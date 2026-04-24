@@ -6,6 +6,7 @@ mod aliases;
 mod archive;
 mod github;
 mod install;
+mod panic;
 
 /// ghp — install binaries from GitHub releases.
 #[derive(FromArgs)]
@@ -56,6 +57,7 @@ struct RemoveCmd {
 struct ListCmd {}
 
 fn main() -> ExitCode {
+    panic::install();
     let cli: Cli = argh::from_env();
     let result = match cli.cmd {
         Cmd::Install(c) => install::install(&c.pkg),
