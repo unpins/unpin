@@ -1,0 +1,47 @@
+use std::fs;
+use std::io::{Cursor, Read};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
+pub fn extract(asset_name: &str, bytes: &[u8], dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+
+    let lower = asset_name.to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        let mut gz = flate2::read::GzDecoder::new(Cursor::new(bytes));
+        let mut tarball = Vec::with_capacity(bytes.len() * 3);
+        gz.read_to_end(&mut tarball)
+            .map_err(|e| format!("gunzip {asset_name}: {e}"))?;
+        unpack_tar(&tarball, dest)
+    } else if lower.ends_with(".tar.xz") {
+        let mut tarball = Vec::with_capacity(bytes.len() * 4);
+        let mut reader = Cursor::new(bytes);
+        lzma_rs::xz_decompress(&mut reader, &mut tarball)
+            .map_err(|e| format!("xz decompress {asset_name}: {e}"))?;
+        unpack_tar(&tarball, dest)
+    } else if lower.ends_with(".tar") {
+        unpack_tar(bytes, dest)
+    } else if lower.ends_with(".zip") {
+        Err(".zip archives are not supported in this MVP".into())
+    } else {
+        // Bare binary.
+        let path = dest.join(asset_name);
+        fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+        let mut perms = fs::metadata(&path)
+            .map_err(|e| format!("stat {}: {e}", path.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+        Ok(())
+    }
+}
+
+fn unpack_tar(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    archive.set_preserve_permissions(true);
+    archive.set_overwrite(true);
+    archive
+        .unpack(dest)
+        .map_err(|e| format!("unpack tar to {}: {e}", dest.display()))
+}

@@ -1,0 +1,24 @@
+[package]
+name = "ghp"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ghp"
+path = "src/main.rs"
+
+[dependencies]
+minreq = { version = "2", default-features = false, features = ["https-rustls"] }
+argh = "0.1"
+nanoserde = "0.2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+lzma-rs = "0.3"
+tar = { version = "0.4", default-features = false }
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
