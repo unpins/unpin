@@ -15,8 +15,11 @@
 # itself. The panic hook in src/panic.rs still runs.
 
 CARGO ?= cargo
-TARGET_TRIPLE ?= x86_64-unknown-linux-gnu
+TARGET_TRIPLE ?= x86_64-unknown-linux-musl
 OBJCOPY ?= objcopy
+
+# Requires: rustup target add x86_64-unknown-linux-musl
+# and the musl-gcc wrapper on PATH.
 
 NON_PIE_FLAGS := -C relocation-model=static -C link-arg=-no-pie
 STRIP_SECTIONS := \
