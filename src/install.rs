@@ -104,29 +104,34 @@ pub fn pick_asset<'a>(assets: &'a [Asset], hint: Option<&str>) -> Result<&'a Ass
     let deny = [
         "darwin", "macos", "apple", "windows", " win", "win32", "win64", "freebsd",
         "openbsd", "netbsd", "i386", "i686", "armv7", "aarch64", "arm64",
-        ".deb", ".rpm", ".appimage", ".zip", ".7z", ".tar.bz2", ".tar.zst",
+        ".deb", ".rpm", ".appimage", ".7z", ".tar.bz2", ".tar.zst",
         ".sig", ".sha256", ".sha512", ".asc", ".pem", ".gpg", ".sbom",
         ".msi", ".exe",
     ];
     let arch_keys = ["x86_64", "amd64", "x64"];
 
+    let linux_safe = |name: &str| -> bool {
+        let l = name.to_ascii_lowercase();
+        l.contains("linux") && !deny.iter().any(|k| l.contains(k))
+    };
+
     let mut candidates: Vec<&Asset> = assets
         .iter()
         .filter(|a| {
+            if !linux_safe(&a.name) {
+                return false;
+            }
             let l = a.name.to_ascii_lowercase();
-            if !l.contains("linux") {
-                return false;
-            }
-            if !arch_keys.iter().any(|k| l.contains(k)) {
-                return false;
-            }
-            // Don't reject windows-style names that share substrings; check carefully.
-            if deny.iter().any(|k| l.contains(k)) {
-                return false;
-            }
-            true
+            arch_keys.iter().any(|k| l.contains(k))
         })
         .collect();
+
+    // Fallback: some projects publish Linux assets without an explicit arch
+    // marker (e.g. flatbuffers' `Linux.flatc.binary.g++-13.zip`). Assume x86_64
+    // when nothing concretely competing (arm64/i386/...) is in the name.
+    if candidates.is_empty() {
+        candidates = assets.iter().filter(|a| linux_safe(&a.name)).collect();
+    }
 
     if let Some(h) = hint {
         let hl = h.to_ascii_lowercase();

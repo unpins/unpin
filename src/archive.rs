@@ -22,7 +22,7 @@ pub fn extract(asset_name: &str, bytes: &[u8], dest: &Path) -> Result<(), String
     } else if lower.ends_with(".tar") {
         unpack_tar(bytes, dest)
     } else if lower.ends_with(".zip") {
-        Err(".zip archives are not supported in this MVP".into())
+        unpack_zip(bytes, dest)
     } else {
         // Bare binary.
         let path = dest.join(asset_name);
@@ -44,4 +44,37 @@ fn unpack_tar(bytes: &[u8], dest: &Path) -> Result<(), String> {
     archive
         .unpack(dest)
         .map_err(|e| format!("unpack tar to {}: {e}", dest.display()))
+}
+
+fn unpack_zip(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| format!("open zip: {e}"))?;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("read zip entry {i}: {e}"))?;
+        let rel = match entry.enclosed_name() {
+            Some(p) => p,
+            None => continue,
+        };
+        let out_path = dest.join(rel);
+        if entry.is_dir() {
+            fs::create_dir_all(&out_path)
+                .map_err(|e| format!("mkdir {}: {e}", out_path.display()))?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        let mut out = fs::File::create(&out_path)
+            .map_err(|e| format!("create {}: {e}", out_path.display()))?;
+        std::io::copy(&mut entry, &mut out)
+            .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+        if let Some(mode) = entry.unix_mode() {
+            fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("chmod {}: {e}", out_path.display()))?;
+        }
+    }
+    Ok(())
 }

@@ -15,6 +15,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 lzma-rs = "0.3"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
+zip = { version = "2", default-features = false, features = ["flate2", "deflate-flate2"] }
 
 [profile.release]
 opt-level = "z"
