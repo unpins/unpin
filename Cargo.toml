@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 minreq = { version = "2", default-features = false, features = ["https-rustls"] }
-argh = "0.1"
+bpaf = { version = "0.9", default-features = false, features = ["bright-color"] }
 nanoserde = "0.2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 lzma-rs = "0.3"

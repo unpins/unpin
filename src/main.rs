@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use argh::FromArgs;
+use bpaf::{construct, positional, pure, Parser};
 
 mod aliases;
 mod archive;
@@ -8,62 +8,55 @@ mod github;
 mod install;
 mod panic;
 
-/// ghp — install binaries from GitHub releases.
-#[derive(FromArgs)]
-struct Cli {
-    #[argh(subcommand)]
-    cmd: Cmd,
-}
-
-#[derive(FromArgs)]
-#[argh(subcommand)]
+#[derive(Clone, Debug)]
 enum Cmd {
-    Install(InstallCmd),
-    Update(UpdateCmd),
-    Remove(RemoveCmd),
-    List(ListCmd),
+    Install(String),
+    Update(Vec<String>),
+    Remove(String),
+    List,
 }
 
-/// Install a package from a GitHub release.
-#[derive(FromArgs)]
-#[argh(subcommand, name = "install")]
-struct InstallCmd {
-    /// alias or owner/repo, optionally with @version
-    #[argh(positional)]
-    pkg: String,
-}
+fn cli() -> bpaf::OptionParser<Cmd> {
+    let install = positional::<String>("PKG")
+        .help("alias or owner/repo, optionally with @version")
+        .map(Cmd::Install)
+        .to_options()
+        .descr("Install a package from a GitHub release.")
+        .command("install");
 
-/// Update one, several, or (with no args) all installed packages.
-#[derive(FromArgs)]
-#[argh(subcommand, name = "update")]
-struct UpdateCmd {
-    /// names of installed packages; empty = update all
-    #[argh(positional)]
-    names: Vec<String>,
-}
+    let update = positional::<String>("NAME")
+        .help("names of installed packages; empty = update all")
+        .many()
+        .map(Cmd::Update)
+        .to_options()
+        .descr("Update one, several, or (with no args) all installed packages.")
+        .command("update");
 
-/// Remove an installed package.
-#[derive(FromArgs)]
-#[argh(subcommand, name = "remove")]
-struct RemoveCmd {
-    /// installed package name
-    #[argh(positional)]
-    name: String,
-}
+    let remove = positional::<String>("NAME")
+        .help("installed package name")
+        .map(Cmd::Remove)
+        .to_options()
+        .descr("Remove an installed package.")
+        .command("remove");
 
-/// List installed packages.
-#[derive(FromArgs)]
-#[argh(subcommand, name = "list")]
-struct ListCmd {}
+    let list = pure(Cmd::List)
+        .to_options()
+        .descr("List installed packages.")
+        .command("list");
+
+    construct!([install, update, remove, list])
+        .to_options()
+        .descr("ghp — install binaries from GitHub releases.")
+}
 
 fn main() -> ExitCode {
     panic::install();
-    let cli: Cli = argh::from_env();
-    let result = match cli.cmd {
-        Cmd::Install(c) => install::install(&c.pkg),
-        Cmd::Update(c) => install::update(&c.names),
-        Cmd::Remove(c) => install::remove(&c.name),
-        Cmd::List(_) => install::list(),
+    let cmd = cli().run();
+    let result = match cmd {
+        Cmd::Install(pkg) => install::install(&pkg),
+        Cmd::Update(names) => install::update(&names),
+        Cmd::Remove(name) => install::remove(&name),
+        Cmd::List => install::list(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
