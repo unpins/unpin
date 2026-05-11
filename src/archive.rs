@@ -44,15 +44,16 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
 }
 
 fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
-    // The zip reader (read_zipfile_from_stream) advances past 30 bytes — the
-    // size of the local file header block — whenever it decides whether the
-    // next record is a local entry or the start of the central directory. The
-    // CdFilter sits between the network and the zip reader and keeps a rolling
-    // tail of the last 30 bytes seen. When read_zipfile_from_stream returns
-    // None (CD signature detected), those 30 bytes are the start of the first
-    // CD entry — combined with whatever remains in the inner stream, we have
-    // the whole CD, where unix_mode actually lives.
-    let mut filter = CdFilter::new(reader, 30);
+    // When read_zipfile_from_stream encounters the central directory it has
+    // already consumed some bytes from the stream — exactly how many is an
+    // internal detail of the zip crate. To recover those bytes we sit a pass-
+    // through reader between the network and the zip parser; it keeps a rolling
+    // tail of the last `TAIL` bytes that flowed. After the loop ends, we
+    // scan the tail (plus whatever's left in the inner stream) for the CD
+    // signature `0x02014b50` and parse from there. TAIL is sized generously
+    // so the consumed prefix always fits, regardless of crate internals.
+    const TAIL: usize = 128;
+    let mut filter = CdFilter::new(reader, TAIL);
     // Name → on-disk path map, so we can chmod each file by the same name the
     // CD entry uses without re-deriving safe paths.
     let mut paths: Vec<(String, PathBuf)> = Vec::new();
@@ -91,7 +92,15 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
         .read_to_end(&mut cd_buf)
         .map_err(|e| format!("read zip central directory: {e}"))?;
 
-    let modes = parse_central_directory(&cd_buf);
+    // Locate the first CD entry magic in the recovered buffer. Anything
+    // before it was either entry data spillover or the bytes the zip parser
+    // already consumed past the signature start.
+    const CD_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+    let cd_start = cd_buf
+        .windows(4)
+        .position(|w| w == CD_SIG)
+        .unwrap_or(cd_buf.len());
+    let modes = parse_central_directory(&cd_buf[cd_start..]);
     for (name, path) in &paths {
         if let Some(mode) = modes.get(name) {
             let _ = fs::set_permissions(path, fs::Permissions::from_mode(*mode));
