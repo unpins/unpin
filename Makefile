@@ -1,4 +1,4 @@
-# Build targets for ghp.
+# Build targets for unpin.
 #
 #   make release       - standard cargo release build
 #   make slim          - release + non-PIE + post-process strip (stable)
@@ -15,6 +15,7 @@
 # itself. The panic hook in src/panic.rs still runs.
 
 CARGO ?= cargo
+NIGHTLY ?= nightly
 TARGET_TRIPLE ?= x86_64-unknown-linux-musl
 OBJCOPY ?= objcopy
 
@@ -36,23 +37,23 @@ slim:
 	RUSTFLAGS='$(NON_PIE_FLAGS)' $(CARGO) build --release \
 		--target $(TARGET_TRIPLE)
 	$(OBJCOPY) $(STRIP_SECTIONS) \
-		target/$(TARGET_TRIPLE)/release/ghp \
-		target/$(TARGET_TRIPLE)/release/ghp-slim
+		target/$(TARGET_TRIPLE)/release/unpin \
+		target/$(TARGET_TRIPLE)/release/unpin-slim
 
 slim-nightly:
 	RUSTFLAGS='$(NON_PIE_FLAGS)' \
-		$(CARGO) +nightly build --release \
+		$(CARGO) +$(NIGHTLY) build --release \
 			--target $(TARGET_TRIPLE) \
 			-Z build-std=std,panic_abort
 	$(OBJCOPY) $(STRIP_SECTIONS) \
-		target/$(TARGET_TRIPLE)/release/ghp \
-		target/$(TARGET_TRIPLE)/release/ghp-slim
+		target/$(TARGET_TRIPLE)/release/unpin \
+		target/$(TARGET_TRIPLE)/release/unpin-slim
 
 size:
 	@for f in \
-		target/release/ghp \
-		target/$(TARGET_TRIPLE)/release/ghp \
-		target/$(TARGET_TRIPLE)/release/ghp-slim; do \
+		target/release/unpin \
+		target/$(TARGET_TRIPLE)/release/unpin \
+		target/$(TARGET_TRIPLE)/release/unpin-slim; do \
 		[ -f $$f ] && ls -lh $$f; \
 	done
 

@@ -1,24 +1,33 @@
 [package]
-name = "ghp"
+name = "unpin"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "ghp"
+name = "unpin"
 path = "src/main.rs"
 
+[features]
+default = ["http-mbedtls"]
+http-minreq = ["dep:minreq"]
+http-mbedtls = ["dep:mbedtls", "dep:fluent-uri", "dep:rustls-native-certs"]
+
 [dependencies]
-minreq = { version = "2", default-features = false, features = ["https-rustls"] }
+minreq = { version = "2", default-features = false, features = ["https-rustls"], optional = true }
+mbedtls = { version = "0.12", default-features = false, features = ["std", "time", "ssl", "x509"], optional = true }
+fluent-uri = { version = "0.3", default-features = false, features = ["std"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 bpaf = { version = "0.9", default-features = false, features = ["bright-color"] }
-nanoserde = "0.2"
+nanoserde = { version = "0.2", default-features = false, features = ["json", "std"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 lzma-rs = "0.3"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
 zip = { version = "2", default-features = false, features = ["flate2", "deflate-flate2"] }
+sha2 = { version = "0.10", default-features = false }
 
 [profile.release]
-opt-level = "z"
+opt-level = 2
 lto = true
 codegen-units = 1
 strip = true

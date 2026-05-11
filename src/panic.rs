@@ -22,16 +22,16 @@ fn print_bug(info: &PanicHookInfo<'_>) -> std::io::Result<()> {
     };
 
     let mut err = std::io::stderr().lock();
-    writeln!(err, "error: Fatal bug in ghp!\n")?;
+    writeln!(err, "error: Fatal bug in unpin!\n")?;
     writeln!(
         err,
-        "This is a bug in ghp, sorry!
+        "This is a bug in unpin, sorry!
 
-Please report this crash to https://github.com/malbarbo/ghp/issues/new
+Please report this crash to https://github.com/unpins/unpin/issues/new
 and include this error message with your report.
 
 Panic: {location}{message}
-ghp version: {version}
+unpin version: {version}
 Operating system: {os}",
         version = env!("CARGO_PKG_VERSION"),
         os = std::env::consts::OS,

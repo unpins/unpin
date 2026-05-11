@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use nanoserde::DeJson;
 
-const USER_AGENT: &str = concat!("ghp/", env!("CARGO_PKG_VERSION"));
+use crate::http;
+
+const USER_AGENT: &str = concat!("unpin/", env!("CARGO_PKG_VERSION"));
 
 #[derive(DeJson, Debug)]
 pub struct Release {
@@ -35,40 +37,42 @@ fn fetch_release(url: &str) -> Result<Release, String> {
     DeJson::deserialize_json(&body).map_err(|e| format!("parse release JSON: {e}"))
 }
 
-fn api_get(url: &str) -> Result<String, String> {
-    let mut req = minreq::get(url)
-        .with_header("User-Agent", USER_AGENT)
-        .with_header("Accept", "application/vnd.github+json");
-    if let Ok(token) = env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            req = req.with_header("Authorization", format!("Bearer {token}"));
+fn auth_header() -> Option<String> {
+    env::var("GITHUB_TOKEN").ok().and_then(|t| {
+        if t.is_empty() {
+            None
+        } else {
+            Some(format!("Bearer {t}"))
         }
+    })
+}
+
+fn api_get(url: &str) -> Result<String, String> {
+    let client = http::default_client();
+    let auth = auth_header();
+    let mut headers: Vec<(&str, &str)> = vec![
+        ("User-Agent", USER_AGENT),
+        ("Accept", "application/vnd.github+json"),
+    ];
+    if let Some(ref h) = auth {
+        headers.push(("Authorization", h));
     }
-    let resp = req.send().map_err(|e| format!("HTTP GET {url}: {e}"))?;
-    if resp.status_code < 200 || resp.status_code >= 300 {
-        return Err(format!(
-            "HTTP {} for {url}: {}",
-            resp.status_code,
-            resp.as_str().unwrap_or("")
-        ));
+    let resp = client.get(url, &headers)?;
+    if resp.status < 200 || resp.status >= 300 {
+        let body_str = std::str::from_utf8(&resp.body).unwrap_or("");
+        return Err(format!("HTTP {} for {url}: {body_str}", resp.status));
     }
-    resp.as_str()
-        .map(|s| s.to_owned())
-        .map_err(|e| format!("decode body for {url}: {e}"))
+    String::from_utf8(resp.body).map_err(|e| format!("decode body for {url}: {e}"))
 }
 
 pub fn download(url: &str) -> Result<Vec<u8>, String> {
-    let mut resp = minreq::get(url)
-        .with_header("User-Agent", USER_AGENT)
-        .send_lazy()
-        .map_err(|e| format!("download {url}: {e}"))?;
-    if resp.status_code < 200 || resp.status_code >= 300 {
-        return Err(format!("HTTP {} downloading {url}", resp.status_code));
+    let client = http::default_client();
+    let headers: Vec<(&str, &str)> = vec![("User-Agent", USER_AGENT)];
+    let mut stream = client.get_streaming(url, &headers)?;
+    if stream.status() < 200 || stream.status() >= 300 {
+        return Err(format!("HTTP {} downloading {url}", stream.status()));
     }
-    let total = resp
-        .headers
-        .get("content-length")
-        .and_then(|s| s.parse::<u64>().ok());
+    let total = stream.content_length();
 
     let interactive = io::stderr().is_terminal();
     let mut buf: Vec<u8> = Vec::with_capacity(total.unwrap_or(0) as usize);
@@ -77,7 +81,7 @@ pub fn download(url: &str) -> Result<Vec<u8>, String> {
     let mut last_render = start - Duration::from_millis(100);
 
     loop {
-        let n = resp
+        let n = stream
             .read(&mut chunk)
             .map_err(|e| format!("read {url}: {e}"))?;
         if n == 0 {

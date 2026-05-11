@@ -1,35 +1,23 @@
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use nanoserde::{DeJson, SerJson};
-
-use crate::aliases::{self, Alias};
 use crate::archive;
 use crate::github::{self, Asset, Release};
 
-#[derive(SerJson, DeJson, Default)]
-pub struct State {
-    #[nserde(default)]
-    pub packages: Vec<PackageEntry>,
-}
-
-#[derive(SerJson, DeJson, Clone)]
-pub struct PackageEntry {
-    pub name: String,
-    pub repo: String,
-    pub tag: String,
-    pub asset: String,
-    pub binary_paths: Vec<String>,
-}
-
 pub struct Spec {
+    pub owner: String,
     pub name: String,
-    pub repo: String,
-    pub alias: Option<&'static Alias>,
     pub version: Option<String>,
+}
+
+impl Spec {
+    fn repo(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
 }
 
 pub fn parse_spec(input: &str) -> Result<Spec, String> {
@@ -37,75 +25,131 @@ pub fn parse_spec(input: &str) -> Result<Spec, String> {
         Some((b, v)) => (b, Some(v.to_owned())),
         None => (input, None),
     };
-    if let Some(alias) = aliases::lookup(base) {
+    if let Some((owner, name)) = base.split_once('/') {
+        if owner.is_empty() || name.is_empty() || name.contains('/') {
+            return Err(format!("invalid package spec: `{input}`"));
+        }
         return Ok(Spec {
-            name: alias.name.to_owned(),
-            repo: alias.repo.to_owned(),
-            alias: Some(alias),
+            owner: owner.to_owned(),
+            name: name.to_owned(),
             version,
         });
     }
-    if let Some((owner, repo)) = base.split_once('/') {
-        if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
-            return Ok(Spec {
-                name: repo.to_owned(),
-                repo: base.to_owned(),
-                alias: None,
-                version,
-            });
-        }
+    if base.is_empty() {
+        return Err("empty package name".into());
     }
-    Err(format!(
-        "unknown package `{input}` (use owner/repo or a known alias)"
-    ))
+    Ok(Spec {
+        owner: "unpins".to_owned(),
+        name: base.to_owned(),
+        version,
+    })
 }
 
 pub fn data_dir() -> PathBuf {
     if let Ok(x) = env::var("XDG_DATA_HOME") {
         if !x.is_empty() {
-            return PathBuf::from(x).join("ghp");
+            return PathBuf::from(x).join("unpin");
         }
     }
-    PathBuf::from(env::var("HOME").unwrap_or_default())
-        .join(".local/share/ghp")
+    PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/share/unpin")
 }
 
 pub fn bin_dir() -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/bin")
 }
 
-fn state_path() -> PathBuf {
-    data_dir().join("state.json")
+fn repo_dir(owner: &str, name: &str) -> PathBuf {
+    data_dir().join(owner).join(name)
 }
 
-fn packages_dir() -> PathBuf {
-    data_dir().join("packages")
+fn version_dir(owner: &str, name: &str, tag: &str) -> PathBuf {
+    repo_dir(owner, name).join(tag)
 }
 
-pub fn read_state() -> Result<State, String> {
-    let p = state_path();
-    if !p.exists() {
-        return Ok(State::default());
+/// Search the data dir for a repo matching `name`. Accepts "owner/repo" or a
+/// bare repo name (searches all owners; ambiguous match is an error).
+fn resolve_installed(name: &str) -> Result<Option<(String, String)>, String> {
+    if let Some((owner, repo)) = name.split_once('/') {
+        if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
+            return Ok(if repo_dir(owner, repo).is_dir() {
+                Some((owner.to_owned(), repo.to_owned()))
+            } else {
+                None
+            });
+        }
+        return Err(format!("invalid name: `{name}`"));
     }
-    let s = fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
-    DeJson::deserialize_json(&s).map_err(|e| format!("parse {}: {e}", p.display()))
+    let root = data_dir();
+    let entries = match fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+    let mut found: Option<(String, String)> = None;
+    for owner_entry in entries.flatten() {
+        if !owner_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let owner = owner_entry.file_name().to_string_lossy().into_owned();
+        let owner_path = owner_entry.path();
+        let repos = match fs::read_dir(&owner_path) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for repo_entry in repos.flatten() {
+            if !repo_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let repo = repo_entry.file_name().to_string_lossy().into_owned();
+            if repo != name {
+                continue;
+            }
+            if found.is_some() {
+                return Err(format!("ambiguous name `{name}` (matches multiple owners)"));
+            }
+            found = Some((owner.clone(), repo));
+        }
+    }
+    Ok(found)
 }
 
-pub fn write_state(state: &State) -> Result<(), String> {
-    let p = state_path();
-    fs::create_dir_all(p.parent().unwrap())
-        .map_err(|e| format!("mkdir {}: {e}", p.parent().unwrap().display()))?;
-    let tmp = p.with_extension("json.new");
-    fs::write(&tmp, state.serialize_json()).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, &p).map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), p.display()))
+/// Find which version dir holds the binaries currently linked into ~/.local/bin.
+/// Returns the tag name. If no linked version found, returns the lexicographic
+/// max of the existing version dirs (best-effort).
+fn active_version(owner: &str, name: &str) -> Option<String> {
+    let rdir = repo_dir(owner, name);
+    let mut versions: Vec<String> = fs::read_dir(&rdir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    if versions.is_empty() {
+        return None;
+    }
+    // Try to identify the version linked from bin_dir.
+    if let Ok(bins) = fs::read_dir(bin_dir()) {
+        for entry in bins.flatten() {
+            if let Ok(target) = fs::read_link(entry.path()) {
+                if let Ok(rel) = target.strip_prefix(&rdir) {
+                    if let Some(first) = rel.components().next() {
+                        let v = first.as_os_str().to_string_lossy().into_owned();
+                        if versions.iter().any(|x| x == &v) {
+                            return Some(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    versions.sort();
+    versions.pop()
 }
 
-pub fn pick_asset<'a>(assets: &'a [Asset], hint: Option<&str>) -> Result<&'a Asset, String> {
+pub fn pick_asset<'a>(assets: &'a [Asset]) -> Result<&'a Asset, String> {
     let deny = [
-        "darwin", "macos", "apple", "windows", " win", "win32", "win64", "freebsd",
-        "openbsd", "netbsd", "i386", "i686", "armv7", "aarch64", "arm64",
-        ".deb", ".rpm", ".appimage", ".7z", ".tar.bz2", ".tar.zst",
-        ".sig", ".sha256", ".sha512", ".asc", ".pem", ".gpg", ".sbom",
+        "darwin", "macos", "apple", "windows", " win", "win32", "win64", "freebsd", "openbsd",
+        "netbsd", "i386", "i686", "armv7", "aarch64", "arm64", ".deb", ".rpm", ".appimage", ".7z",
+        ".tar.bz2", ".tar.zst", ".sig", ".sha256", ".sha512", ".asc", ".pem", ".gpg", ".sbom",
         ".msi", ".exe",
     ];
     let arch_keys = ["x86_64", "amd64", "x64"];
@@ -126,23 +170,8 @@ pub fn pick_asset<'a>(assets: &'a [Asset], hint: Option<&str>) -> Result<&'a Ass
         })
         .collect();
 
-    // Fallback: some projects publish Linux assets without an explicit arch
-    // marker (e.g. flatbuffers' `Linux.flatc.binary.g++-13.zip`). Assume x86_64
-    // when nothing concretely competing (arm64/i386/...) is in the name.
     if candidates.is_empty() {
         candidates = assets.iter().filter(|a| linux_safe(&a.name)).collect();
-    }
-
-    if let Some(h) = hint {
-        let hl = h.to_ascii_lowercase();
-        let filtered: Vec<&Asset> = candidates
-            .iter()
-            .copied()
-            .filter(|a| a.name.to_ascii_lowercase().contains(&hl))
-            .collect();
-        if !filtered.is_empty() {
-            candidates = filtered;
-        }
     }
 
     match candidates.len() {
@@ -180,6 +209,19 @@ fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, String> {
     Ok(candidates[idx - 1])
 }
 
+fn prompt_yes_no(question: &str) -> bool {
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+    eprint!("{question} [y/N] ");
+    io::stderr().flush().ok();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim_start().chars().next(), Some('y' | 'Y'))
+}
+
 fn walk_files(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -200,280 +242,577 @@ fn is_executable(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn find_binaries(version_dir: &Path, spec: &Spec) -> Result<Vec<PathBuf>, String> {
-    let mut all = Vec::new();
-    walk_files(version_dir, &mut all)
-        .map_err(|e| format!("walk {}: {e}", version_dir.display()))?;
+fn ensure_executable(p: &Path) -> Result<(), String> {
+    if is_executable(p) {
+        return Ok(());
+    }
+    let mut perms = fs::metadata(p)
+        .map_err(|e| format!("stat {}: {e}", p.display()))?
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(p, perms).map_err(|e| format!("chmod {}: {e}", p.display()))
+}
 
-    let wanted: Option<&[&'static str]> = spec.alias.map(|a| a.binaries);
-
-    if let Some(names) = wanted {
-        let mut found = Vec::with_capacity(names.len());
-        for name in names {
-            let m = all
-                .iter()
-                .find(|p| p.file_name().map(|n| n == *name).unwrap_or(false));
-            match m {
-                Some(p) => {
-                    // Ensure executable bit set; if not, set it.
-                    if !is_executable(p) {
-                        let mut perms = fs::metadata(p)
-                            .map_err(|e| format!("stat {}: {e}", p.display()))?
-                            .permissions();
-                        perms.set_mode(0o755);
-                        fs::set_permissions(p, perms)
-                            .map_err(|e| format!("chmod {}: {e}", p.display()))?;
-                    }
-                    found.push(p.clone());
-                }
-                None => return Err(format!("binary `{name}` not found in archive")),
-            }
+/// Strip trailing target-triple markers from a binary filename. Useful when
+/// projects ship `tool-x86_64-linux-musl` and we want the link to be `tool`.
+fn short_binary_name(name: &str) -> &str {
+    const MARKERS: &[&str] = &[
+        "-x86_64", "_x86_64", "-amd64", "_amd64", "-aarch64", "_aarch64", "-arm64", "_arm64",
+        "-i686", "_i686", "-i386", "_i386", "-linux", "_linux", "-darwin", "_darwin", "-apple",
+        "-pc-", "-musl", "-gnu",
+    ];
+    let mut earliest: Option<usize> = None;
+    for m in MARKERS {
+        if let Some(i) = name.find(m) {
+            earliest = Some(earliest.map_or(i, |e| e.min(i)));
         }
-        Ok(found)
-    } else {
-        let by_name: Vec<_> = all
-            .iter()
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n == spec.name)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-        if by_name.len() == 1 {
-            return Ok(by_name);
-        }
-        let executables: Vec<_> = all.iter().filter(|p| is_executable(p)).cloned().collect();
-        if executables.len() == 1 {
-            return Ok(executables);
-        }
-        Err(format!(
-            "could not unambiguously identify a binary for `{}` (found {} executables). \
-             Use an alias entry to specify `binaries`.",
-            spec.name,
-            executables.len()
-        ))
+    }
+    match earliest {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
     }
 }
 
-fn replace_symlink(target: &Path, link: &Path) -> Result<(), String> {
+fn link_binary(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, String> {
     let parent = link.parent().ok_or("symlink has no parent")?;
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-    let tmp_name = link.with_file_name(format!(
-        "{}.new",
-        link.file_name().unwrap().to_string_lossy()
-    ));
-    let _ = fs::remove_file(&tmp_name);
-    symlink(target, &tmp_name).map_err(|e| {
-        format!(
-            "symlink {} -> {}: {e}",
-            tmp_name.display(),
-            target.display()
-        )
-    })?;
-    fs::rename(&tmp_name, link)
-        .map_err(|e| format!("rename {} -> {}: {e}", tmp_name.display(), link.display()))
-}
 
-fn relative_to(base: &Path, full: &Path) -> Result<PathBuf, String> {
-    full.strip_prefix(base)
-        .map(|p| p.to_path_buf())
-        .map_err(|_| {
-            format!(
-                "{} is not inside {}",
-                full.display(),
-                base.display()
-            )
-        })
+    if let Ok(meta) = fs::symlink_metadata(link) {
+        let managed = meta.file_type().is_symlink()
+            && fs::read_link(link)
+                .map(|t| t.starts_with(data_dir()))
+                .unwrap_or(false);
+        if !managed && !assume_yes {
+            let q = format!(
+                "{} already exists and was not installed by unpin. Overwrite?",
+                link.display()
+            );
+            if !prompt_yes_no(&q) {
+                eprintln!(
+                    "Skipped {}",
+                    link.file_name().unwrap_or_default().to_string_lossy()
+                );
+                return Ok(false);
+            }
+        }
+        let _ = fs::remove_file(link);
+    }
+    symlink(target, link).map_err(|e| {
+        format!("symlink {} -> {}: {e}", link.display(), target.display())
+    })?;
+    Ok(true)
 }
 
 fn fetch_release(spec: &Spec) -> Result<Release, String> {
+    let repo = spec.repo();
     match &spec.version {
-        Some(tag) => github::fetch_tag(&spec.repo, tag),
-        None => github::fetch_latest(&spec.repo),
+        Some(tag) => github::fetch_tag(&repo, tag),
+        None => github::fetch_latest(&repo),
     }
 }
 
-pub fn install(input: &str) -> Result<(), String> {
-    let spec = parse_spec(input)?;
-    do_install(&spec)
-}
+/// Download + verify + extract the release's asset into `<data>/<owner>/<repo>/<tag>/`.
+/// Returns the absolute version_dir path. Skips network work if already extracted.
+fn ensure_extracted(spec: &Spec, release: &Release, assume_yes: bool) -> Result<PathBuf, String> {
+    let vdir = version_dir(&spec.owner, &spec.name, &release.tag_name);
+    if vdir.is_dir() {
+        return Ok(vdir);
+    }
 
-fn do_install(spec: &Spec) -> Result<(), String> {
-    println!("Resolving {} ({})...", spec.name, spec.repo);
-    let release = fetch_release(spec)?;
-    let hint = spec.alias.and_then(|a| a.asset_hint);
-    let asset = pick_asset(&release.assets, hint)?;
+    let asset = pick_asset(&release.assets)?;
+    let expected_sha256 = match find_checksum_url(&release.assets, &asset.name) {
+        Some(url) => Some(fetch_expected_sha256(&url)?),
+        None => {
+            if !assume_yes
+                && !prompt_yes_no("No SHA-256 checksum found. Continue without verification?")
+            {
+                return Err("aborted: missing checksum".into());
+            }
+            None
+        }
+    };
+
     println!("Downloading {} ({})...", asset.name, release.tag_name);
     let bytes = github::download(&asset.browser_download_url)?;
 
-    let pkg_root = packages_dir().join(&spec.name);
-    fs::create_dir_all(&pkg_root)
-        .map_err(|e| format!("mkdir {}: {e}", pkg_root.display()))?;
+    if let Some(expected) = expected_sha256 {
+        let got = sha256_hex(&bytes);
+        if !got.eq_ignore_ascii_case(&expected) {
+            return Err(format!(
+                "checksum mismatch for {}: expected {expected}, got {got}",
+                asset.name
+            ));
+        }
+        println!("Verified SHA-256: {expected}");
+    }
+
+    let rdir = repo_dir(&spec.owner, &spec.name);
+    fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
 
     let staging = tempfile::Builder::new()
         .prefix(".staging-")
-        .tempdir_in(&pkg_root)
-        .map_err(|e| format!("tempdir in {}: {e}", pkg_root.display()))?;
-
+        .tempdir_in(&rdir)
+        .map_err(|e| format!("tempdir in {}: {e}", rdir.display()))?;
     archive::extract(&asset.name, &bytes, staging.path())?;
-
-    // Find binaries inside staging.
-    let bin_paths_abs = find_binaries(staging.path(), spec)?;
-    let bin_paths_rel: Vec<PathBuf> = bin_paths_abs
-        .iter()
-        .map(|p| relative_to(staging.path(), p))
-        .collect::<Result<_, _>>()?;
-
-    let version_dir = pkg_root.join(&release.tag_name);
-    if version_dir.exists() {
-        // Reinstall: nuke the old extraction.
-        fs::remove_dir_all(&version_dir)
-            .map_err(|e| format!("remove {}: {e}", version_dir.display()))?;
-    }
-
-    // Promote staging dir to the version dir (atomic same-fs rename).
     let staging_path = staging.keep();
-    fs::rename(&staging_path, &version_dir).map_err(|e| {
-        format!(
-            "rename {} -> {}: {e}",
-            staging_path.display(),
-            version_dir.display()
-        )
+    fs::rename(&staging_path, &vdir).map_err(|e| {
+        format!("rename {} -> {}: {e}", staging_path.display(), vdir.display())
     })?;
-
-    // Swap the `current` symlink (relative target).
-    replace_symlink(Path::new(&release.tag_name), &pkg_root.join("current"))?;
-
-    // Symlink each binary into ~/.local/bin/
-    let bin_dir = bin_dir();
-    let current_dir = pkg_root.join("current");
-    let mut bin_names = Vec::with_capacity(bin_paths_rel.len());
-    for rel in &bin_paths_rel {
-        let target = current_dir.join(rel);
-        let link_name = rel.file_name().ok_or("binary path has no file name")?;
-        let link = bin_dir.join(link_name);
-        replace_symlink(&target, &link)?;
-        bin_names.push(link.file_name().unwrap().to_string_lossy().into_owned());
-    }
-
-    // Update state.
-    let mut state = read_state()?;
-    state.packages.retain(|p| p.name != spec.name);
-    state.packages.push(PackageEntry {
-        name: spec.name.clone(),
-        repo: spec.repo.clone(),
-        tag: release.tag_name.clone(),
-        asset: asset.name.clone(),
-        binary_paths: bin_paths_rel
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-    });
-    state.packages.sort_by(|a, b| a.name.cmp(&b.name));
-    write_state(&state)?;
-
-    println!(
-        "Installed {} {} ({} binaries: {})",
-        spec.name,
-        release.tag_name,
-        bin_names.len(),
-        bin_names.join(", ")
-    );
-    Ok(())
+    Ok(vdir)
 }
 
-pub fn list() -> Result<(), String> {
-    let state = read_state()?;
-    if state.packages.is_empty() {
-        println!("(no packages installed)");
-        return Ok(());
+fn link_all_executables(spec: &Spec, vdir: &Path, assume_yes: bool) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    walk_files(vdir, &mut files).map_err(|e| format!("walk {}: {e}", vdir.display()))?;
+
+    let mut executables: Vec<PathBuf> = files.into_iter().filter(|p| is_executable(p)).collect();
+    // If nothing has +x set (rare; some archives lose modes), promote any file
+    // matching spec.name so the user still gets a working symlink.
+    if executables.is_empty() {
+        let mut fallback = Vec::new();
+        walk_files(vdir, &mut fallback).map_err(|e| format!("walk {}: {e}", vdir.display()))?;
+        if let Some(p) = fallback
+            .iter()
+            .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(&spec.name))
+        {
+            ensure_executable(p)?;
+            executables.push(p.clone());
+        }
     }
-    let name_w = state.packages.iter().map(|p| p.name.len()).max().unwrap_or(0);
-    let tag_w = state.packages.iter().map(|p| p.tag.len()).max().unwrap_or(0);
-    for p in &state.packages {
+
+    let bin = bin_dir();
+    let mut linked = Vec::new();
+    for target in &executables {
+        let basename = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("non-utf8 binary name")?;
+        let short = short_binary_name(basename);
+        let link = bin.join(short);
+        if link_binary(target, &link, assume_yes)? {
+            linked.push(short.to_owned());
+        }
+    }
+    Ok(linked)
+}
+
+pub fn install_many(inputs: &[String], assume_yes: bool) -> Result<(), String> {
+    let mut last_err: Option<String> = None;
+    for input in inputs {
+        if let Err(e) = install_one(input, assume_yes) {
+            eprintln!("unpin: {input}: {e}");
+            last_err = Some(e);
+        }
+    }
+    match last_err {
+        Some(e) => Err(format!("one or more installs failed (last: {e})")),
+        None => Ok(()),
+    }
+}
+
+fn install_one(input: &str, assume_yes: bool) -> Result<(), String> {
+    let spec = parse_spec(input)?;
+    do_install(&spec, assume_yes)
+}
+
+fn do_install(spec: &Spec, assume_yes: bool) -> Result<(), String> {
+    println!("Resolving {}...", spec.repo());
+    let release = fetch_release(spec)?;
+    let vdir = ensure_extracted(spec, &release, assume_yes)?;
+    let linked = link_all_executables(spec, &vdir, assume_yes)?;
+    if linked.is_empty() {
+        println!("Installed {} {}", spec.repo(), release.tag_name);
+    } else {
         println!(
-            "{:<name_w$}  {:<tag_w$}  {}",
-            p.name,
-            p.tag,
-            p.repo,
-            name_w = name_w,
-            tag_w = tag_w
+            "Installed {} {} ({})",
+            spec.repo(),
+            release.tag_name,
+            linked.join(", ")
         );
     }
     Ok(())
 }
 
-pub fn remove(name: &str) -> Result<(), String> {
-    let mut state = read_state()?;
-    let idx = state
-        .packages
-        .iter()
-        .position(|p| p.name == name)
-        .ok_or_else(|| format!("not installed: {name}"))?;
-    let entry = state.packages.remove(idx);
+fn find_checksum_url(assets: &[Asset], asset_name: &str) -> Option<String> {
+    for suffix in [".sha256", ".sha256sum"] {
+        let want = format!("{asset_name}{suffix}");
+        if let Some(a) = assets.iter().find(|a| a.name == want) {
+            return Some(a.browser_download_url.clone());
+        }
+    }
+    None
+}
 
-    let pkg_root = packages_dir().join(&entry.name);
-    let bin_dir = bin_dir();
-    for rel in &entry.binary_paths {
-        let link_name = Path::new(rel).file_name().unwrap_or_default();
-        let link = bin_dir.join(link_name);
-        if let Ok(target) = fs::read_link(&link) {
-            if target.starts_with(&pkg_root) {
-                let _ = fs::remove_file(&link);
+fn fetch_expected_sha256(url: &str) -> Result<String, String> {
+    let body = github::download(url)?;
+    let text = std::str::from_utf8(&body).map_err(|e| format!("checksum body: {e}"))?;
+    let mut hex = String::with_capacity(64);
+    for c in text.chars() {
+        if hex.len() == 64 {
+            break;
+        }
+        if c.is_ascii_hexdigit() {
+            hex.push(c.to_ascii_lowercase());
+        } else if !hex.is_empty() {
+            break;
+        }
+    }
+    if hex.len() != 64 {
+        return Err("malformed checksum file".into());
+    }
+    Ok(hex)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+pub fn list() -> Result<(), String> {
+    let root = data_dir();
+    let entries = match fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => {
+            println!("No packages installed");
+            return Ok(());
+        }
+    };
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    for owner_entry in entries.flatten() {
+        if !owner_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let owner = owner_entry.file_name().to_string_lossy().into_owned();
+        let repos = match fs::read_dir(owner_entry.path()) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for repo_entry in repos.flatten() {
+            if !repo_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let repo = repo_entry.file_name().to_string_lossy().into_owned();
+            let versions = match fs::read_dir(repo_entry.path()) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for ver_entry in versions.flatten() {
+                if !ver_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let v = ver_entry.file_name().to_string_lossy().into_owned();
+                rows.push((owner.clone(), repo.clone(), v));
             }
         }
     }
-    if pkg_root.exists() {
-        fs::remove_dir_all(&pkg_root)
-            .map_err(|e| format!("remove {}: {e}", pkg_root.display()))?;
+    if rows.is_empty() {
+        println!("No packages installed");
+        return Ok(());
     }
-    write_state(&state)?;
-    println!("Removed {}", name);
+    rows.sort();
+    let repo_w = rows
+        .iter()
+        .map(|(o, r, _)| o.len() + 1 + r.len())
+        .max()
+        .unwrap_or(0);
+    for (owner, repo, v) in &rows {
+        let full = format!("{owner}/{repo}");
+        println!("{full:<repo_w$}  {v}", repo_w = repo_w);
+    }
     Ok(())
 }
 
-pub fn update(names: &[String]) -> Result<(), String> {
-    let state = read_state()?;
-    let targets: Vec<PackageEntry> = if names.is_empty() {
-        state.packages.clone()
+pub fn remove_many(names: &[String]) -> Result<(), String> {
+    let mut last_err: Option<String> = None;
+    for name in names {
+        if let Err(e) = remove_one(name) {
+            eprintln!("unpin: {name}: {e}");
+            last_err = Some(e);
+        }
+    }
+    match last_err {
+        Some(e) => Err(format!("one or more removes failed (last: {e})")),
+        None => Ok(()),
+    }
+}
+
+fn remove_one(name: &str) -> Result<(), String> {
+    let (owner, repo) = resolve_installed(name)?
+        .ok_or_else(|| format!("not installed: {name}"))?;
+    let rdir = repo_dir(&owner, &repo);
+
+    let mut versions: Vec<String> = fs::read_dir(&rdir)
+        .map(|it| {
+            it.flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    versions.sort();
+
+    if let Ok(entries) = fs::read_dir(bin_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(target) = fs::read_link(&path) {
+                if target.starts_with(&rdir) {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    }
+    if rdir.exists() {
+        fs::remove_dir_all(&rdir).map_err(|e| format!("remove {}: {e}", rdir.display()))?;
+    }
+    let _ = fs::remove_dir(data_dir().join(&owner));
+
+    if versions.is_empty() {
+        println!("Removed {owner}/{repo}");
+    } else {
+        for v in &versions {
+            println!("Removed {owner}/{repo}@{v}");
+        }
+    }
+    Ok(())
+}
+
+pub fn update(names: &[String], assume_yes: bool) -> Result<(), String> {
+    let targets: Vec<(String, String)> = if names.is_empty() {
+        installed_repos()
     } else {
         let mut out = Vec::with_capacity(names.len());
         for n in names {
-            let p = state
-                .packages
-                .iter()
-                .find(|p| &p.name == n)
+            let r = resolve_installed(n)?
                 .ok_or_else(|| format!("not installed: {n}"))?;
-            out.push(p.clone());
+            out.push(r);
         }
         out
     };
 
     if targets.is_empty() {
-        println!("(no packages installed)");
+        println!("No packages installed");
         return Ok(());
     }
 
-    for entry in &targets {
-        let alias = aliases::lookup(&entry.name);
+    let mut last_err: Option<String> = None;
+    for (owner, repo) in &targets {
         let spec = Spec {
-            name: entry.name.clone(),
-            repo: entry.repo.clone(),
-            alias,
+            owner: owner.clone(),
+            name: repo.clone(),
             version: None,
         };
-        let release = github::fetch_latest(&spec.repo)?;
-        if release.tag_name == entry.tag {
-            println!("{}: up to date ({})", entry.name, entry.tag);
+        let release = match github::fetch_latest(&spec.repo()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("unpin: {}/{}: {e}", owner, repo);
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let current = active_version(owner, repo);
+        if current.as_deref() == Some(release.tag_name.as_str()) {
+            println!("{owner}/{repo}: up to date ({})", release.tag_name);
             continue;
         }
-        println!(
-            "{}: {} -> {}",
-            entry.name, entry.tag, release.tag_name
-        );
-        do_install(&spec)?;
+        let from = current.as_deref().unwrap_or("(none)");
+        println!("{owner}/{repo}: {} -> {}", from, release.tag_name);
+        if let Err(e) = do_install(&spec, assume_yes) {
+            eprintln!("unpin: {owner}/{repo}: {e}");
+            last_err = Some(e);
+        }
+    }
+    match last_err {
+        Some(e) => Err(format!("one or more updates failed (last: {e})")),
+        None => Ok(()),
+    }
+}
+
+fn installed_repos() -> Vec<(String, String)> {
+    let root = data_dir();
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for owner_entry in entries.flatten() {
+        if !owner_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let owner = owner_entry.file_name().to_string_lossy().into_owned();
+        let repos = match fs::read_dir(owner_entry.path()) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for repo_entry in repos.flatten() {
+            if !repo_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            out.push((
+                owner.clone(),
+                repo_entry.file_name().to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    out
+}
+
+pub fn info(input: &str) -> Result<(), String> {
+    if let Some((owner, repo)) = resolve_installed(input)? {
+        let rdir = repo_dir(&owner, &repo);
+        let mut versions: Vec<String> = fs::read_dir(&rdir)
+            .map_err(|e| format!("read {}: {e}", rdir.display()))?
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        versions.sort();
+        let active = active_version(&owner, &repo);
+
+        println!("Repo:     {owner}/{repo}");
+        if let Some(v) = &active {
+            println!("Active:   {v}");
+            println!("Path:     {}", version_dir(&owner, &repo, v).display());
+        }
+        if versions.len() > 1 || active.is_none() {
+            println!("Versions: {}", versions.join(", "));
+        }
+        println!("Links:");
+        let bin = bin_dir();
+        let mut any = false;
+        if let Ok(entries) = fs::read_dir(&bin) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(target) = fs::read_link(&path) {
+                    if target.starts_with(&rdir) {
+                        println!("  {} -> {}", path.display(), target.display());
+                        any = true;
+                    }
+                }
+            }
+        }
+        if !any {
+            println!("  None");
+        }
+        return Ok(());
+    }
+
+    let spec = parse_spec(input)?;
+    let release = fetch_release(&spec)?;
+    println!("Repo:    {}", spec.repo());
+    println!("Version: {} (latest)", release.tag_name);
+    println!("Status:  not installed");
+    match pick_asset(&release.assets) {
+        Ok(a) => println!("Asset:   {}", a.name),
+        Err(e) => println!("Asset:   (unresolved: {e})"),
+    }
+    Ok(())
+}
+
+pub fn prune() -> Result<(), String> {
+    let mut removed = 0usize;
+
+    let bin = bin_dir();
+    let root = data_dir();
+    if let Ok(entries) = fs::read_dir(&bin) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let target = match fs::read_link(&path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !target.starts_with(&root) {
+                continue;
+            }
+            if fs::metadata(&target).is_err() && fs::remove_file(&path).is_ok() {
+                println!("Removed dangling {}", path.display());
+                removed += 1;
+            }
+        }
+    }
+
+    // Orphan version dirs: no live symlink in bin_dir points into them.
+    let linked_targets: Vec<PathBuf> = fs::read_dir(&bin)
+        .map(|it| {
+            it.flatten()
+                .filter_map(|e| fs::read_link(e.path()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (owner, repo) in installed_repos() {
+        let rdir = repo_dir(&owner, &repo);
+        let versions = match fs::read_dir(&rdir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for ver_entry in versions.flatten() {
+            if !ver_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let vpath = ver_entry.path();
+            if linked_targets.iter().any(|t| t.starts_with(&vpath)) {
+                continue;
+            }
+            let v = ver_entry.file_name().to_string_lossy().into_owned();
+            if fs::remove_dir_all(&vpath).is_ok() {
+                println!("Removed orphan {owner}/{repo}@{v}");
+                removed += 1;
+            }
+        }
+        // Clean up now-empty repo and owner dirs.
+        let _ = fs::remove_dir(&rdir);
+        let _ = fs::remove_dir(data_dir().join(&owner));
+    }
+
+    if removed == 0 {
+        println!("Nothing to prune");
+    }
+    Ok(())
+}
+
+pub fn run(input: &str, args: &[String]) -> Result<(), String> {
+    let spec = parse_spec(input)?;
+    println!("Resolving {}...", spec.repo());
+    let release = fetch_release(&spec)?;
+    let vdir = ensure_extracted(&spec, &release, true)?;
+
+    let mut files = Vec::new();
+    walk_files(&vdir, &mut files).map_err(|e| format!("walk {}: {e}", vdir.display()))?;
+    let executables: Vec<PathBuf> = files.iter().filter(|p| is_executable(p)).cloned().collect();
+    let bin = match executables.len() {
+        0 => {
+            // No +x file; try to promote one matching spec.name.
+            let m = files
+                .iter()
+                .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(&spec.name))
+                .ok_or("no executable in archive")?;
+            ensure_executable(m)?;
+            m.clone()
+        }
+        1 => executables.into_iter().next().unwrap(),
+        _ => {
+            // Multiple executables: prefer one matching spec.name.
+            executables
+                .iter()
+                .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(&spec.name))
+                .cloned()
+                .unwrap_or_else(|| executables.into_iter().next().unwrap())
+        }
+    };
+
+    let status = Command::new(&bin)
+        .args(args)
+        .status()
+        .map_err(|e| format!("exec {}: {e}", bin.display()))?;
+    if let Some(code) = status.code() {
+        if code != 0 {
+            std::process::exit(code);
+        }
     }
     Ok(())
 }
