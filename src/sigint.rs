@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-static CLEANUP: Mutex<Option<PathBuf>> = Mutex::new(None);
+// Vec, not Option<PathBuf>: parallel installs each register their own vdir.
+static CLEANUP: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 pub fn install() {
     let _ = ctrlc::set_handler(|| {
         if let Ok(mut g) = CLEANUP.lock() {
-            if let Some(p) = g.take() {
+            for p in g.drain(..) {
                 let _ = std::fs::remove_dir_all(&p);
             }
         }
@@ -15,14 +16,14 @@ pub fn install() {
     });
 }
 
-pub fn register_cleanup(path: &Path) {
+pub fn push_cleanup(path: &Path) {
     if let Ok(mut g) = CLEANUP.lock() {
-        *g = Some(path.to_path_buf());
+        g.push(path.to_path_buf());
     }
 }
 
-pub fn clear_cleanup() {
+pub fn pop_cleanup(path: &Path) {
     if let Ok(mut g) = CLEANUP.lock() {
-        *g = None;
+        g.retain(|p| p != path);
     }
 }

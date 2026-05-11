@@ -4,10 +4,15 @@ use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
 use crate::archive;
 use crate::github::{self, Asset, Release};
 
+#[derive(Clone)]
 pub struct Spec {
     pub owner: String,
     pub name: String,
@@ -46,10 +51,10 @@ pub fn parse_spec(input: &str) -> Result<Spec, String> {
 }
 
 pub fn data_dir() -> PathBuf {
-    if let Ok(x) = env::var("XDG_DATA_HOME") {
-        if !x.is_empty() {
-            return PathBuf::from(x).join("unpin");
-        }
+    if let Ok(x) = env::var("XDG_DATA_HOME")
+        && !x.is_empty()
+    {
+        return PathBuf::from(x).join("unpin");
     }
     PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/share/unpin")
 }
@@ -129,14 +134,13 @@ fn active_version(owner: &str, name: &str) -> Option<String> {
     // Try to identify the version linked from bin_dir.
     if let Ok(bins) = fs::read_dir(bin_dir()) {
         for entry in bins.flatten() {
-            if let Ok(target) = fs::read_link(entry.path()) {
-                if let Ok(rel) = target.strip_prefix(&rdir) {
-                    if let Some(first) = rel.components().next() {
-                        let v = first.as_os_str().to_string_lossy().into_owned();
-                        if versions.iter().any(|x| x == &v) {
-                            return Some(v);
-                        }
-                    }
+            if let Ok(target) = fs::read_link(entry.path())
+                && let Ok(rel) = target.strip_prefix(&rdir)
+                && let Some(first) = rel.components().next()
+            {
+                let v = first.as_os_str().to_string_lossy().into_owned();
+                if versions.iter().any(|x| x == &v) {
+                    return Some(v);
                 }
             }
         }
@@ -145,51 +149,132 @@ fn active_version(owner: &str, name: &str) -> Option<String> {
     versions.pop()
 }
 
-pub fn pick_asset<'a>(assets: &'a [Asset]) -> Result<&'a Asset, String> {
-    let deny = [
-        "darwin", "macos", "apple", "windows", " win", "win32", "win64", "freebsd", "openbsd",
-        "netbsd", "i386", "i686", "armv7", "aarch64", "arm64", ".deb", ".rpm", ".appimage", ".7z",
-        ".tar.bz2", ".sig", ".sha256", ".sha512", ".asc", ".pem", ".gpg", ".sbom",
-        ".msi", ".exe",
+/// Classify an asset that should be excluded from the picker. Returns a short
+/// human reason, or `None` if the asset is potentially installable.
+fn classify_excluded(name_lower: &str) -> Option<&'static str> {
+    const CROSS_PLATFORM: &[&str] = &[
+        "darwin", "macos", "apple", "windows", " win", "win32", "win64",
+        "freebsd", "openbsd", "netbsd",
     ];
+    const OTHER_ARCH: &[&str] = &["i386", "i686", "armv7", "aarch64", "arm64"];
+    const AUXILIARY: &[&str] = &[
+        ".deb", ".rpm", ".appimage", ".7z", ".tar.bz2", ".sig", ".sha256",
+        ".sha512", ".asc", ".pem", ".gpg", ".sbom", ".msi", ".exe",
+    ];
+    if CROSS_PLATFORM.iter().any(|k| name_lower.contains(k)) {
+        return Some("other platform");
+    }
+    if OTHER_ARCH.iter().any(|k| name_lower.contains(k)) {
+        return Some("other arch");
+    }
+    if AUXILIARY.iter().any(|k| name_lower.contains(k)) {
+        return Some("auxiliary");
+    }
+    if name_lower.contains(".bsdiff") {
+        return Some("unsupported format");
+    }
+    // Bare `.zst` (not `.tar.zst`) is single-stream compression; we only handle
+    // the tar-zst container.
+    if name_lower.ends_with(".zst") && !name_lower.ends_with(".tar.zst") {
+        return Some("unsupported format");
+    }
+    if !name_lower.contains("linux") {
+        return Some("not linux");
+    }
+    None
+}
+
+pub fn pick_asset<'a>(
+    assets: &'a [Asset],
+    repo_name: &str,
+    force_pick: bool,
+    verbose: bool,
+) -> Result<&'a Asset, String> {
     let arch_keys = ["x86_64", "amd64", "x64"];
 
-    let linux_safe = |name: &str| -> bool {
-        let l = name.to_ascii_lowercase();
-        l.contains("linux") && !deny.iter().any(|k| l.contains(k))
-    };
+    let mut selectable: Vec<&Asset> = Vec::new();
+    let mut ignored: Vec<(&Asset, &'static str)> = Vec::new();
+    for a in assets {
+        let l = a.name.to_ascii_lowercase();
+        match classify_excluded(&l) {
+            Some(reason) => ignored.push((a, reason)),
+            None => selectable.push(a),
+        }
+    }
 
-    let mut candidates: Vec<&Asset> = assets
+    // Tier 1: linux + explicit arch tag. Tier 2 (fallback): linux only.
+    let with_arch: Vec<&Asset> = selectable
         .iter()
+        .copied()
         .filter(|a| {
-            if !linux_safe(&a.name) {
-                return false;
-            }
             let l = a.name.to_ascii_lowercase();
             arch_keys.iter().any(|k| l.contains(k))
         })
         .collect();
+    let mut candidates = if with_arch.is_empty() {
+        selectable.clone()
+    } else {
+        with_arch
+    };
 
-    if candidates.is_empty() {
-        candidates = assets.iter().filter(|a| linux_safe(&a.name)).collect();
+    // Narrow to `<repo>-<arch>` etc. when auto-picking; --pick keeps the
+    // full selectable list so the user can choose alternates.
+    if !force_pick && candidates.len() > 1 {
+        let repo_lower = repo_name.to_ascii_lowercase();
+        let narrowed: Vec<&Asset> = candidates
+            .iter()
+            .copied()
+            .filter(|a| {
+                let l = a.name.to_ascii_lowercase();
+                let Some(rest) = l.strip_prefix(&repo_lower) else {
+                    return false;
+                };
+                let Some(sep) = rest.chars().next() else {
+                    return false;
+                };
+                if !matches!(sep, '-' | '_' | '.') {
+                    return false;
+                }
+                let after_sep = &rest[sep.len_utf8()..];
+                arch_keys.iter().any(|k| after_sep.starts_with(k))
+            })
+            .collect();
+        if !narrowed.is_empty() {
+            candidates = narrowed;
+        }
     }
 
-    match candidates.len() {
-        0 => Err(format!(
+    if verbose && !ignored.is_empty() {
+        let w = ignored.iter().map(|(a, _)| a.name.len()).max().unwrap_or(0);
+        eprintln!("Ignored {} assets:", ignored.len());
+        for (a, reason) in &ignored {
+            eprintln!("  {:<w$}  ({reason})", a.name);
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err(format!(
             "no matching Linux x86_64 asset.\nAvailable assets:\n{}",
             assets
                 .iter()
                 .map(|a| format!("  {}", a.name))
                 .collect::<Vec<_>>()
                 .join("\n")
-        )),
-        1 => Ok(candidates[0]),
-        _ => prompt_pick(&candidates),
+        ));
     }
+    if !force_pick && candidates.len() == 1 {
+        return Ok(candidates[0]);
+    }
+    prompt_pick(&candidates)
 }
 
 fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, String> {
-    println!("Multiple matching assets:");
+    let header = if candidates.len() == 1 {
+        "Available asset:"
+    } else {
+        "Available assets:"
+    };
+    println!("{header}");
     for (i, a) in candidates.iter().enumerate() {
         println!("  [{}] {}", i + 1, a.name);
     }
@@ -311,15 +396,43 @@ fn fetch_release(spec: &Spec) -> Result<Release, String> {
     }
 }
 
-/// Download + verify + extract the release's asset into `<data>/<owner>/<repo>/<tag>/`.
-/// Returns the absolute version_dir path. Skips network work if already extracted.
-fn ensure_extracted(spec: &Spec, release: &Release, assume_yes: bool) -> Result<PathBuf, String> {
-    let vdir = version_dir(&spec.owner, &spec.name, &release.tag_name);
-    if vdir.is_dir() {
-        return Ok(vdir);
-    }
+/// Result of the serial preflight: enough to extract+verify in a worker without
+/// talking to the user. `None` for `expected_sha256` means user opted to skip
+/// verification; `None` for `asset` means the package is already cached.
+pub struct ExtractJob {
+    pub spec: Spec,
+    pub release: Release,
+    pub vdir: PathBuf,
+    /// `None` → already cached, worker skips the download path entirely.
+    pub asset: Option<Asset>,
+    pub expected_sha256: Option<String>,
+}
 
-    let asset = pick_asset(&release.assets)?;
+/// Serial preflight: pick asset, resolve checksum, decide if download is needed.
+/// May prompt the user (asset picker, missing-checksum confirmation).
+fn preflight_extract(
+    spec: Spec,
+    release: Release,
+    assume_yes: bool,
+    pick: bool,
+    verbose: bool,
+) -> Result<ExtractJob, String> {
+    let vdir = version_dir(&spec.owner, &spec.name, &release.tag_name);
+    if vdir.is_dir() && !pick {
+        return Ok(ExtractJob {
+            spec,
+            release,
+            vdir,
+            asset: None,
+            expected_sha256: None,
+        });
+    }
+    let asset = pick_asset(&release.assets, &spec.name, pick, verbose)?.clone();
+    // --pick on a cached version: wipe before re-extracting the chosen asset.
+    if vdir.is_dir() {
+        fs::remove_dir_all(&vdir)
+            .map_err(|e| format!("remove {}: {e}", vdir.display()))?;
+    }
     let expected_sha256 = match find_checksum_url(&release.assets, &asset.name) {
         Some(url) => Some(fetch_expected_sha256(&url)?),
         None => {
@@ -331,36 +444,53 @@ fn ensure_extracted(spec: &Spec, release: &Release, assume_yes: bool) -> Result<
             None
         }
     };
+    Ok(ExtractJob {
+        spec,
+        release,
+        vdir,
+        asset: Some(asset),
+        expected_sha256,
+    })
+}
 
-    let rdir = repo_dir(&spec.owner, &spec.name);
+/// Worker body: download + extract + verify. No prompts, no stdout/stderr;
+/// progress is reported through the provided `ProgressBar` and `multi`-routed
+/// log lines. Safe to call from a worker thread in `thread::scope`.
+fn do_extract(job: &ExtractJob, bar: ProgressBar, multi: &MultiProgress) -> Result<(), String> {
+    let Some(asset) = job.asset.as_ref() else {
+        return Ok(()); // cached
+    };
+
+    let rdir = repo_dir(&job.spec.owner, &job.spec.name);
     fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
 
-    // Stream-extract directly into the version dir. The cleanup guard removes
-    // the partial dir on any error/panic. Ctrl-C is handled separately by
-    // crate::sigint, which also wipes the registered path.
-    let _guard = CleanupGuard::arm(vdir.clone());
-    crate::sigint::register_cleanup(&vdir);
+    crate::sigint::push_cleanup(&job.vdir);
+    let mut guard = CleanupGuard::arm(job.vdir.clone());
 
-    println!("Downloading {} ({})...", asset.name, release.tag_name);
-    let stream = github::download_stream(&asset.browser_download_url)?;
+    bar.set_prefix(format!("{} {}", job.spec.name, job.release.tag_name));
+    let stream = github::download_stream_into(&asset.browser_download_url, bar.clone())?;
     let mut hashing = HashingReader::new(stream);
-    archive::extract(&asset.name, &mut hashing, &vdir)?;
+    archive::extract(&asset.name, &mut hashing, &job.vdir)?;
     let got = hashing.finalize_hex();
+    bar.finish_and_clear();
 
-    if let Some(expected) = expected_sha256 {
-        if !got.eq_ignore_ascii_case(&expected) {
+    if let Some(expected) = job.expected_sha256.as_ref() {
+        if !got.eq_ignore_ascii_case(expected) {
             return Err(format!(
                 "checksum mismatch for {}: expected {expected}, got {got}",
                 asset.name
             ));
         }
-        println!("Verified SHA-256: {expected}");
+        let _ = multi.println(format!(
+            "  verified {}  ({})",
+            job.spec.repo(),
+            &expected[..16]
+        ));
     }
 
-    crate::sigint::clear_cleanup();
-    let mut g = _guard;
-    g.disarm();
-    Ok(vdir)
+    crate::sigint::pop_cleanup(&job.vdir);
+    guard.disarm();
+    Ok(())
 }
 
 struct CleanupGuard {
@@ -420,19 +550,16 @@ fn link_all_executables(spec: &Spec, vdir: &Path, assume_yes: bool) -> Result<Ve
     let mut files = Vec::new();
     walk_files(vdir, &mut files).map_err(|e| format!("walk {}: {e}", vdir.display()))?;
 
-    let mut executables: Vec<PathBuf> = files.into_iter().filter(|p| is_executable(p)).collect();
+    let mut executables: Vec<PathBuf> = files.iter().filter(|p| is_executable(p)).cloned().collect();
     // If nothing has +x set (rare; some archives lose modes), promote any file
     // matching spec.name so the user still gets a working symlink.
-    if executables.is_empty() {
-        let mut fallback = Vec::new();
-        walk_files(vdir, &mut fallback).map_err(|e| format!("walk {}: {e}", vdir.display()))?;
-        if let Some(p) = fallback
+    if executables.is_empty()
+        && let Some(p) = files
             .iter()
             .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(&spec.name))
-        {
-            ensure_executable(p)?;
-            executables.push(p.clone());
-        }
+    {
+        ensure_executable(p)?;
+        executables.push(p.clone());
     }
 
     let bin = bin_dir();
@@ -451,41 +578,150 @@ fn link_all_executables(spec: &Spec, vdir: &Path, assume_yes: bool) -> Result<Ve
     Ok(linked)
 }
 
-pub fn install_many(inputs: &[String], assume_yes: bool) -> Result<(), String> {
+pub fn install_many(
+    inputs: &[String],
+    assume_yes: bool,
+    jobs: u8,
+    pick: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    let specs: Vec<(String, Spec)> = inputs
+        .iter()
+        .map(|s| parse_spec(s).map(|sp| (s.clone(), sp)))
+        .collect::<Result<_, _>>()?;
+    run_pipeline(specs, assume_yes, jobs, pick, verbose)
+}
+
+/// Three-phase pipeline shared by `install` and `update`.
+/// Phase A is serial (may prompt); Phase B is parallel; Phase C is serial.
+fn run_pipeline(
+    specs: Vec<(String, Spec)>,
+    assume_yes: bool,
+    jobs: u8,
+    pick: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    if specs.is_empty() {
+        return Ok(());
+    }
+
     let mut last_err: Option<String> = None;
-    for input in inputs {
-        if let Err(e) = install_one(input, assume_yes) {
-            eprintln!("unpin: {input}: {e}");
-            last_err = Some(e);
+    let mut prepared: Vec<(String, ExtractJob)> = Vec::new();
+
+    // ---- Phase A: serial preflight (fetch release, pick asset, prompt) ----
+    for (label, spec) in specs {
+        println!("Resolving {}...", spec.repo());
+        let release = match fetch_release(&spec) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("unpin: {label}: {e}");
+                last_err = Some(e);
+                continue;
+            }
+        };
+        match preflight_extract(spec, release, assume_yes, pick, verbose) {
+            Ok(job) => prepared.push((label, job)),
+            Err(e) => {
+                eprintln!("unpin: {label}: {e}");
+                last_err = Some(e);
+            }
         }
     }
+
+    // ---- Phase B: parallel download + extract + verify ----
+    let n_workers = pick_jobs(jobs, prepared.len());
+    let extract_results = parallel_extract(&prepared, n_workers);
+
+    // ---- Phase C: serial linking + final summary (may prompt to overwrite) ----
+    for ((label, job), result) in prepared.iter().zip(extract_results.into_iter()) {
+        if let Err(e) = result {
+            eprintln!("unpin: {label}: {e}");
+            last_err = Some(e);
+            continue;
+        }
+        match link_all_executables(&job.spec, &job.vdir, assume_yes) {
+            Ok(linked) => {
+                if linked.is_empty() {
+                    println!("Installed {} {}", job.spec.repo(), job.release.tag_name);
+                } else {
+                    println!(
+                        "Installed {} {} ({})",
+                        job.spec.repo(),
+                        job.release.tag_name,
+                        linked.join(", ")
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("unpin: {label}: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+
     match last_err {
-        Some(e) => Err(format!("one or more installs failed (last: {e})")),
+        Some(e) => Err(format!("one or more operations failed (last: {e})")),
         None => Ok(()),
     }
 }
 
-fn install_one(input: &str, assume_yes: bool) -> Result<(), String> {
-    let spec = parse_spec(input)?;
-    do_install(&spec, assume_yes)
+fn pick_jobs(requested: u8, n_inputs: usize) -> usize {
+    let req = if requested == 0 { 4 } else { requested as usize };
+    req.min(n_inputs).max(1)
 }
 
-fn do_install(spec: &Spec, assume_yes: bool) -> Result<(), String> {
-    println!("Resolving {}...", spec.repo());
-    let release = fetch_release(spec)?;
-    let vdir = ensure_extracted(spec, &release, assume_yes)?;
-    let linked = link_all_executables(spec, &vdir, assume_yes)?;
-    if linked.is_empty() {
-        println!("Installed {} {}", spec.repo(), release.tag_name);
+/// Run the parallel extract phase. Returns one Result per input, in input order.
+/// Spawns N worker threads pulling from a shared work queue. Cached jobs are
+/// resolved inline; only ones with `asset: Some(_)` are dispatched to workers.
+fn parallel_extract(prepared: &[(String, ExtractJob)], n_workers: usize) -> Vec<Result<(), String>> {
+    let multi = if io::stderr().is_terminal() {
+        MultiProgress::new()
     } else {
-        println!(
-            "Installed {} {} ({})",
-            spec.repo(),
-            release.tag_name,
-            linked.join(", ")
-        );
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+    };
+
+    let mut results: Vec<Result<(), String>> =
+        (0..prepared.len()).map(|_| Ok(())).collect();
+
+    // Feed indices needing real work into a channel; workers pull one at a time.
+    // Cached jobs are announced upfront (before any bar exists, so println is safe).
+    let (work_tx, work_rx) = mpsc::channel::<usize>();
+    for (i, (_, job)) in prepared.iter().enumerate() {
+        if job.asset.is_some() {
+            work_tx.send(i).unwrap();
+        } else {
+            println!("Using {} {} (cached)", job.spec.repo(), job.release.tag_name);
+        }
     }
-    Ok(())
+    drop(work_tx);
+    let work_rx = std::sync::Mutex::new(work_rx);
+
+    let (result_tx, result_rx) = mpsc::channel::<(usize, Result<(), String>)>();
+
+    thread::scope(|s| {
+        for _ in 0..n_workers {
+            let multi_w = multi.clone();
+            let result_tx_w = result_tx.clone();
+            let work_rx_w = &work_rx;
+            let prepared_w = prepared;
+            s.spawn(move || loop {
+                let i = match work_rx_w.lock().unwrap().recv() {
+                    Ok(i) => i,
+                    Err(_) => break,
+                };
+                let (_label, job) = &prepared_w[i];
+                let bar = multi_w.add(ProgressBar::new(0));
+                let result = do_extract(job, bar, &multi_w);
+                let _ = result_tx_w.send((i, result));
+            });
+        }
+        drop(result_tx);
+        for (i, r) in result_rx {
+            results[i] = r;
+        }
+    });
+
+    results
 }
 
 fn find_checksum_url(assets: &[Asset], asset_name: &str) -> Option<String> {
@@ -621,10 +857,10 @@ fn remove_one(name: &str) -> Result<(), String> {
     if let Ok(entries) = fs::read_dir(bin_dir()) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Ok(target) = fs::read_link(&path) {
-                if target.starts_with(&rdir) {
-                    let _ = fs::remove_file(&path);
-                }
+            if let Ok(target) = fs::read_link(&path)
+                && target.starts_with(&rdir)
+            {
+                let _ = fs::remove_file(&path);
             }
         }
     }
@@ -643,7 +879,13 @@ fn remove_one(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn update(names: &[String], assume_yes: bool) -> Result<(), String> {
+pub fn update(
+    names: &[String],
+    assume_yes: bool,
+    jobs: u8,
+    pick: bool,
+    verbose: bool,
+) -> Result<(), String> {
     let targets: Vec<(String, String)> = if names.is_empty() {
         installed_repos()
     } else {
@@ -661,7 +903,11 @@ pub fn update(names: &[String], assume_yes: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    // Resolve which packages actually need an update before kicking off the
+    // pipeline — so users see "up to date" lines and `-j` doesn't waste workers
+    // on no-ops. Up-to-date / failed resolutions never reach the pipeline.
     let mut last_err: Option<String> = None;
+    let mut specs: Vec<(String, Spec)> = Vec::new();
     for (owner, repo) in &targets {
         let spec = Spec {
             owner: owner.clone(),
@@ -683,10 +929,11 @@ pub fn update(names: &[String], assume_yes: bool) -> Result<(), String> {
         }
         let from = current.as_deref().unwrap_or("(none)");
         println!("{owner}/{repo}: {} -> {}", from, release.tag_name);
-        if let Err(e) = do_install(&spec, assume_yes) {
-            eprintln!("unpin: {owner}/{repo}: {e}");
-            last_err = Some(e);
-        }
+        specs.push((format!("{owner}/{repo}"), spec));
+    }
+
+    if let Err(e) = run_pipeline(specs, assume_yes, jobs, pick, verbose) {
+        last_err = Some(e);
     }
     match last_err {
         Some(e) => Err(format!("one or more updates failed (last: {e})")),
@@ -749,11 +996,11 @@ pub fn info(input: &str) -> Result<(), String> {
         if let Ok(entries) = fs::read_dir(&bin) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Ok(target) = fs::read_link(&path) {
-                    if target.starts_with(&rdir) {
-                        println!("  {} -> {}", path.display(), target.display());
-                        any = true;
-                    }
+                if let Ok(target) = fs::read_link(&path)
+                    && target.starts_with(&rdir)
+                {
+                    println!("  {} -> {}", path.display(), target.display());
+                    any = true;
                 }
             }
         }
@@ -768,7 +1015,7 @@ pub fn info(input: &str) -> Result<(), String> {
     println!("Repo:    {}", spec.repo());
     println!("Version: {} (latest)", release.tag_name);
     println!("Status:  not installed");
-    match pick_asset(&release.assets) {
+    match pick_asset(&release.assets, &spec.name, false, false) {
         Ok(a) => println!("Asset:   {}", a.name),
         Err(e) => println!("Asset:   (unresolved: {e})"),
     }
@@ -842,7 +1089,18 @@ pub fn run(input: &str, args: &[String]) -> Result<(), String> {
     println!("Resolving {}...", spec.repo());
     let release = fetch_release(&spec)?;
     let was_cached = version_dir(&spec.owner, &spec.name, &release.tag_name).is_dir();
-    let vdir = ensure_extracted(&spec, &release, true)?;
+    let job = preflight_extract(spec.clone(), release.clone(), true, false, false)?;
+    let vdir = job.vdir.clone();
+    if !was_cached {
+        // Single bar, stand-alone (no MultiProgress needed for one job).
+        let multi = if io::stderr().is_terminal() {
+            MultiProgress::new()
+        } else {
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        };
+        let bar = multi.add(ProgressBar::new(0));
+        do_extract(&job, bar, &multi)?;
+    }
     if was_cached {
         let has_links = fs::read_dir(bin_dir())
             .map(|it| {
@@ -886,10 +1144,10 @@ pub fn run(input: &str, args: &[String]) -> Result<(), String> {
         .args(args)
         .status()
         .map_err(|e| format!("exec {}: {e}", bin.display()))?;
-    if let Some(code) = status.code() {
-        if code != 0 {
-            std::process::exit(code);
-        }
+    if let Some(code) = status.code()
+        && code != 0
+    {
+        std::process::exit(code);
     }
     Ok(())
 }
