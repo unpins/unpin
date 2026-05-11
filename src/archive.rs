@@ -186,7 +186,11 @@ fn parse_central_directory(buf: &[u8]) -> std::collections::HashMap<String, u32>
             break;
         }
         if host_system == 3 {
-            let mode = (external_attrs >> 16) & 0xFFFF;
+            // Upper 16 bits include the file-type bits (S_IFREG etc.). Mask to
+            // the permission bits proper (rwxrwxrwx + setuid/setgid/sticky) so
+            // fs::set_permissions doesn't end up clearing perms when only the
+            // type bits happen to be set.
+            let mode = ((external_attrs >> 16) & 0xFFFF) & 0o7777;
             if mode != 0 {
                 if let Ok(name) = std::str::from_utf8(&buf[name_start..name_end]) {
                     out.insert(name.to_owned(), mode);
@@ -200,4 +204,194 @@ fn parse_central_directory(buf: &[u8]) -> std::collections::HashMap<String, u32>
         pos = next;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tar_with(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, data, mode) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(name).unwrap();
+            h.set_size(data.len() as u64);
+            h.set_mode(*mode);
+            h.set_cksum();
+            builder.append(&h, *data).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    fn elf_bytes() -> Vec<u8> {
+        // Minimal "ELF" — just the magic + filler. Enough for is_elf detection.
+        let mut v = b"\x7fELF".to_vec();
+        v.extend_from_slice(b"rest of fake binary contents");
+        v
+    }
+
+    fn read_file(path: &Path) -> Vec<u8> {
+        fs::read(path).unwrap()
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn extract_plain_tar_preserves_perms() {
+        let entries: &[(&str, &[u8], u32)] = &[("bin/rg", b"ELF-ish data", 0o755)];
+        let tar = tar_with(entries);
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.tar", &tar[..], tmp.path()).unwrap();
+        let p = tmp.path().join("bin/rg");
+        assert_eq!(read_file(&p), b"ELF-ish data");
+        assert_eq!(mode_of(&p), 0o755);
+    }
+
+    #[test]
+    fn extract_tar_gz_preserves_perms() {
+        let tar = tar_with(&[("hello", b"hi", 0o755)]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar).unwrap();
+        let bytes = gz.finish().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.tar.gz", &bytes[..], tmp.path()).unwrap();
+        let p = tmp.path().join("hello");
+        assert_eq!(read_file(&p), b"hi");
+        assert_eq!(mode_of(&p), 0o755);
+    }
+
+    #[test]
+    fn extract_tgz_alias() {
+        let tar = tar_with(&[("x", b"x", 0o644)]);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar).unwrap();
+        let bytes = gz.finish().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.tgz", &bytes[..], tmp.path()).unwrap();
+        assert_eq!(read_file(&tmp.path().join("x")), b"x");
+    }
+
+    #[test]
+    fn extract_tar_xz_preserves_perms() {
+        let tar = tar_with(&[("only", b"xz body", 0o700)]);
+        let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+        xz.write_all(&tar).unwrap();
+        let bytes = xz.finish().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.tar.xz", &bytes[..], tmp.path()).unwrap();
+        let p = tmp.path().join("only");
+        assert_eq!(read_file(&p), b"xz body");
+        assert_eq!(mode_of(&p), 0o700);
+    }
+
+    #[test]
+    fn extract_tar_zst_preserves_perms() {
+        let tar = tar_with(&[("z", b"zstd body", 0o755)]);
+        let bytes = zstd::encode_all(&tar[..], 3).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.tar.zst", &bytes[..], tmp.path()).unwrap();
+        let p = tmp.path().join("z");
+        assert_eq!(read_file(&p), b"zstd body");
+        assert_eq!(mode_of(&p), 0o755);
+    }
+
+    #[test]
+    fn extract_zip_preserves_unix_mode_from_central_directory() {
+        let mut zw = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o755);
+        zw.start_file("tool", opts).unwrap();
+        zw.write_all(&elf_bytes()).unwrap();
+        let opts644 = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o644);
+        zw.start_file("README.md", opts644).unwrap();
+        zw.write_all(b"# docs").unwrap();
+        let bytes = zw.finish().unwrap().into_inner();
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.zip", &bytes[..], tmp.path()).unwrap();
+        assert_eq!(mode_of(&tmp.path().join("tool")), 0o755);
+        assert_eq!(mode_of(&tmp.path().join("README.md")), 0o644);
+    }
+
+    #[test]
+    fn extract_zip_without_unix_mode_falls_back_to_heuristic() {
+        // Build a zip with default (Windows-style) permissions, but file
+        // contents that should trip the ELF / shebang heuristic.
+        let mut zw = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            // Force a non-Unix host so external_attrs has no unix_mode.
+            .last_modified_time(zip::DateTime::default());
+        // We can't easily set host = DOS via the public API. Use unix_permissions(0)
+        // which makes parse_central_directory skip the entry (mode == 0).
+        let opts_zero = opts.unix_permissions(0);
+        zw.start_file("native", opts_zero).unwrap();
+        zw.write_all(&elf_bytes()).unwrap();
+        zw.start_file("script", opts_zero).unwrap();
+        zw.write_all(b"#!/bin/sh\necho hi\n").unwrap();
+        zw.start_file("notes.txt", opts_zero).unwrap();
+        zw.write_all(b"plain text").unwrap();
+        let bytes = zw.finish().unwrap().into_inner();
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.zip", &bytes[..], tmp.path()).unwrap();
+        assert_eq!(mode_of(&tmp.path().join("native")), 0o755);
+        assert_eq!(mode_of(&tmp.path().join("script")), 0o755);
+        assert_ne!(mode_of(&tmp.path().join("notes.txt")), 0o755);
+    }
+
+    #[test]
+    fn extract_bare_binary_writes_with_755() {
+        let bytes = b"raw payload, no archive container";
+        let tmp = tempfile::tempdir().unwrap();
+        extract("downloaded-binary", &bytes[..], tmp.path()).unwrap();
+        let p = tmp.path().join("downloaded-binary");
+        assert_eq!(read_file(&p), bytes);
+        assert_eq!(mode_of(&p), 0o755);
+    }
+
+    #[test]
+    fn cd_filter_keeps_rolling_tail_and_forwards_all_bytes() {
+        let data: Vec<u8> = (0u8..200).collect();
+        let mut filter = CdFilter::new(&data[..], 64);
+        let mut sink = Vec::new();
+        io::copy(&mut filter, &mut sink).unwrap();
+        assert_eq!(sink, data);
+        let (_, tail) = filter.finish();
+        assert_eq!(tail.len(), 64);
+        assert_eq!(&tail[..], &data[136..]);
+    }
+
+    #[test]
+    fn parse_central_directory_extracts_unix_mode_from_unix_host() {
+        let mut cd = vec![0u8; 46 + 2];
+        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
+        // version_made_by: upper byte 3 = Unix
+        cd[4..6].copy_from_slice(&((3u16 << 8) | 20).to_le_bytes());
+        cd[28..30].copy_from_slice(&2u16.to_le_bytes()); // name_len
+        let mode: u32 = 0o755;
+        cd[38..42].copy_from_slice(&(mode << 16).to_le_bytes());
+        cd[46..48].copy_from_slice(b"rg");
+        let modes = parse_central_directory(&cd);
+        assert_eq!(modes.get("rg").copied(), Some(0o755));
+    }
+
+    #[test]
+    fn parse_central_directory_skips_non_unix_host() {
+        let mut cd = vec![0u8; 46 + 1];
+        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
+        // version_made_by: upper byte 0 = DOS (not Unix)
+        cd[4..6].copy_from_slice(&20u16.to_le_bytes());
+        cd[28..30].copy_from_slice(&1u16.to_le_bytes());
+        cd[38..42].copy_from_slice(&((0o755u32) << 16).to_le_bytes());
+        cd[46] = b'x';
+        let modes = parse_central_directory(&cd);
+        assert!(modes.is_empty());
+    }
 }
