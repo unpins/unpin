@@ -264,12 +264,12 @@ mod mbedtls_backend {
             let mut current = url.to_string();
             for _ in 0..MAX_REDIRECTS {
                 let mut stream = self.open(&current, headers)?;
-                if is_redirect(stream.status) {
-                    if let Some(loc) = stream.location.clone() {
-                        drop(stream);
-                        current = resolve_url(&current, &loc)?;
-                        continue;
-                    }
+                if is_redirect(stream.status)
+                    && let Some(loc) = stream.location.clone()
+                {
+                    drop(stream);
+                    current = resolve_url(&current, &loc)?;
+                    continue;
                 }
                 let status = stream.status;
                 let mut body = Vec::new();
@@ -289,12 +289,12 @@ mod mbedtls_backend {
             let mut current = url.to_string();
             for _ in 0..MAX_REDIRECTS {
                 let stream = self.open(&current, headers)?;
-                if is_redirect(stream.status) {
-                    if let Some(loc) = stream.location.clone() {
-                        drop(stream);
-                        current = resolve_url(&current, &loc)?;
-                        continue;
-                    }
+                if is_redirect(stream.status)
+                    && let Some(loc) = stream.location.clone()
+                {
+                    drop(stream);
+                    current = resolve_url(&current, &loc)?;
+                    continue;
                 }
                 return Ok(Box::new(stream));
             }

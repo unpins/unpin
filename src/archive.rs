@@ -85,9 +85,7 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
     }
 
     // Drain the rest of the stream — this is the remainder of the CD + EOCD.
-    let (inner, tail) = filter.finish();
-    let mut cd_buf = tail;
-    let mut inner = inner;
+    let (mut inner, mut cd_buf) = filter.finish();
     inner
         .read_to_end(&mut cd_buf)
         .map_err(|e| format!("read zip central directory: {e}"))?;
@@ -191,10 +189,10 @@ fn parse_central_directory(buf: &[u8]) -> std::collections::HashMap<String, u32>
             // fs::set_permissions doesn't end up clearing perms when only the
             // type bits happen to be set.
             let mode = ((external_attrs >> 16) & 0xFFFF) & 0o7777;
-            if mode != 0 {
-                if let Ok(name) = std::str::from_utf8(&buf[name_start..name_end]) {
-                    out.insert(name.to_owned(), mode);
-                }
+            if mode != 0
+                && let Ok(name) = std::str::from_utf8(&buf[name_start..name_end])
+            {
+                out.insert(name.to_owned(), mode);
             }
         }
         let next = name_end + extra_len + comment_len;
