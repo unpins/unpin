@@ -149,7 +149,7 @@ pub fn pick_asset<'a>(assets: &'a [Asset]) -> Result<&'a Asset, String> {
     let deny = [
         "darwin", "macos", "apple", "windows", " win", "win32", "win64", "freebsd", "openbsd",
         "netbsd", "i386", "i686", "armv7", "aarch64", "arm64", ".deb", ".rpm", ".appimage", ".7z",
-        ".tar.bz2", ".tar.zst", ".sig", ".sha256", ".sha512", ".asc", ".pem", ".gpg", ".sbom",
+        ".tar.bz2", ".sig", ".sha256", ".sha512", ".asc", ".pem", ".gpg", ".sbom",
         ".msi", ".exe",
     ];
     let arch_keys = ["x86_64", "amd64", "x64"];
@@ -332,11 +332,22 @@ fn ensure_extracted(spec: &Spec, release: &Release, assume_yes: bool) -> Result<
         }
     };
 
+    let rdir = repo_dir(&spec.owner, &spec.name);
+    fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
+
+    // Stream-extract directly into the version dir. The cleanup guard removes
+    // the partial dir on any error/panic. Ctrl-C is handled separately by
+    // crate::sigint, which also wipes the registered path.
+    let _guard = CleanupGuard::arm(vdir.clone());
+    crate::sigint::register_cleanup(&vdir);
+
     println!("Downloading {} ({})...", asset.name, release.tag_name);
-    let bytes = github::download(&asset.browser_download_url)?;
+    let stream = github::download_stream(&asset.browser_download_url)?;
+    let mut hashing = HashingReader::new(stream);
+    archive::extract(&asset.name, &mut hashing, &vdir)?;
+    let got = hashing.finalize_hex();
 
     if let Some(expected) = expected_sha256 {
-        let got = sha256_hex(&bytes);
         if !got.eq_ignore_ascii_case(&expected) {
             return Err(format!(
                 "checksum mismatch for {}: expected {expected}, got {got}",
@@ -346,19 +357,63 @@ fn ensure_extracted(spec: &Spec, release: &Release, assume_yes: bool) -> Result<
         println!("Verified SHA-256: {expected}");
     }
 
-    let rdir = repo_dir(&spec.owner, &spec.name);
-    fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
-
-    let staging = tempfile::Builder::new()
-        .prefix(".staging-")
-        .tempdir_in(&rdir)
-        .map_err(|e| format!("tempdir in {}: {e}", rdir.display()))?;
-    archive::extract(&asset.name, &bytes, staging.path())?;
-    let staging_path = staging.keep();
-    fs::rename(&staging_path, &vdir).map_err(|e| {
-        format!("rename {} -> {}: {e}", staging_path.display(), vdir.display())
-    })?;
+    crate::sigint::clear_cleanup();
+    let mut g = _guard;
+    g.disarm();
     Ok(vdir)
+}
+
+struct CleanupGuard {
+    path: PathBuf,
+    armed: bool,
+}
+impl CleanupGuard {
+    fn arm(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+struct HashingReader<R> {
+    inner: R,
+    hasher: sha2::Sha256,
+}
+impl<R: io::Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        use sha2::Digest;
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+        }
+    }
+    fn finalize_hex(self) -> String {
+        use sha2::Digest;
+        let digest = self.hasher.finalize();
+        let mut out = String::with_capacity(64);
+        for b in digest {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+}
+impl<R: io::Read> io::Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use sha2::Digest;
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+        }
+        Ok(n)
+    }
 }
 
 fn link_all_executables(spec: &Spec, vdir: &Path, assume_yes: bool) -> Result<Vec<String>, String> {
@@ -463,16 +518,6 @@ fn fetch_expected_sha256(url: &str) -> Result<String, String> {
     Ok(hex)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for b in digest {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
-
 pub fn list() -> Result<(), String> {
     let root = data_dir();
     let entries = match fs::read_dir(&root) {
@@ -515,14 +560,31 @@ pub fn list() -> Result<(), String> {
         return Ok(());
     }
     rows.sort();
+
+    let linked_targets: Vec<PathBuf> = fs::read_dir(bin_dir())
+        .map(|it| {
+            it.flatten()
+                .filter_map(|e| fs::read_link(e.path()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let repo_w = rows
         .iter()
         .map(|(o, r, _)| o.len() + 1 + r.len())
         .max()
         .unwrap_or(0);
+    let ver_w = rows.iter().map(|(_, _, v)| v.len()).max().unwrap_or(0);
     for (owner, repo, v) in &rows {
         let full = format!("{owner}/{repo}");
-        println!("{full:<repo_w$}  {v}", repo_w = repo_w);
+        let vdir = version_dir(owner, repo, v);
+        let cached = !linked_targets.iter().any(|t| t.starts_with(&vdir));
+        let suffix = if cached { "  (cached)" } else { "" };
+        println!(
+            "{full:<repo_w$}  {v:<ver_w$}{suffix}",
+            repo_w = repo_w,
+            ver_w = ver_w
+        );
     }
     Ok(())
 }
@@ -779,7 +841,22 @@ pub fn run(input: &str, args: &[String]) -> Result<(), String> {
     let spec = parse_spec(input)?;
     println!("Resolving {}...", spec.repo());
     let release = fetch_release(&spec)?;
+    let was_cached = version_dir(&spec.owner, &spec.name, &release.tag_name).is_dir();
     let vdir = ensure_extracted(&spec, &release, true)?;
+    if was_cached {
+        let has_links = fs::read_dir(bin_dir())
+            .map(|it| {
+                it.flatten().any(|e| {
+                    fs::read_link(e.path())
+                        .map(|t| t.starts_with(&vdir))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !has_links {
+            println!("Using {} {} (cached)", spec.repo(), release.tag_name);
+        }
+    }
 
     let mut files = Vec::new();
     walk_files(&vdir, &mut files).map_err(|e| format!("walk {}: {e}", vdir.display()))?;

@@ -66,41 +66,78 @@ fn api_get(url: &str) -> Result<String, String> {
 }
 
 pub fn download(url: &str) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    let mut reader = download_stream(url)?;
+    std::io::copy(&mut reader, &mut buf).map_err(|e| format!("read {url}: {e}"))?;
+    Ok(buf)
+}
+
+/// Streaming download. The returned reader updates a progress bar on stderr
+/// as bytes are consumed, and writes a final newline on Drop when interactive.
+pub fn download_stream(url: &str) -> Result<ProgressStream, String> {
     let client = http::default_client();
     let headers: Vec<(&str, &str)> = vec![("User-Agent", USER_AGENT)];
-    let mut stream = client.get_streaming(url, &headers)?;
+    let stream = client.get_streaming(url, &headers)?;
     if stream.status() < 200 || stream.status() >= 300 {
         return Err(format!("HTTP {} downloading {url}", stream.status()));
     }
     let total = stream.content_length();
-
     let interactive = io::stderr().is_terminal();
-    let mut buf: Vec<u8> = Vec::with_capacity(total.unwrap_or(0) as usize);
-    let mut chunk = [0u8; 32 * 1024];
     let start = Instant::now();
-    let mut last_render = start - Duration::from_millis(100);
+    Ok(ProgressStream {
+        inner: stream,
+        total,
+        read_so_far: 0,
+        start,
+        last_render: start - Duration::from_millis(100),
+        interactive,
+        finished: false,
+    })
+}
 
-    loop {
-        let n = stream
-            .read(&mut chunk)
-            .map_err(|e| format!("read {url}: {e}"))?;
+pub struct ProgressStream {
+    inner: Box<dyn http::HttpStream + Send>,
+    total: Option<u64>,
+    read_so_far: u64,
+    start: Instant,
+    last_render: Instant,
+    interactive: bool,
+    finished: bool,
+}
+
+impl Read for ProgressStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
         if n == 0 {
-            break;
+            self.finalize();
+            return Ok(0);
         }
-        buf.extend_from_slice(&chunk[..n]);
+        self.read_so_far += n as u64;
+        if self.interactive && self.last_render.elapsed() >= Duration::from_millis(80) {
+            render_progress(self.read_so_far, self.total, self.start);
+            self.last_render = Instant::now();
+        }
+        Ok(n)
+    }
+}
 
-        if interactive && last_render.elapsed() >= Duration::from_millis(80) {
-            render_progress(buf.len() as u64, total, start);
-            last_render = Instant::now();
+impl ProgressStream {
+    fn finalize(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if self.interactive {
+            render_progress(self.read_so_far, self.total, self.start);
+            let _ = writeln!(io::stderr().lock());
         }
     }
+}
 
-    if interactive {
-        render_progress(buf.len() as u64, total, start);
-        let _ = writeln!(io::stderr().lock());
+impl Drop for ProgressStream {
+    fn drop(&mut self) {
+        self.finalize();
     }
-
-    Ok(buf)
 }
 
 fn render_progress(done: u64, total: Option<u64>, start: Instant) {

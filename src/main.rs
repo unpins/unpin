@@ -7,6 +7,7 @@ mod github;
 mod http;
 mod install;
 mod panic;
+mod sigint;
 
 #[derive(Clone, Debug)]
 enum Cmd {
@@ -90,6 +91,7 @@ fn cli() -> bpaf::OptionParser<Cmd> {
 
 fn main() -> ExitCode {
     panic::install();
+    sigint::install();
     let cmd = cli().run();
     let result = match cmd {
         Cmd::Install { assume_yes, pkgs } => install::install_many(&pkgs, assume_yes),
