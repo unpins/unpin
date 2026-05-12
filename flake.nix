@@ -91,8 +91,17 @@
       # Cross-build: aarch64-darwin → x86_64-darwin. Same single-runner
       # pattern as windowsUnpin (one runner produces both arches), used to
       # avoid the increasingly-scarce macos-13 native Intel runner.
-      # pkgsStatic on Darwin still leaves libSystem dynamic (Apple
-      # constraint) but keeps the binary free of /nix/store paths.
+      #
+      # Plain `cross.rustPlatform` (NOT `cross.pkgsStatic.rustPlatform`)
+      # because the pkgsStatic view triggers a rebuild of the cross
+      # cctools/ld64 toolchain in its "static" variant, which fails on
+      # `xar-static-arm64-apple-darwin`: configure errors with "Cannot
+      # build without libxml2" — the cross-static libxml2 chain is broken
+      # upstream. We get the same /nix/store-free property as the native
+      # build because unpin's only C dep is mbedtls (vendored, statically
+      # linked into the rustc output via mbedtls-sys-auto); everything
+      # else is pure Rust, so the produced Mach-O references only
+      # libSystem.dylib.
       darwinX86Unpin =
         let
           pkgs = nixpkgsFor.aarch64-darwin;
@@ -100,8 +109,7 @@
         in
         mkUnpin {
           hostPkgs = pkgs;
-          rustPlatform = cross.pkgsStatic.rustPlatform;
-          env.RUSTFLAGS = "-C relocation-model=static";
+          rustPlatform = cross.rustPlatform;
         };
 
       nativePackages = ulib.forAllNative (system: {
