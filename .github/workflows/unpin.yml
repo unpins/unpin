@@ -1,9 +1,8 @@
-name: Build and Publish
+name: Build
 
 on:
   push:
     branches: [ "main" ]
-    tags: [ 'v*' ]
   workflow_dispatch:
 
 concurrency:
@@ -13,9 +12,8 @@ concurrency:
 jobs:
   build:
     # action-build/build.yml has a nested `release` job declaring
-    # `contents: write`. GitHub checks permissions statically — even when
-    # create_release is false, the caller must grant the permission for the
-    # workflow to start.
+    # `contents: write`. GitHub checks permissions statically, so the caller
+    # must grant it even though we never set create_release=true here.
     permissions:
       contents: write
     uses: unpins/action-build/.github/workflows/build.yml@v1
@@ -25,7 +23,6 @@ jobs:
       # unpin is the bootstrap: users download it by hand from unpins.org,
       # so the artifact gets a stable filename without version embedded.
       bootstrap_naming: true
-      create_release: ${{ startsWith(github.ref, 'refs/tags/') }}
       platforms: |
         [
           {"runner":"ubuntu-latest",    "os":"linux",   "arch":"x86_64"},
