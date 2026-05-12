@@ -88,6 +88,22 @@
           auditable = false;
         };
 
+      # Cross-build: aarch64-darwin → x86_64-darwin. Same single-runner
+      # pattern as windowsUnpin (one runner produces both arches), used to
+      # avoid the increasingly-scarce macos-13 native Intel runner.
+      # pkgsStatic on Darwin still leaves libSystem dynamic (Apple
+      # constraint) but keeps the binary free of /nix/store paths.
+      darwinX86Unpin =
+        let
+          pkgs = nixpkgsFor.aarch64-darwin;
+          cross = pkgs.pkgsCross.x86_64-darwin;
+        in
+        mkUnpin {
+          hostPkgs = pkgs;
+          rustPlatform = cross.pkgsStatic.rustPlatform;
+          env.RUSTFLAGS = "-C relocation-model=static";
+        };
+
       nativePackages = ulib.forAllNative (system: {
         default = nativeUnpin system;
       });
@@ -97,6 +113,10 @@
         x86_64-linux = nativePackages.x86_64-linux // {
           # Address as: packages.x86_64-linux."windows-x86_64" (see workflow).
           "windows-x86_64" = windowsUnpin;
+        };
+        aarch64-darwin = nativePackages.aarch64-darwin // {
+          # Address as: packages.aarch64-darwin."darwin-x86_64".
+          "darwin-x86_64" = darwinX86Unpin;
         };
       };
 

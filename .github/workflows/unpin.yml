@@ -23,12 +23,17 @@ jobs:
       # unpin is the bootstrap: users download it by hand from unpins.org,
       # so the artifact gets a stable filename without version embedded.
       bootstrap_naming: true
+      # Same shape as action-build's default plus a windows cross entry.
+      # darwin-x86_64 is cross-built from macos-14 (aarch64) using
+      # pkgsCross.x86_64-darwin — matches the pattern action-build@v1 uses
+      # by default; we list everything explicitly only because of the
+      # extra windows row (no way to "append" to the default input array).
       platforms: |
         [
           {"runner":"ubuntu-latest",    "os":"linux",   "arch":"x86_64"},
           {"runner":"ubuntu-24.04-arm", "os":"linux",   "arch":"aarch64"},
-          {"runner":"macos-13",         "os":"darwin",  "arch":"x86_64"},
           {"runner":"macos-14",         "os":"darwin",  "arch":"aarch64"},
+          {"runner":"macos-14",         "os":"darwin",  "arch":"x86_64", "attr":"packages.aarch64-darwin.\"darwin-x86_64\""},
           {"runner":"ubuntu-latest",    "os":"windows", "arch":"x86_64", "attr":"packages.x86_64-linux.\"windows-x86_64\""}
         ]
     secrets:
