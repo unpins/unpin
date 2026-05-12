@@ -36,7 +36,7 @@
       # `bindgenHook` is taken from the SAME rustPlatform as the rust toolchain,
       # so bindgen gets the right `--target` for `mbedtls-sys-auto` (cross
       # mismatches give `ssize_t (4) vs pointer size (8)` panics).
-      mkUnpin = { hostPkgs, rustPlatform, env ? {}, auditable ? true }:
+      mkUnpin = { hostPkgs, rustPlatform, env ? {}, auditable ? true, extraNativeBuildInputs ? [] }:
         (rustPlatform.buildRustPackage {
           pname = "unpin";
           version = "0.1.0";
@@ -47,7 +47,7 @@
             hostPkgs.perl
             hostPkgs.python3
             rustPlatform.bindgenHook
-          ];
+          ] ++ extraNativeBuildInputs;
           inherit env;
           # CI runs `cargo test` directly; tests touch ~/.local and the network.
           doCheck = false;
@@ -102,6 +102,14 @@
       # linked into the rustc output via mbedtls-sys-auto); everything
       # else is pure Rust, so the produced Mach-O references only
       # libSystem.dylib.
+      #
+      # `hostPkgs.libiconv` in nativeBuildInputs is required for the
+      # mbedtls-sys-auto *build.rs* link step: rustc injects `-liconv`
+      # into the host (aarch64-darwin) link command, but the cross
+      # rustPlatform's environment doesn't put it on the linker search
+      # path by default. Native darwin builds don't hit this because the
+      # native stdenv resolves libiconv from libSystem via different
+      # plumbing.
       darwinX86Unpin =
         let
           pkgs = nixpkgsFor.aarch64-darwin;
@@ -110,6 +118,7 @@
         mkUnpin {
           hostPkgs = pkgs;
           rustPlatform = cross.rustPlatform;
+          extraNativeBuildInputs = [ pkgs.libiconv ];
         };
 
       nativePackages = ulib.forAllNative (system: {
