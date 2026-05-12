@@ -24,14 +24,18 @@
     },
     "unpins-lib": {
       "locked": {
-        "lastModified": 1778446285,
-        "narHash": "sha256-+bb4K/cILJ/XQizhzWQoac2dCaySwDIKG7Gdokceo/4=",
-        "path": "/home/malbarbo/projetos/unpins/nix-lib",
-        "type": "path"
+        "lastModified": 1778550377,
+        "narHash": "sha256-kUvwbT6vTMRuljHiaN3zT/tkh4QO1yIFFxJqSebmS1E=",
+        "owner": "unpins",
+        "repo": "nix-lib",
+        "rev": "6e3766ae890c05a5f7b32f4165a6d5927e342fdf",
+        "type": "github"
       },
       "original": {
-        "path": "/home/malbarbo/projetos/unpins/nix-lib",
-        "type": "path"
+        "owner": "unpins",
+        "ref": "v1",
+        "repo": "nix-lib",
+        "type": "github"
       }
     }
   },

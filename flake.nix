@@ -8,8 +8,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    # TODO: switch to "github:unpins/nix-lib" once published.
-    unpins-lib.url = "path:/home/malbarbo/projetos/unpins/nix-lib";
+    unpins-lib.url = "github:unpins/nix-lib/v1";
   };
 
   outputs = { self, nixpkgs, unpins-lib }:
