@@ -19,6 +19,28 @@ enum Cmd {
     Info { pkgs: Vec<String> },
     Prune,
     Run { pkg: String, args: Vec<String> },
+    Completion { shell: Shell },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Shell {
+    Bash,
+    Zsh,
+    Fish,
+    Elvish,
+}
+
+impl std::str::FromStr for Shell {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "bash" => Ok(Shell::Bash),
+            "zsh" => Ok(Shell::Zsh),
+            "fish" => Ok(Shell::Fish),
+            "elvish" => Ok(Shell::Elvish),
+            _ => Err(format!("unknown shell '{s}' (supported: bash, zsh, fish, elvish)")),
+        }
+    }
 }
 
 fn yes_flag() -> impl Parser<bool> {
@@ -117,7 +139,16 @@ fn cli() -> bpaf::OptionParser<Cmd> {
             .command("run")
     };
 
-    construct!([install, update, remove, list, info, prune, run])
+    let completion = {
+        let shell = positional::<Shell>("SHELL")
+            .help("bash | zsh | fish | elvish");
+        construct!(Cmd::Completion { shell })
+            .to_options()
+            .descr("Print a shell completion script. Pipe it to your shell's completion directory (see README).")
+            .command("completion")
+    };
+
+    construct!([install, update, remove, list, info, prune, run, completion])
         .to_options()
         .usage("Usage: unpin [COMMAND] ...")
 }
@@ -146,7 +177,7 @@ fn term_width() -> usize {
 }
 
 const SUBCOMMANDS: &[&str] = &[
-    "install", "update", "remove", "list", "info", "prune", "run",
+    "install", "update", "remove", "list", "info", "prune", "run", "completion",
 ];
 
 fn main() -> ExitCode {
@@ -208,6 +239,26 @@ fn main() -> ExitCode {
         Cmd::Info { pkgs } => install::info_many(&pkgs),
         Cmd::Prune => install::prune(),
         Cmd::Run { pkg, args } => install::run(&pkg, &args),
+        Cmd::Completion { shell } => {
+            // bpaf's `autocomplete` feature exposes hidden `--bpaf-complete-style-<shell>`
+            // flags that print the script for that shell. We re-enter the parser with
+            // that flag so users see a clean `unpin completion <shell>` interface.
+            let flag = match shell {
+                Shell::Bash => "--bpaf-complete-style-bash",
+                Shell::Zsh => "--bpaf-complete-style-zsh",
+                Shell::Fish => "--bpaf-complete-style-fish",
+                Shell::Elvish => "--bpaf-complete-style-elvish",
+            };
+            let argv = [flag];
+            let inner_args = bpaf::Args::from(&argv[..]).set_name("unpin");
+            match cli().run_inner(inner_args) {
+                Ok(_) => Err("completion: unexpected Ok from bpaf".to_owned()),
+                Err(err) => {
+                    err.print_message(term_width());
+                    return ExitCode::from(err.exit_code() as u8);
+                }
+            }
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

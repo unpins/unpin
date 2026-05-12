@@ -21,7 +21,7 @@ minreq = { version = "2", default-features = false, features = ["https-rustls"],
 mbedtls = { version = "0.12", default-features = false, features = ["std", "time", "ssl", "x509"], optional = true }
 fluent-uri = { version = "0.3", default-features = false, features = ["std"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
-bpaf = { version = "0.9", default-features = false, features = ["bright-color"] }
+bpaf = { version = "0.9", default-features = false, features = ["bright-color", "autocomplete"] }
 nanoserde = { version = "0.2", default-features = false, features = ["json", "std"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 xz2 = { version = "0.1", features = ["static"] }

@@ -68,6 +68,7 @@ unpin list                   List installed packages
 unpin info <name>...         Show details for installed packages
 unpin prune                  Drop old versions, keep the active one
 unpin run <repo> [args...]   Fetch and execute a binary without linking
+unpin completion <shell>     Print a shell completion script
 ```
 
 Common flags:
@@ -83,6 +84,28 @@ Common flags:
 A `<repo>` is `owner/name[@version]`. When the owner is omitted, `unpins` is
 assumed — so `unpin install htop` resolves to `unpins/htop`. When `@version`
 is omitted, the latest release is used.
+
+## Shell completion
+
+`unpin completion <shell>` prints a script that hooks the binary into your
+shell's completion. Generated dynamically by the parser, so it always matches
+the installed version's commands and flags.
+
+```sh
+# bash
+unpin completion bash > ~/.local/share/bash-completion/completions/unpin
+
+# zsh — add ~/.zfunc to fpath in ~/.zshrc, then:
+unpin completion zsh > ~/.zfunc/_unpin
+
+# fish
+unpin completion fish > ~/.config/fish/completions/unpin.fish
+
+# elvish
+unpin completion elvish >> ~/.config/elvish/rc.elv
+```
+
+Start a new shell session to pick up the completion.
 
 ## License
 
