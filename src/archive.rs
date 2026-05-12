@@ -1,7 +1,8 @@
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+use crate::platform;
 
 pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
@@ -22,13 +23,15 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
     } else if lower.ends_with(".zip") {
         unpack_zip_stream(reader, dest)
     } else {
-        // Bare binary: stream directly to a file with the asset's name.
+        // Bare binary: stream directly to a file with the asset's name. On
+        // Unix the file is chmod'd +x; on Windows we rely on the `.exe`
+        // extension (the file ships with it).
         let path = dest.join(asset_name);
         let mut out = fs::File::create(&path)
             .map_err(|e| format!("create {}: {e}", path.display()))?;
         let mut r = reader;
         io::copy(&mut r, &mut out).map_err(|e| format!("write {}: {e}", path.display()))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        platform::set_unix_mode(&path, 0o755)
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
         Ok(())
     }
@@ -101,7 +104,7 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
     let modes = parse_central_directory(&cd_buf[cd_start..]);
     for (name, path) in &paths {
         if let Some(mode) = modes.get(name) {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(*mode));
+            let _ = platform::set_unix_mode(path, *mode);
         } else {
             // Zip made on a non-Unix host doesn't encode permissions. Fall
             // back to detecting ELF/shebang and promoting to 0o755.
@@ -111,7 +114,7 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                 let is_elf = n >= 4 && &head[..4] == b"\x7fELF";
                 let is_shebang = n >= 2 && &head[..2] == b"#!";
                 if is_elf || is_shebang {
-                    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
+                    let _ = platform::set_unix_mode(path, 0o755);
                 }
             }
         }
@@ -204,10 +207,14 @@ fn parse_central_directory(buf: &[u8]) -> std::collections::HashMap<String, u32>
     out
 }
 
-#[cfg(test)]
+// Tests check Unix permission bits, so they only run on Unix targets. (The
+// production code is portable; we just have no equivalent assertions for
+// Windows extraction.)
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
 
     fn tar_with(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());

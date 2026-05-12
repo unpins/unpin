@@ -1282,6 +1282,7 @@ name = "unpin"
 version = "0.1.0"
 dependencies = [
  "bpaf",
+ "console",
  "ctrlc",
  "flate2",
  "fluent-uri",

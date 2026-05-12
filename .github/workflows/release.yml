@@ -1,0 +1,28 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    uses: unpins/action-build/.github/workflows/release.yml@main
+    with:
+      package_name: 'unpin'
+      package_data: false
+      bootstrap_naming: true
+      platforms: |
+        [
+          {"runner":"ubuntu-latest",    "os":"linux",   "arch":"x86_64"},
+          {"runner":"ubuntu-24.04-arm", "os":"linux",   "arch":"aarch64"},
+          {"runner":"macos-13",         "os":"darwin",  "arch":"x86_64"},
+          {"runner":"macos-14",         "os":"darwin",  "arch":"aarch64"},
+          {"runner":"ubuntu-latest",    "os":"windows", "arch":"x86_64", "attr":"packages.x86_64-linux.\"windows-x86_64\""}
+        ]
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}

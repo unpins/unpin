@@ -7,15 +7,16 @@ mod github;
 mod http;
 mod install;
 mod panic;
+mod platform;
 mod sigint;
 
 #[derive(Clone, Debug)]
 enum Cmd {
     Install { assume_yes: bool, jobs: u8, pick: bool, verbose: bool, pkgs: Vec<String> },
     Update { assume_yes: bool, jobs: u8, pick: bool, verbose: bool, names: Vec<String> },
-    Remove { names: Vec<String> },
+    Remove { assume_yes: bool, names: Vec<String> },
     List,
-    Info { pkg: String },
+    Info { pkgs: Vec<String> },
     Prune,
     Run { pkg: String, args: Vec<String> },
 }
@@ -33,7 +34,8 @@ fn jobs_flag() -> impl Parser<u8> {
 }
 
 fn pick_flag() -> impl Parser<bool> {
-    bpaf::long("pick")
+    short('p')
+        .long("pick")
         .help("Always prompt to choose the asset (instead of auto-picking)")
         .switch()
 }
@@ -56,7 +58,7 @@ fn cli() -> bpaf::OptionParser<Cmd> {
             .some("expected at least one package");
         construct!(Cmd::Install { assume_yes(yes), jobs, pick, verbose, pkgs })
             .to_options()
-            .descr("Install one or more packages from GitHub releases.")
+            .descr("Install one or more packages from GitHub releases. Default command — `unpin owner/repo` is equivalent to `unpin install owner/repo`.")
             .command("install")
     };
 
@@ -74,13 +76,16 @@ fn cli() -> bpaf::OptionParser<Cmd> {
             .command("update")
     };
 
-    let remove = positional::<String>("NAME")
-        .help("installed package name")
-        .some("expected at least one package")
-        .map(|names| Cmd::Remove { names })
-        .to_options()
-        .descr("Remove one or more installed packages.")
-        .command("remove");
+    let remove = {
+        let yes = yes_flag();
+        let names = positional::<String>("NAME")
+            .help("installed package name; empty = remove all (with confirmation)")
+            .many();
+        construct!(Cmd::Remove { assume_yes(yes), names })
+            .to_options()
+            .descr("Remove one, several, or (with no args) all installed packages.")
+            .command("remove")
+    };
 
     let list = pure(Cmd::List)
         .to_options()
@@ -89,14 +94,15 @@ fn cli() -> bpaf::OptionParser<Cmd> {
 
     let info = positional::<String>("PKG")
         .help("installed name, owner/repo, or bare name for unpins/<name>")
-        .map(|pkg| Cmd::Info { pkg })
+        .some("expected at least one package")
+        .map(|pkgs| Cmd::Info { pkgs })
         .to_options()
-        .descr("Show details about an installed package, or a remote release if not installed.")
+        .descr("Show details about one or more packages (installed or remote).")
         .command("info");
 
     let prune = pure(Cmd::Prune)
         .to_options()
-        .descr("Remove dangling unpin-managed symlinks from ~/.local/bin.")
+        .descr("Remove dangling links and unused version dirs from the unpin cache.")
         .command("prune");
 
     let run = {
@@ -107,11 +113,13 @@ fn cli() -> bpaf::OptionParser<Cmd> {
             .many();
         construct!(Cmd::Run { pkg, args })
             .to_options()
-            .descr("Download a package into a temp dir and run it without installing.")
+            .descr("Run a package's binary without installing it (no entry added to PATH).")
             .command("run")
     };
 
-    construct!([install, update, remove, list, info, prune, run]).to_options()
+    construct!([install, update, remove, list, info, prune, run])
+        .to_options()
+        .usage("Usage: unpin [COMMAND] ...")
 }
 
 fn print_banner() {
@@ -120,6 +128,21 @@ fn print_banner() {
         env!("CARGO_PKG_VERSION")
     );
     println!("https://unpins.org");
+}
+
+fn print_auth_footer() {
+    println!();
+    println!("Auth (optional, raises GitHub API rate limit from 60/h to 5000/h):");
+    println!("  UNPIN_GITHUB_TOKEN | GITHUB_TOKEN | GH_TOKEN   token from env var");
+    println!("  UNPIN_USE_GH_AUTH=1                            use `gh auth token`");
+}
+
+fn term_width() -> usize {
+    console::Term::stdout()
+        .size_checked()
+        .map(|(_rows, cols)| cols as usize)
+        .unwrap_or(80)
+        .clamp(40, 120)
 }
 
 const SUBCOMMANDS: &[&str] = &[
@@ -138,7 +161,9 @@ fn main() -> ExitCode {
         println!("unpin {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-    if pre_ddash.iter().any(|a| *a == "--help" || *a == "-h") {
+    let is_help = pre_ddash.iter().any(|a| *a == "--help" || *a == "-h");
+    let is_top_help = is_help && !pre_ddash.iter().any(|a| SUBCOMMANDS.contains(a));
+    if is_help {
         print_banner();
         println!();
     }
@@ -164,7 +189,10 @@ fn main() -> ExitCode {
     let cmd = match cli().run_inner(bpaf_args) {
         Ok(c) => c,
         Err(err) => {
-            err.print_message(80);
+            err.print_message(term_width());
+            if is_top_help {
+                print_auth_footer();
+            }
             return ExitCode::from(err.exit_code() as u8);
         }
     };
@@ -175,9 +203,9 @@ fn main() -> ExitCode {
         Cmd::Update { assume_yes, jobs, pick, verbose, names } => {
             install::update(&names, assume_yes, jobs, pick, verbose)
         }
-        Cmd::Remove { names } => install::remove_many(&names),
+        Cmd::Remove { assume_yes, names } => install::remove_many(&names, assume_yes),
         Cmd::List => install::list(),
-        Cmd::Info { pkg } => install::info(&pkg),
+        Cmd::Info { pkgs } => install::info_many(&pkgs),
         Cmd::Prune => install::prune(),
         Cmd::Run { pkg, args } => install::run(&pkg, &args),
     };

@@ -1,7 +1,5 @@
-use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -11,6 +9,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
 use crate::archive;
 use crate::github::{self, Asset, Release};
+use crate::platform;
 
 #[derive(Clone)]
 pub struct Spec {
@@ -50,17 +49,12 @@ pub fn parse_spec(input: &str) -> Result<Spec, String> {
     })
 }
 
-pub fn data_dir() -> PathBuf {
-    if let Ok(x) = env::var("XDG_DATA_HOME")
-        && !x.is_empty()
-    {
-        return PathBuf::from(x).join("unpin");
-    }
-    PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/share/unpin")
+fn data_dir() -> PathBuf {
+    platform::data_dir()
 }
 
-pub fn bin_dir() -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/bin")
+fn bin_dir() -> PathBuf {
+    platform::bin_dir()
 }
 
 fn repo_dir(owner: &str, name: &str) -> PathBuf {
@@ -117,57 +111,42 @@ fn resolve_installed(name: &str) -> Result<Option<(String, String)>, String> {
     Ok(found)
 }
 
-/// Find which version dir holds the binaries currently linked into ~/.local/bin.
-/// Returns the tag name. If no linked version found, returns the lexicographic
-/// max of the existing version dirs (best-effort).
+/// Return the version of `owner/name` currently linked from `bin_dir`, or
+/// `None` if no link points into this repo's data dir. "Active" == "in PATH".
+///
+/// Earlier versions had a lex-max fallback when no link was found, but lex
+/// ordering trips on common tags (`v1.10.0` < `v1.9.0`), giving wrong answers
+/// in `info` ("Active: v1.9.0" when nothing is linked) and `update` (wrong
+/// "from" in the `from -> to` line). Returning `None` is honest and the
+/// pipeline handles it fine: `preflight_extract` sees the cached vdir and
+/// skips the download, so `update` just re-links without re-downloading.
 fn active_version(owner: &str, name: &str) -> Option<String> {
     let rdir = repo_dir(owner, name);
-    let mut versions: Vec<String> = fs::read_dir(&rdir)
-        .ok()?
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    if versions.is_empty() {
-        return None;
-    }
-    // Try to identify the version linked from bin_dir.
-    if let Ok(bins) = fs::read_dir(bin_dir()) {
-        for entry in bins.flatten() {
-            if let Ok(target) = fs::read_link(entry.path())
-                && let Ok(rel) = target.strip_prefix(&rdir)
-                && let Some(first) = rel.components().next()
-            {
-                let v = first.as_os_str().to_string_lossy().into_owned();
-                if versions.iter().any(|x| x == &v) {
-                    return Some(v);
-                }
+    let bins = fs::read_dir(bin_dir()).ok()?;
+    for entry in bins.flatten() {
+        if let Some(target) = platform::read_link(&entry.path())
+            && let Ok(rel) = target.strip_prefix(&rdir)
+            && let Some(first) = rel.components().next()
+        {
+            let v = first.as_os_str().to_string_lossy().into_owned();
+            if version_dir(owner, name, &v).is_dir() {
+                return Some(v);
             }
         }
     }
-    versions.sort();
-    versions.pop()
+    None
 }
 
 /// Classify an asset that should be excluded from the picker. Returns a short
 /// human reason, or `None` if the asset is potentially installable.
 fn classify_excluded(name_lower: &str) -> Option<&'static str> {
-    const CROSS_PLATFORM: &[&str] = &[
-        "darwin", "macos", "apple", "windows", " win", "win32", "win64",
-        "freebsd", "openbsd", "netbsd",
-    ];
-    const OTHER_ARCH: &[&str] = &["i386", "i686", "armv7", "aarch64", "arm64"];
-    const AUXILIARY: &[&str] = &[
-        ".deb", ".rpm", ".appimage", ".7z", ".tar.bz2", ".sig", ".sha256",
-        ".sha512", ".asc", ".pem", ".gpg", ".sbom", ".msi", ".exe",
-    ];
-    if CROSS_PLATFORM.iter().any(|k| name_lower.contains(k)) {
+    if platform::other_os_keys().iter().any(|k| name_lower.contains(k)) {
         return Some("other platform");
     }
-    if OTHER_ARCH.iter().any(|k| name_lower.contains(k)) {
+    if platform::other_arch_keys().iter().any(|k| name_lower.contains(k)) {
         return Some("other arch");
     }
-    if AUXILIARY.iter().any(|k| name_lower.contains(k)) {
+    if platform::auxiliary_keys().iter().any(|k| name_lower.contains(k)) {
         return Some("auxiliary");
     }
     if name_lower.contains(".bsdiff") {
@@ -178,8 +157,8 @@ fn classify_excluded(name_lower: &str) -> Option<&'static str> {
     if name_lower.ends_with(".zst") && !name_lower.ends_with(".tar.zst") {
         return Some("unsupported format");
     }
-    if !name_lower.contains("linux") {
-        return Some("not linux");
+    if !platform::current_os_keys().iter().any(|k| name_lower.contains(k)) {
+        return Some("no OS tag");
     }
     None
 }
@@ -190,7 +169,7 @@ pub fn pick_asset<'a>(
     force_pick: bool,
     verbose: bool,
 ) -> Result<&'a Asset, String> {
-    let arch_keys = ["x86_64", "amd64", "x64"];
+    let arch_keys = platform::current_arch_keys();
 
     let mut selectable: Vec<&Asset> = Vec::new();
     let mut ignored: Vec<(&Asset, &'static str)> = Vec::new();
@@ -254,8 +233,10 @@ pub fn pick_asset<'a>(
 
     if candidates.is_empty() {
         return Err(format!(
-            "no matching Linux x86_64 asset.\nAvailable assets:\n{}",
-            assets
+            "no matching {os} {arch} asset.\nAvailable assets:\n{list}",
+            os = std::env::consts::OS,
+            arch = std::env::consts::ARCH,
+            list = assets
                 .iter()
                 .map(|a| format!("  {}", a.name))
                 .collect::<Vec<_>>()
@@ -322,29 +303,24 @@ fn walk_files(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
 }
 
 fn is_executable(p: &Path) -> bool {
-    fs::metadata(p)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    platform::is_executable(p)
 }
 
 fn ensure_executable(p: &Path) -> Result<(), String> {
-    if is_executable(p) {
-        return Ok(());
-    }
-    let mut perms = fs::metadata(p)
-        .map_err(|e| format!("stat {}: {e}", p.display()))?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(p, perms).map_err(|e| format!("chmod {}: {e}", p.display()))
+    platform::ensure_executable(p)
 }
 
 /// Strip trailing target-triple markers from a binary filename. Useful when
 /// projects ship `tool-x86_64-linux-musl` and we want the link to be `tool`.
+/// On Windows the `.exe` suffix is stripped first.
 fn short_binary_name(name: &str) -> &str {
+    #[cfg(windows)]
+    let name = name.strip_suffix(".exe").unwrap_or(name);
     const MARKERS: &[&str] = &[
         "-x86_64", "_x86_64", "-amd64", "_amd64", "-aarch64", "_aarch64", "-arm64", "_arm64",
         "-i686", "_i686", "-i386", "_i386", "-linux", "_linux", "-darwin", "_darwin", "-apple",
-        "-pc-", "-musl", "-gnu",
+        "-windows", "_windows", "-win64", "_win64", "-win32", "_win32", "-mingw", "_mingw",
+        "-msvc", "_msvc", "-pc-", "-musl", "-gnu",
     ];
     let mut earliest: Option<usize> = None;
     for m in MARKERS {
@@ -359,14 +335,13 @@ fn short_binary_name(name: &str) -> &str {
 }
 
 fn link_binary(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, String> {
-    let parent = link.parent().ok_or("symlink has no parent")?;
+    let parent = link.parent().ok_or("link has no parent")?;
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
 
-    if let Ok(meta) = fs::symlink_metadata(link) {
-        let managed = meta.file_type().is_symlink()
-            && fs::read_link(link)
-                .map(|t| t.starts_with(data_dir()))
-                .unwrap_or(false);
+    if link.exists() || fs::symlink_metadata(link).is_ok() {
+        let managed = platform::read_link(link)
+            .map(|t| t.starts_with(data_dir()))
+            .unwrap_or(false);
         if !managed && !assume_yes {
             let q = format!(
                 "{} already exists and was not installed by unpin. Overwrite?",
@@ -382,9 +357,8 @@ fn link_binary(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, Str
         }
         let _ = fs::remove_file(link);
     }
-    symlink(target, link).map_err(|e| {
-        format!("symlink {} -> {}: {e}", link.display(), target.display())
-    })?;
+    platform::create_link(target, link)
+        .map_err(|e| format!("link {} -> {}: {e}", link.display(), target.display()))?;
     Ok(true)
 }
 
@@ -453,26 +427,45 @@ fn preflight_extract(
     })
 }
 
-/// Worker body: download + extract + verify. No prompts, no stdout/stderr;
-/// progress is reported through the provided `ProgressBar` and `multi`-routed
-/// log lines. Safe to call from a worker thread in `thread::scope`.
-fn do_extract(job: &ExtractJob, bar: ProgressBar, multi: &MultiProgress) -> Result<(), String> {
+/// Worker body: download + extract + verify. The bar must already be
+/// registered with `multi` (pre-added on the main thread). Safe to call from a
+/// worker thread in `thread::scope`.
+///
+/// On success the bar is cleared from the terminal. On failure the bar is
+/// re-styled red, the reason is set as its message, and it is abandoned —
+/// leaving the failure visible above any later output.
+fn do_extract(job: &ExtractJob, bar: &ProgressBar, multi: &MultiProgress) -> Result<(), String> {
     let Some(asset) = job.asset.as_ref() else {
         return Ok(()); // cached
     };
+    let result = do_extract_inner(job, asset, bar, multi);
+    match &result {
+        Ok(()) => bar.finish_and_clear(),
+        Err(e) => {
+            bar.set_style(github::download_error_style());
+            bar.set_message(e.clone());
+            bar.abandon();
+        }
+    }
+    result
+}
 
+fn do_extract_inner(
+    job: &ExtractJob,
+    asset: &Asset,
+    bar: &ProgressBar,
+    multi: &MultiProgress,
+) -> Result<(), String> {
     let rdir = repo_dir(&job.spec.owner, &job.spec.name);
     fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
 
     crate::sigint::push_cleanup(&job.vdir);
     let mut guard = CleanupGuard::arm(job.vdir.clone());
 
-    bar.set_prefix(format!("{} {}", job.spec.name, job.release.tag_name));
-    let stream = github::download_stream_into(&asset.browser_download_url, bar.clone())?;
+    let stream = github::download_stream_into(&asset.browser_download_url, bar)?;
     let mut hashing = HashingReader::new(stream);
     archive::extract(&asset.name, &mut hashing, &job.vdir)?;
     let got = hashing.finalize_hex();
-    bar.finish_and_clear();
 
     if let Some(expected) = job.expected_sha256.as_ref() {
         if !got.eq_ignore_ascii_case(expected) {
@@ -570,7 +563,7 @@ fn link_all_executables(spec: &Spec, vdir: &Path, assume_yes: bool) -> Result<Ve
             .and_then(|n| n.to_str())
             .ok_or("non-utf8 binary name")?;
         let short = short_binary_name(basename);
-        let link = bin.join(short);
+        let link = bin.join(platform::link_filename(short));
         if link_binary(target, &link, assume_yes)? {
             linked.push(short.to_owned());
         }
@@ -585,27 +578,50 @@ pub fn install_many(
     pick: bool,
     verbose: bool,
 ) -> Result<(), String> {
-    let specs: Vec<(String, Spec)> = inputs
+    let parsed: Vec<(String, Spec)> = inputs
         .iter()
         .map(|s| parse_spec(s).map(|sp| (s.clone(), sp)))
         .collect::<Result<_, _>>()?;
-    run_pipeline(specs, assume_yes, jobs, pick, verbose)
+    // Dedup by (owner, name, version), preserving first-seen order: two
+    // identical args (or two args that normalize to the same spec, e.g.
+    // "ripgrep" and "unpins/ripgrep") would otherwise race on the same vdir
+    // in the parallel phase. Linear scan is fine — N is the CLI arg count.
+    let mut specs: Vec<(String, Spec)> = Vec::with_capacity(parsed.len());
+    for (label, spec) in parsed {
+        let dup = specs.iter().any(|(_, s)| {
+            s.owner == spec.owner && s.name == spec.name && s.version == spec.version
+        });
+        if !dup {
+            specs.push((label, spec));
+        }
+    }
+    run_pipeline(specs, assume_yes, jobs, pick, verbose, Vec::new())
 }
 
 /// Three-phase pipeline shared by `install` and `update`.
 /// Phase A is serial (may prompt); Phase B is parallel; Phase C is serial.
+///
+/// All error messages are collected and printed in a single batch at the very
+/// end — interleaving stdout (progress) with stderr (errors) was producing
+/// out-of-order output, and Phase B failed bars stay visible in red anyway.
 fn run_pipeline(
     specs: Vec<(String, Spec)>,
     assume_yes: bool,
     jobs: u8,
     pick: bool,
     verbose: bool,
+    mut errors: Vec<String>,
 ) -> Result<(), String> {
     if specs.is_empty() {
-        return Ok(());
+        if errors.is_empty() {
+            return Ok(());
+        }
+        for err in &errors {
+            eprintln!("{err}");
+        }
+        return Err(format!("{} operation(s) failed", errors.len()));
     }
 
-    let mut last_err: Option<String> = None;
     let mut prepared: Vec<(String, ExtractJob)> = Vec::new();
 
     // ---- Phase A: serial preflight (fetch release, pick asset, prompt) ----
@@ -614,16 +630,14 @@ fn run_pipeline(
         let release = match fetch_release(&spec) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("unpin: {label}: {e}");
-                last_err = Some(e);
+                errors.push(format!("unpin: {label}: {e}"));
                 continue;
             }
         };
         match preflight_extract(spec, release, assume_yes, pick, verbose) {
             Ok(job) => prepared.push((label, job)),
             Err(e) => {
-                eprintln!("unpin: {label}: {e}");
-                last_err = Some(e);
+                errors.push(format!("unpin: {label}: {e}"));
             }
         }
     }
@@ -635,8 +649,7 @@ fn run_pipeline(
     // ---- Phase C: serial linking + final summary (may prompt to overwrite) ----
     for ((label, job), result) in prepared.iter().zip(extract_results.into_iter()) {
         if let Err(e) = result {
-            eprintln!("unpin: {label}: {e}");
-            last_err = Some(e);
+            errors.push(format!("unpin: {label}: {e}"));
             continue;
         }
         match link_all_executables(&job.spec, &job.vdir, assume_yes) {
@@ -653,15 +666,18 @@ fn run_pipeline(
                 }
             }
             Err(e) => {
-                eprintln!("unpin: {label}: {e}");
-                last_err = Some(e);
+                errors.push(format!("unpin: {label}: {e}"));
             }
         }
     }
 
-    match last_err {
-        Some(e) => Err(format!("one or more operations failed (last: {e})")),
-        None => Ok(()),
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        for err in &errors {
+            eprintln!("{err}");
+        }
+        Err(format!("{} operation(s) failed", errors.len()))
     }
 }
 
@@ -671,10 +687,15 @@ fn pick_jobs(requested: u8, n_inputs: usize) -> usize {
 }
 
 /// Run the parallel extract phase. Returns one Result per input, in input order.
-/// Spawns N worker threads pulling from a shared work queue. Cached jobs are
-/// resolved inline; only ones with `asset: Some(_)` are dispatched to workers.
+///
+/// Pre-adds every download bar to the `MultiProgress` on the main thread BEFORE
+/// any worker starts. This is required by indicatif: a `ProgressBar` constructed
+/// then ticked before being attached to a `MultiProgress` first writes its own
+/// stderr lines, which remain in scrollback when the bar is later attached —
+/// producing ghost copies. Configure first, tick later.
 fn parallel_extract(prepared: &[(String, ExtractJob)], n_workers: usize) -> Vec<Result<(), String>> {
-    let multi = if io::stderr().is_terminal() {
+    let is_tty = io::stderr().is_terminal();
+    let multi = if is_tty {
         MultiProgress::new()
     } else {
         MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
@@ -683,14 +704,52 @@ fn parallel_extract(prepared: &[(String, ExtractJob)], n_workers: usize) -> Vec<
     let mut results: Vec<Result<(), String>> =
         (0..prepared.len()).map(|_| Ok(())).collect();
 
-    // Feed indices needing real work into a channel; workers pull one at a time.
-    // Cached jobs are announced upfront (before any bar exists, so println is safe).
+    // Compute per-column widths so all bars share the same name/tag alignment.
+    let (name_w, tag_w) = prepared
+        .iter()
+        .filter(|(_, j)| j.asset.is_some())
+        .fold((0usize, 0usize), |(n, t), (_, j)| {
+            (n.max(j.spec.name.chars().count()), t.max(j.release.tag_name.chars().count()))
+        });
+
+    // Pre-add a bar for every job that needs a download. Cached jobs get None
+    // (no slot, no bar). multi.add MUST happen before set_style/set_prefix —
+    // those methods tick the bar, and on a fresh `ProgressBar::new` the draw
+    // target is still the default stderr writer. A tick there renders the bar
+    // directly to stderr (showing "100%" because length=0/position=0), and
+    // that line stays in scrollback when multi.add later swaps the target —
+    // producing one ghost row per bar above the live render area.
+    let bars: Vec<Option<ProgressBar>> = prepared
+        .iter()
+        .map(|(_, job)| {
+            job.asset.as_ref()?;
+            let bar = multi.add(ProgressBar::new(0));
+            bar.set_style(github::download_progress_style());
+            bar.set_prefix(format!(
+                "{:<name_w$}  {:<tag_w$}",
+                job.spec.name, job.release.tag_name
+            ));
+            Some(bar)
+        })
+        .collect();
+
+    // Announce cached jobs. In TTY mode use multi.println so it lands above
+    // the bars; in non-TTY just print to stdout (multi is hidden there).
+    for (_, job) in prepared {
+        if job.asset.is_none() {
+            let msg = format!("Using {} {} (cached)", job.spec.repo(), job.release.tag_name);
+            if is_tty {
+                let _ = multi.println(msg);
+            } else {
+                println!("{msg}");
+            }
+        }
+    }
+
     let (work_tx, work_rx) = mpsc::channel::<usize>();
     for (i, (_, job)) in prepared.iter().enumerate() {
         if job.asset.is_some() {
             work_tx.send(i).unwrap();
-        } else {
-            println!("Using {} {} (cached)", job.spec.repo(), job.release.tag_name);
         }
     }
     drop(work_tx);
@@ -704,13 +763,14 @@ fn parallel_extract(prepared: &[(String, ExtractJob)], n_workers: usize) -> Vec<
             let result_tx_w = result_tx.clone();
             let work_rx_w = &work_rx;
             let prepared_w = prepared;
+            let bars_w = &bars;
             s.spawn(move || loop {
                 let i = match work_rx_w.lock().unwrap().recv() {
                     Ok(i) => i,
                     Err(_) => break,
                 };
                 let (_label, job) = &prepared_w[i];
-                let bar = multi_w.add(ProgressBar::new(0));
+                let bar = bars_w[i].as_ref().expect("downloadable job has a pre-added bar");
                 let result = do_extract(job, bar, &multi_w);
                 let _ = result_tx_w.send((i, result));
             });
@@ -737,21 +797,31 @@ fn find_checksum_url(assets: &[Asset], asset_name: &str) -> Option<String> {
 fn fetch_expected_sha256(url: &str) -> Result<String, String> {
     let body = github::download(url)?;
     let text = std::str::from_utf8(&body).map_err(|e| format!("checksum body: {e}"))?;
-    let mut hex = String::with_capacity(64);
-    for c in text.chars() {
-        if hex.len() == 64 {
-            break;
+    parse_sha256(text)
+}
+
+/// Extract a SHA-256 digest from a per-asset checksum file. Some projects ship
+/// `<hex>  <filename>` (sha256sum format); others wrap the digest in prose
+/// (e.g. ripgrep's "SHA256 hash of ...zip:\n<hex>\n"). We look for the first
+/// run of >= 64 consecutive ASCII-hex chars — short hex-looking words ("SHA",
+/// "of") are what tripped a naive scanner.
+fn parse_sha256(text: &str) -> Result<String, String> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_hexdigit() {
+            i += 1;
+            continue;
         }
-        if c.is_ascii_hexdigit() {
-            hex.push(c.to_ascii_lowercase());
-        } else if !hex.is_empty() {
-            break;
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        if i - start >= 64 {
+            return Ok(text[start..start + 64].to_ascii_lowercase());
         }
     }
-    if hex.len() != 64 {
-        return Err("malformed checksum file".into());
-    }
-    Ok(hex)
+    Err("malformed checksum file".into())
 }
 
 pub fn list() -> Result<(), String> {
@@ -800,7 +870,7 @@ pub fn list() -> Result<(), String> {
     let linked_targets: Vec<PathBuf> = fs::read_dir(bin_dir())
         .map(|it| {
             it.flatten()
-                .filter_map(|e| fs::read_link(e.path()).ok())
+                .filter_map(|e| platform::read_link(&e.path()))
                 .collect()
         })
         .unwrap_or_default();
@@ -825,9 +895,27 @@ pub fn list() -> Result<(), String> {
     Ok(())
 }
 
-pub fn remove_many(names: &[String]) -> Result<(), String> {
+pub fn remove_many(names: &[String], assume_yes: bool) -> Result<(), String> {
+    let targets: Vec<String> = if names.is_empty() {
+        let all = installed_repos();
+        if all.is_empty() {
+            println!("No packages installed");
+            return Ok(());
+        }
+        println!("This will remove all {} installed package(s):", all.len());
+        for (owner, repo) in &all {
+            println!("  {owner}/{repo}");
+        }
+        if !assume_yes && !prompt_yes_no("Continue?") {
+            return Err("aborted".into());
+        }
+        all.into_iter().map(|(o, r)| format!("{o}/{r}")).collect()
+    } else {
+        names.to_vec()
+    };
+
     let mut last_err: Option<String> = None;
-    for name in names {
+    for name in &targets {
         if let Err(e) = remove_one(name) {
             eprintln!("unpin: {name}: {e}");
             last_err = Some(e);
@@ -857,7 +945,7 @@ fn remove_one(name: &str) -> Result<(), String> {
     if let Ok(entries) = fs::read_dir(bin_dir()) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Ok(target) = fs::read_link(&path)
+            if let Some(target) = platform::read_link(&path)
                 && target.starts_with(&rdir)
             {
                 let _ = fs::remove_file(&path);
@@ -889,11 +977,15 @@ pub fn update(
     let targets: Vec<(String, String)> = if names.is_empty() {
         installed_repos()
     } else {
-        let mut out = Vec::with_capacity(names.len());
+        // Dedup, preserving first-seen order: `update foo foo` (or
+        // `update foo unpins/foo`) would otherwise race on the same vdir.
+        let mut out: Vec<(String, String)> = Vec::with_capacity(names.len());
         for n in names {
             let r = resolve_installed(n)?
                 .ok_or_else(|| format!("not installed: {n}"))?;
-            out.push(r);
+            if !out.contains(&r) {
+                out.push(r);
+            }
         }
         out
     };
@@ -906,7 +998,7 @@ pub fn update(
     // Resolve which packages actually need an update before kicking off the
     // pipeline — so users see "up to date" lines and `-j` doesn't waste workers
     // on no-ops. Up-to-date / failed resolutions never reach the pipeline.
-    let mut last_err: Option<String> = None;
+    let mut errors: Vec<String> = Vec::new();
     let mut specs: Vec<(String, Spec)> = Vec::new();
     for (owner, repo) in &targets {
         let spec = Spec {
@@ -917,8 +1009,7 @@ pub fn update(
         let release = match github::fetch_latest(&spec.repo()) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("unpin: {}/{}: {e}", owner, repo);
-                last_err = Some(e);
+                errors.push(format!("unpin: {owner}/{repo}: {e}"));
                 continue;
             }
         };
@@ -932,13 +1023,7 @@ pub fn update(
         specs.push((format!("{owner}/{repo}"), spec));
     }
 
-    if let Err(e) = run_pipeline(specs, assume_yes, jobs, pick, verbose) {
-        last_err = Some(e);
-    }
-    match last_err {
-        Some(e) => Err(format!("one or more updates failed (last: {e})")),
-        None => Ok(()),
-    }
+    run_pipeline(specs, assume_yes, jobs, pick, verbose, errors)
 }
 
 fn installed_repos() -> Vec<(String, String)> {
@@ -970,7 +1055,24 @@ fn installed_repos() -> Vec<(String, String)> {
     out
 }
 
-pub fn info(input: &str) -> Result<(), String> {
+pub fn info_many(inputs: &[String]) -> Result<(), String> {
+    let mut last_err: Option<String> = None;
+    for (i, input) in inputs.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        if let Err(e) = info(input) {
+            eprintln!("unpin: {input}: {e}");
+            last_err = Some(e);
+        }
+    }
+    match last_err {
+        Some(e) => Err(format!("one or more info lookups failed (last: {e})")),
+        None => Ok(()),
+    }
+}
+
+fn info(input: &str) -> Result<(), String> {
     if let Some((owner, repo)) = resolve_installed(input)? {
         let rdir = repo_dir(&owner, &repo);
         let mut versions: Vec<String> = fs::read_dir(&rdir)
@@ -996,7 +1098,7 @@ pub fn info(input: &str) -> Result<(), String> {
         if let Ok(entries) = fs::read_dir(&bin) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Ok(target) = fs::read_link(&path)
+                if let Some(target) = platform::read_link(&path)
                     && target.starts_with(&rdir)
                 {
                     println!("  {} -> {}", path.display(), target.display());
@@ -1014,6 +1116,9 @@ pub fn info(input: &str) -> Result<(), String> {
     let release = fetch_release(&spec)?;
     println!("Repo:    {}", spec.repo());
     println!("Version: {} (latest)", release.tag_name);
+    if !release.published_at.is_empty() {
+        println!("Date:    {}", &release.published_at[..release.published_at.len().min(10)]);
+    }
     println!("Status:  not installed");
     match pick_asset(&release.assets, &spec.name, false, false) {
         Ok(a) => println!("Asset:   {}", a.name),
@@ -1030,9 +1135,9 @@ pub fn prune() -> Result<(), String> {
     if let Ok(entries) = fs::read_dir(&bin) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let target = match fs::read_link(&path) {
-                Ok(t) => t,
-                Err(_) => continue,
+            let target = match platform::read_link(&path) {
+                Some(t) => t,
+                None => continue,
             };
             if !target.starts_with(&root) {
                 continue;
@@ -1044,11 +1149,11 @@ pub fn prune() -> Result<(), String> {
         }
     }
 
-    // Orphan version dirs: no live symlink in bin_dir points into them.
+    // Orphan version dirs: no live link in bin_dir points into them.
     let linked_targets: Vec<PathBuf> = fs::read_dir(&bin)
         .map(|it| {
             it.flatten()
-                .filter_map(|e| fs::read_link(e.path()).ok())
+                .filter_map(|e| platform::read_link(&e.path()))
                 .collect()
         })
         .unwrap_or_default();
@@ -1092,20 +1197,23 @@ pub fn run(input: &str, args: &[String]) -> Result<(), String> {
     let job = preflight_extract(spec.clone(), release.clone(), true, false, false)?;
     let vdir = job.vdir.clone();
     if !was_cached {
-        // Single bar, stand-alone (no MultiProgress needed for one job).
         let multi = if io::stderr().is_terminal() {
             MultiProgress::new()
         } else {
             MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
         };
+        // multi.add before set_style/set_prefix — see comment in parallel_extract
+        // about ghost rows from stderr-direct ticks on freshly-constructed bars.
         let bar = multi.add(ProgressBar::new(0));
-        do_extract(&job, bar, &multi)?;
+        bar.set_style(github::download_progress_style());
+        bar.set_prefix(format!("{} {}", spec.name, release.tag_name));
+        do_extract(&job, &bar, &multi)?;
     }
     if was_cached {
         let has_links = fs::read_dir(bin_dir())
             .map(|it| {
                 it.flatten().any(|e| {
-                    fs::read_link(e.path())
+                    platform::read_link(&e.path())
                         .map(|t| t.starts_with(&vdir))
                         .unwrap_or(false)
                 })
@@ -1144,10 +1252,247 @@ pub fn run(input: &str, args: &[String]) -> Result<(), String> {
         .args(args)
         .status()
         .map_err(|e| format!("exec {}: {e}", bin.display()))?;
-    if let Some(code) = status.code()
-        && code != 0
-    {
-        std::process::exit(code);
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) => std::process::exit(code),
+        None => {
+            // Unix: child terminated by signal. Mirror shell convention 128+sig
+            // so callers (CI, shell scripts) see a non-zero exit. On Windows
+            // status.code() is always Some(_), so this branch is Unix-only in
+            // practice — fall back to 1 anywhere else.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                let sig = status.signal().unwrap_or(0);
+                std::process::exit(128 + sig);
+            }
+            #[cfg(not(unix))]
+            {
+                std::process::exit(1);
+            }
+        }
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parse_spec ----
+
+    #[test]
+    fn parse_spec_owner_repo() {
+        let s = parse_spec("BurntSushi/ripgrep").unwrap();
+        assert_eq!(s.owner, "BurntSushi");
+        assert_eq!(s.name, "ripgrep");
+        assert_eq!(s.version, None);
+    }
+
+    #[test]
+    fn parse_spec_with_version() {
+        let s = parse_spec("BurntSushi/ripgrep@14.1.0").unwrap();
+        assert_eq!(s.owner, "BurntSushi");
+        assert_eq!(s.name, "ripgrep");
+        assert_eq!(s.version.as_deref(), Some("14.1.0"));
+    }
+
+    #[test]
+    fn parse_spec_bare_name_defaults_to_unpins_owner() {
+        let s = parse_spec("sgleam").unwrap();
+        assert_eq!(s.owner, "unpins");
+        assert_eq!(s.name, "sgleam");
+        assert_eq!(s.version, None);
+    }
+
+    #[test]
+    fn parse_spec_bare_name_with_version() {
+        let s = parse_spec("sgleam@v0.7.0").unwrap();
+        assert_eq!(s.owner, "unpins");
+        assert_eq!(s.name, "sgleam");
+        assert_eq!(s.version.as_deref(), Some("v0.7.0"));
+    }
+
+    #[test]
+    fn parse_spec_rejects_empty() {
+        assert!(parse_spec("").is_err());
+        assert!(parse_spec("@1.0").is_err());
+    }
+
+    #[test]
+    fn parse_spec_rejects_empty_owner_or_repo() {
+        assert!(parse_spec("/repo").is_err());
+        assert!(parse_spec("owner/").is_err());
+    }
+
+    #[test]
+    fn parse_spec_rejects_extra_slashes() {
+        // split_once splits on the FIRST '/', so "a/b/c" leaves "b/c" as repo —
+        // rejected because repo contains '/'.
+        assert!(parse_spec("a/b/c").is_err());
+    }
+
+    // ---- classify_excluded ----
+
+    #[test]
+    fn classify_picks_up_other_os_assets() {
+        // Test relies on host OS — the function uses platform::other_os_keys.
+        #[cfg(target_os = "linux")]
+        assert_eq!(classify_excluded("tool-darwin-x86_64.tar.gz"), Some("other platform"));
+        #[cfg(target_os = "linux")]
+        assert_eq!(classify_excluded("tool-windows-x86_64.zip"), Some("other platform"));
+    }
+
+    #[test]
+    fn classify_filters_other_arch() {
+        // On x86_64 we exclude aarch64 binaries.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(classify_excluded("tool-linux-aarch64.tar.gz"), Some("other arch"));
+    }
+
+    #[test]
+    fn classify_excludes_auxiliary() {
+        assert_eq!(classify_excluded("rg-14.1.0-linux.tar.gz.sha256"), Some("auxiliary"));
+        assert_eq!(classify_excluded("rg-14.1.0-linux.tar.gz.sig"), Some("auxiliary"));
+        assert_eq!(classify_excluded("rg-14.1.0.deb"), Some("auxiliary"));
+        assert_eq!(classify_excluded("rg-14.1.0.rpm"), Some("auxiliary"));
+        assert_eq!(classify_excluded("rg-14.1.0.appimage"), Some("auxiliary"));
+    }
+
+    #[test]
+    fn classify_excludes_bsdiff_and_bare_zst() {
+        assert_eq!(classify_excluded("update.bsdiff"), Some("unsupported format"));
+        assert_eq!(classify_excluded("payload.zst"), Some("unsupported format"));
+        // .tar.zst is fine — caught by the OS-key check below, not unsupported.
+        assert_ne!(classify_excluded("rg-linux.tar.zst"), Some("unsupported format"));
+    }
+
+    #[test]
+    fn classify_rejects_asset_with_no_os_tag() {
+        // No "linux"/"darwin"/"windows" anywhere — can't tell what platform.
+        #[cfg(target_os = "linux")]
+        assert_eq!(classify_excluded("tool-generic.tar.gz"), Some("no OS tag"));
+    }
+
+    #[test]
+    fn classify_accepts_current_os_asset() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(classify_excluded("rg-14.1.0-x86_64-linux.tar.gz"), None);
+        #[cfg(target_os = "macos")]
+        assert_eq!(classify_excluded("rg-14.1.0-x86_64-darwin.tar.gz"), None);
+    }
+
+    // ---- short_binary_name ----
+
+    #[test]
+    fn short_name_strips_target_triple_suffix() {
+        assert_eq!(short_binary_name("rg-x86_64-linux-musl"), "rg");
+        assert_eq!(short_binary_name("tool_x86_64-linux"), "tool");
+        assert_eq!(short_binary_name("fd-aarch64-apple-darwin"), "fd");
+    }
+
+    #[test]
+    fn short_name_strips_pc_marker() {
+        assert_eq!(short_binary_name("rg-x86_64-pc-linux-gnu"), "rg");
+    }
+
+    #[test]
+    fn short_name_keeps_simple_names() {
+        assert_eq!(short_binary_name("rg"), "rg");
+        assert_eq!(short_binary_name("jq"), "jq");
+    }
+
+    #[test]
+    fn short_name_strips_exe_on_windows_first() {
+        // On Unix, .exe is preserved (not a special suffix). On Windows it
+        // gets stripped before marker scanning. We can only test the Unix path
+        // here directly; the cfg(windows) branch is exercised in cross builds.
+        #[cfg(unix)]
+        assert_eq!(short_binary_name("rg.exe"), "rg.exe");
+        #[cfg(windows)]
+        assert_eq!(short_binary_name("rg.exe"), "rg");
+        #[cfg(windows)]
+        assert_eq!(short_binary_name("rg-x86_64-pc-windows-gnu.exe"), "rg");
+    }
+
+    #[test]
+    fn short_name_first_marker_wins() {
+        // Earliest marker position wins, so we don't trim more than intended.
+        assert_eq!(short_binary_name("rg-linux-amd64"), "rg");
+    }
+
+    // ---- parse_sha256 ----
+
+    #[test]
+    fn parse_sha256_accepts_sha256sum_format() {
+        let body = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  rg.tar.gz\n";
+        let got = parse_sha256(body).unwrap();
+        assert_eq!(got, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+    }
+
+    #[test]
+    fn parse_sha256_handles_ripgrep_prose_format() {
+        // This is the format that crashed the Windows install earlier.
+        let body = "SHA256 hash of ripgrep-15.1.0-x86_64-pc-windows-gnu.zip:\r\n\
+                    9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08\r\n";
+        let got = parse_sha256(body).unwrap();
+        assert_eq!(got, "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
+    }
+
+    #[test]
+    fn parse_sha256_lowercases_uppercase_hex() {
+        let body = "DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF";
+        assert_eq!(
+            parse_sha256(body).unwrap(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        );
+    }
+
+    #[test]
+    fn parse_sha256_rejects_short_runs() {
+        // 63 hex chars — one short of a digest.
+        let body = "a".repeat(63);
+        assert!(parse_sha256(&body).is_err());
+    }
+
+    #[test]
+    fn parse_sha256_rejects_empty_and_no_hex() {
+        assert!(parse_sha256("").is_err());
+        assert!(parse_sha256("no digest here").is_err());
+        assert!(parse_sha256("SHA256 hash of foo.zip:").is_err());
+    }
+
+    #[test]
+    fn parse_sha256_ignores_long_runs_after_first_match() {
+        // First valid run wins — no ambiguity.
+        let body = "1111111111111111111111111111111111111111111111111111111111111111\n\
+                    2222222222222222222222222222222222222222222222222222222222222222";
+        assert_eq!(
+            parse_sha256(body).unwrap(),
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        );
+    }
+
+    // ---- pick_jobs ----
+
+    #[test]
+    fn pick_jobs_defaults_to_min_of_4_and_inputs() {
+        assert_eq!(pick_jobs(0, 1), 1);
+        assert_eq!(pick_jobs(0, 3), 3);
+        assert_eq!(pick_jobs(0, 4), 4);
+        assert_eq!(pick_jobs(0, 10), 4);
+    }
+
+    #[test]
+    fn pick_jobs_honors_explicit_request_capped_by_inputs() {
+        assert_eq!(pick_jobs(8, 3), 3);
+        assert_eq!(pick_jobs(2, 10), 2);
+    }
+
+    #[test]
+    fn pick_jobs_never_returns_zero() {
+        // Defensive: even with 0 inputs the worker pool is at least 1 (the
+        // pool exits immediately on empty channel).
+        assert_eq!(pick_jobs(0, 0), 1);
+        assert_eq!(pick_jobs(4, 0), 1);
+    }
 }

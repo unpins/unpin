@@ -150,11 +150,22 @@ mod mbedtls_backend {
                 .map_err(|e| format!("parse embedded CA roots: {e}"))?;
 
             // Append the platform trust store (Schannel on Windows, Security
-            // Framework on macOS, ca-certificates file on Linux/BSD).
+            // Framework on macOS, ca-certificates file on Linux/BSD). The
+            // embedded `github-roots.pem` above is always loaded, so failures
+            // here only matter for non-GitHub HTTPS — log them but don't fail.
             let result = rustls_native_certs::load_native_certs();
             for der in result.certs {
                 if let Ok(cert) = Certificate::from_der(&der) {
                     roots.push(cert);
+                }
+            }
+            if !result.errors.is_empty() {
+                eprintln!(
+                    "unpin: warning: {} native CA cert(s) failed to load (non-GitHub HTTPS may fail):",
+                    result.errors.len()
+                );
+                for e in &result.errors {
+                    eprintln!("  {e}");
                 }
             }
 

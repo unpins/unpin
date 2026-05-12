@@ -1,0 +1,32 @@
+name: Build and Publish
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: unpins/action-build/.github/workflows/build.yml@main
+    with:
+      package_name: 'unpin'
+      package_data: false
+      # unpin is the bootstrap: users download it by hand from unpins.org,
+      # so the artifact gets a stable filename without version embedded.
+      bootstrap_naming: true
+      create_release: ${{ startsWith(github.ref, 'refs/tags/') }}
+      platforms: |
+        [
+          {"runner":"ubuntu-latest",    "os":"linux",   "arch":"x86_64"},
+          {"runner":"ubuntu-24.04-arm", "os":"linux",   "arch":"aarch64"},
+          {"runner":"macos-13",         "os":"darwin",  "arch":"x86_64"},
+          {"runner":"macos-14",         "os":"darwin",  "arch":"aarch64"},
+          {"runner":"ubuntu-latest",    "os":"windows", "arch":"x86_64", "attr":"packages.x86_64-linux.\"windows-x86_64\""}
+        ]
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
