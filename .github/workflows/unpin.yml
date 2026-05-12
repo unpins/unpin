@@ -12,6 +12,12 @@ concurrency:
 
 jobs:
   build:
+    # action-build/build.yml has a nested `release` job declaring
+    # `contents: write`. GitHub checks permissions statically — even when
+    # create_release is false, the caller must grant the permission for the
+    # workflow to start.
+    permissions:
+      contents: write
     uses: unpins/action-build/.github/workflows/build.yml@v1
     with:
       package_name: 'unpin'
