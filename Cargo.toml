@@ -11,16 +11,8 @@ homepage = "https://unpins.org"
 name = "unpin"
 path = "src/main.rs"
 
-[features]
-default = ["http-mbedtls"]
-http-minreq = ["dep:minreq"]
-http-mbedtls = ["dep:mbedtls", "dep:fluent-uri", "dep:rustls-native-certs"]
-
 [dependencies]
-minreq = { version = "2", default-features = false, features = ["https-rustls"], optional = true }
-mbedtls = { version = "0.12", default-features = false, features = ["std", "time", "ssl", "x509"], optional = true }
-fluent-uri = { version = "0.3", default-features = false, features = ["std"], optional = true }
-rustls-native-certs = { version = "0.8", optional = true }
+minreq = { version = "2", default-features = false, features = ["https-rustls"] }
 bpaf = { version = "0.9", default-features = false, features = ["bright-color", "autocomplete"] }
 nanoserde = { version = "0.2", default-features = false, features = ["json", "std"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
