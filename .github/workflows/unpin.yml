@@ -2,7 +2,7 @@ name: Build and Publish
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
     tags: [ 'v*' ]
   workflow_dispatch:
 
@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   build:
-    uses: unpins/action-build/.github/workflows/build.yml@main
+    uses: unpins/action-build/.github/workflows/build.yml@v1
     with:
       package_name: 'unpin'
       package_data: false
