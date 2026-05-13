@@ -16,6 +16,22 @@
         "type": "github"
       }
     },
+    "nixpkgs_2": {
+      "locked": {
+        "lastModified": 1778430510,
+        "narHash": "sha256-Ti+ZBvW6yrWWAg2szExVTwCd4qOJ3KlVr1tFHfyfi8Q=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "8fd9daa3db09ced9700431c5b7ad0e8ba199b575",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-25.11",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "nixpkgs": "nixpkgs",
@@ -23,17 +39,19 @@
       }
     },
     "unpins-lib": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_2"
+      },
       "locked": {
-        "lastModified": 1778550377,
-        "narHash": "sha256-kUvwbT6vTMRuljHiaN3zT/tkh4QO1yIFFxJqSebmS1E=",
+        "lastModified": 1778676840,
+        "narHash": "sha256-QOMCApgaOgiZJMdxIrW+E9k1b/NVOTEebFkJ5Omey/M=",
         "owner": "unpins",
         "repo": "nix-lib",
-        "rev": "6e3766ae890c05a5f7b32f4165a6d5927e342fdf",
+        "rev": "27d5e7cad41bd6a0eafa28a5b40788f51bb00fce",
         "type": "github"
       },
       "original": {
         "owner": "unpins",
-        "ref": "v1",
         "repo": "nix-lib",
         "type": "github"
       }

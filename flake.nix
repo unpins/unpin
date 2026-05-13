@@ -8,7 +8,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    unpins-lib.url = "github:unpins/nix-lib/v1";
+    unpins-lib.url = "github:unpins/nix-lib";
   };
 
   outputs = { self, nixpkgs, unpins-lib }:
