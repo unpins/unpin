@@ -46,17 +46,20 @@
         auditable = false;
       };
 
-      # rustc injects `-liconv` on darwin targets; cross stdenv resolves it to
-      # nixpkgs' libiconv dylib, so rewrite the load command to Apple's path.
+      # rustc injects `-liconv` on darwin targets. The default cross stdenv
+      # ships libiconv as a dylib → the binary carries an LC_LOAD_DYLIB for
+      # libiconv.2.dylib, which action-build rejects (Apple's ABI contract
+      # only covers libSystem + libobjc + Frameworks; /usr/lib/libiconv is
+      # de-facto stable but not contractually). Prepending pkgsStatic.libiconv
+      # to buildInputs makes the linker see libiconv.a first and emit no
+      # dylib load command. Only libiconv goes through pkgsStatic — the rest
+      # of the cross stays non-static so the cctools/xar-static cascade
+      # (broken upstream for cross-darwin, see fake-cross-darwin-blocked memory)
+      # never gets pulled in.
       darwinX86Unpin =
         let cross = nixpkgsFor.aarch64-darwin.pkgsCross.x86_64-darwin; in
         (mkUnpin { rustPlatform = cross.rustPlatform; }).overrideAttrs (old: {
-          postFixup = (old.postFixup or "") + ''
-            install_name_tool -change \
-              ${cross.libiconv}/lib/libiconv.2.dylib \
-              /usr/lib/libiconv.2.dylib \
-              $out/bin/unpin
-          '';
+          buildInputs = [ cross.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
         });
 
       nativePackages = ulib.forAllNative (system: { default = nativeUnpin system; });
