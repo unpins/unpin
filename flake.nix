@@ -16,6 +16,8 @@
       ulib = unpins-lib.lib;
       nixpkgsFor = ulib.forAllNative (system: import nixpkgs { inherit system; });
 
+      version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
+
       src = nixpkgs.lib.cleanSourceWith {
         src = ./.;
         filter = path: _:
@@ -26,8 +28,7 @@
       mkUnpin = { rustPlatform, env ? {}, auditable ? true }:
         (rustPlatform.buildRustPackage {
           pname = "unpin";
-          version = "0.1.0";
-          inherit src auditable env;
+          inherit version src auditable env;
           cargoLock.lockFile = ./Cargo.lock;
           doCheck = false;
         }).overrideAttrs (_: { stripAllList = [ "bin" ]; });
