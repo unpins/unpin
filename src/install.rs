@@ -8,6 +8,7 @@ use std::thread;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
 use crate::archive;
+use crate::ctx::Ctx;
 use crate::github::{self, Asset, Release};
 use crate::platform;
 
@@ -363,11 +364,11 @@ fn link_binary(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, Str
     Ok(true)
 }
 
-fn fetch_release(spec: &Spec) -> Result<Release, String> {
+fn fetch_release(spec: &Spec, ctx: &Ctx) -> Result<Release, String> {
     let repo = spec.repo();
     match &spec.version {
-        Some(tag) => github::fetch_tag(&repo, tag),
-        None => github::fetch_latest(&repo),
+        Some(tag) => github::fetch_tag(&repo, tag, ctx),
+        None => github::fetch_latest(&repo, ctx),
     }
 }
 
@@ -413,10 +414,20 @@ fn preflight_extract(
     release: Release,
     assume_yes: bool,
     pick: bool,
-    verbose: bool,
+    include_data: bool,
+    ctx: &Ctx,
 ) -> Result<ExtractJob, String> {
     let vdir = version_dir(&spec.owner, &spec.name, &release.tag_name);
-    let companion_peek = find_companion(&spec.name, &release.tag_name, &release.assets);
+    // `--no-data` (or `data = false` in config) suppresses the companion lookup
+    // entirely. As a side effect the cache-complete check no longer requires
+    // `share/`, so a vdir installed without data won't be re-extracted by a
+    // later `--no-data` install/update — and conversely, a vdir installed with
+    // `--no-data` will be re-extracted when the user later runs without it.
+    let companion_peek = if include_data {
+        find_companion(&spec.name, &release.tag_name, &release.assets)
+    } else {
+        None
+    };
     // Cache is complete iff the version dir exists AND, if a companion exists,
     // share/ is present (the companion's payload). Without this, a download
     // interrupted between primary and companion leaves a half-installed vdir
@@ -434,14 +445,14 @@ fn preflight_extract(
             companion_expected_sha256: None,
         });
     }
-    let asset = pick_asset(&release.assets, &spec.name, pick, verbose)?.clone();
+    let asset = pick_asset(&release.assets, &spec.name, pick, ctx.verbose)?.clone();
     // --pick (or incomplete cache) on a cached version: wipe before re-extracting.
     if vdir.is_dir() {
         fs::remove_dir_all(&vdir)
             .map_err(|e| format!("remove {}: {e}", vdir.display()))?;
     }
     let expected_sha256 = match find_checksum_url(&release.assets, &asset.name) {
-        Some(url) => Some(fetch_expected_sha256(&url)?),
+        Some(url) => Some(fetch_expected_sha256(&url, ctx)?),
         None => {
             if !assume_yes
                 && !prompt_yes_no("No SHA-256 checksum found. Continue without verification?")
@@ -451,10 +462,14 @@ fn preflight_extract(
             None
         }
     };
-    let companion = find_companion(&spec.name, &release.tag_name, &release.assets).cloned();
+    let companion = if include_data {
+        find_companion(&spec.name, &release.tag_name, &release.assets).cloned()
+    } else {
+        None
+    };
     let companion_expected_sha256 = match companion.as_ref() {
         Some(c) => match find_checksum_url(&release.assets, &c.name) {
-            Some(url) => Some(fetch_expected_sha256(&url)?),
+            Some(url) => Some(fetch_expected_sha256(&url, ctx)?),
             None => {
                 if !assume_yes
                     && !prompt_yes_no(
@@ -492,6 +507,7 @@ fn do_extract(
     primary_bar: &ProgressBar,
     companion_bar: Option<&ProgressBar>,
     multi: &MultiProgress,
+    ctx: &Ctx,
 ) -> Result<(), String> {
     let Some(primary_asset) = job.asset.as_ref() else {
         return Ok(()); // cached
@@ -520,6 +536,7 @@ fn do_extract(
                     multi,
                     &repo,
                     false,
+                    ctx,
                 )
             });
             let h_comp = s.spawn(|| {
@@ -531,6 +548,7 @@ fn do_extract(
                     multi,
                     &repo,
                     true,
+                    ctx,
                 )
             });
             (h_prim.join().unwrap(), h_comp.join().unwrap())
@@ -545,6 +563,7 @@ fn do_extract(
             multi,
             &repo,
             false,
+            ctx,
         )
     };
 
@@ -568,9 +587,17 @@ fn download_extract_verify(
     multi: &MultiProgress,
     repo: &str,
     is_companion: bool,
+    ctx: &Ctx,
 ) -> Result<(), String> {
     let r = (|| -> Result<(), String> {
-        let stream = github::download_stream_into(&asset.browser_download_url, bar)?;
+        if ctx.verbose {
+            // multi.println serializes with the bar render loop — avoids
+            // interleaving on a TTY. In non-TTY mode (hidden draw target)
+            // this is a no-op; api_get URLs from Phase A still print via
+            // eprintln, so the user sees what was resolved even when piping.
+            let _ = multi.println(format!("  GET {}", asset.browser_download_url));
+        }
+        let stream = github::download_stream_into(&asset.browser_download_url, bar, ctx)?;
         let mut hashing = HashingReader::new(stream);
         archive::extract(&asset.name, &mut hashing, vdir)?;
         let got = hashing.finalize_hex();
@@ -690,8 +717,10 @@ pub fn install_many(
     assume_yes: bool,
     jobs: u8,
     pick: bool,
-    verbose: bool,
+    no_data: bool,
+    ctx: &Ctx,
 ) -> Result<(), String> {
+    let include_data = !no_data && ctx.cfg.data();
     let parsed: Vec<(String, Spec)> = inputs
         .iter()
         .map(|s| parse_spec(s).map(|sp| (s.clone(), sp)))
@@ -709,7 +738,7 @@ pub fn install_many(
             specs.push((label, spec));
         }
     }
-    run_pipeline(specs, assume_yes, jobs, pick, verbose, Vec::new())
+    run_pipeline(specs, assume_yes, jobs, pick, include_data, Vec::new(), ctx)
 }
 
 /// Three-phase pipeline shared by `install` and `update`.
@@ -723,8 +752,9 @@ fn run_pipeline(
     assume_yes: bool,
     jobs: u8,
     pick: bool,
-    verbose: bool,
+    include_data: bool,
     mut errors: Vec<String>,
+    ctx: &Ctx,
 ) -> Result<(), String> {
     if specs.is_empty() {
         if errors.is_empty() {
@@ -741,14 +771,14 @@ fn run_pipeline(
     // ---- Phase A: serial preflight (fetch release, pick asset, prompt) ----
     for (label, spec) in specs {
         println!("Resolving {}...", spec.repo());
-        let release = match fetch_release(&spec) {
+        let release = match fetch_release(&spec, ctx) {
             Ok(r) => r,
             Err(e) => {
                 errors.push(format!("unpin: {label}: {e}"));
                 continue;
             }
         };
-        match preflight_extract(spec, release, assume_yes, pick, verbose) {
+        match preflight_extract(spec, release, assume_yes, pick, include_data, ctx) {
             Ok(job) => prepared.push((label, job)),
             Err(e) => {
                 errors.push(format!("unpin: {label}: {e}"));
@@ -758,7 +788,7 @@ fn run_pipeline(
 
     // ---- Phase B: parallel download + extract + verify ----
     let n_workers = pick_jobs(jobs, prepared.len());
-    let extract_results = parallel_extract(&prepared, n_workers);
+    let extract_results = parallel_extract(&prepared, n_workers, ctx);
 
     // ---- Phase C: serial linking + final summary (may prompt to overwrite) ----
     for ((label, job), result) in prepared.iter().zip(extract_results.into_iter()) {
@@ -807,7 +837,11 @@ fn pick_jobs(requested: u8, n_inputs: usize) -> usize {
 /// then ticked before being attached to a `MultiProgress` first writes its own
 /// stderr lines, which remain in scrollback when the bar is later attached —
 /// producing ghost copies. Configure first, tick later.
-fn parallel_extract(prepared: &[(String, ExtractJob)], n_workers: usize) -> Vec<Result<(), String>> {
+fn parallel_extract(
+    prepared: &[(String, ExtractJob)],
+    n_workers: usize,
+    ctx: &Ctx,
+) -> Vec<Result<(), String>> {
     let is_tty = io::stderr().is_terminal();
     let multi = if is_tty {
         MultiProgress::new()
@@ -898,7 +932,7 @@ fn parallel_extract(prepared: &[(String, ExtractJob)], n_workers: usize) -> Vec<
                 };
                 let (_label, job) = &prepared_w[i];
                 let (bar, cbar) = bars_w[i].as_ref().expect("downloadable job has pre-added bars");
-                let result = do_extract(job, bar, cbar.as_ref(), &multi_w);
+                let result = do_extract(job, bar, cbar.as_ref(), &multi_w, ctx);
                 let _ = result_tx_w.send((i, result));
             });
         }
@@ -921,8 +955,8 @@ fn find_checksum_url(assets: &[Asset], asset_name: &str) -> Option<String> {
     None
 }
 
-fn fetch_expected_sha256(url: &str) -> Result<String, String> {
-    let body = github::download(url)?;
+fn fetch_expected_sha256(url: &str, ctx: &Ctx) -> Result<String, String> {
+    let body = github::download(url, ctx)?;
     let text = std::str::from_utf8(&body).map_err(|e| format!("checksum body: {e}"))?;
     parse_sha256(text)
 }
@@ -1099,8 +1133,10 @@ pub fn update(
     assume_yes: bool,
     jobs: u8,
     pick: bool,
-    verbose: bool,
+    no_data: bool,
+    ctx: &Ctx,
 ) -> Result<(), String> {
+    let include_data = !no_data && ctx.cfg.data();
     let targets: Vec<(String, String)> = if names.is_empty() {
         installed_repos()
     } else {
@@ -1133,7 +1169,7 @@ pub fn update(
             name: repo.clone(),
             version: None,
         };
-        let release = match github::fetch_latest(&spec.repo()) {
+        let release = match github::fetch_latest(&spec.repo(), ctx) {
             Ok(r) => r,
             Err(e) => {
                 errors.push(format!("unpin: {owner}/{repo}: {e}"));
@@ -1150,7 +1186,7 @@ pub fn update(
         specs.push((format!("{owner}/{repo}"), spec));
     }
 
-    run_pipeline(specs, assume_yes, jobs, pick, verbose, errors)
+    run_pipeline(specs, assume_yes, jobs, pick, include_data, errors, ctx)
 }
 
 fn installed_repos() -> Vec<(String, String)> {
@@ -1182,13 +1218,13 @@ fn installed_repos() -> Vec<(String, String)> {
     out
 }
 
-pub fn info_many(inputs: &[String]) -> Result<(), String> {
+pub fn info_many(inputs: &[String], ctx: &Ctx) -> Result<(), String> {
     let mut last_err: Option<String> = None;
     for (i, input) in inputs.iter().enumerate() {
         if i > 0 {
             println!();
         }
-        if let Err(e) = info(input) {
+        if let Err(e) = info(input, ctx) {
             eprintln!("unpin: {input}: {e}");
             last_err = Some(e);
         }
@@ -1199,7 +1235,7 @@ pub fn info_many(inputs: &[String]) -> Result<(), String> {
     }
 }
 
-fn info(input: &str) -> Result<(), String> {
+fn info(input: &str, ctx: &Ctx) -> Result<(), String> {
     if let Some((owner, repo)) = resolve_installed(input)? {
         let rdir = repo_dir(&owner, &repo);
         let mut versions: Vec<String> = fs::read_dir(&rdir)
@@ -1240,14 +1276,14 @@ fn info(input: &str) -> Result<(), String> {
     }
 
     let spec = parse_spec(input)?;
-    let release = fetch_release(&spec)?;
+    let release = fetch_release(&spec, ctx)?;
     println!("Repo:    {}", spec.repo());
     println!("Version: {} (latest)", release.tag_name);
     if !release.published_at.is_empty() {
         println!("Date:    {}", &release.published_at[..release.published_at.len().min(10)]);
     }
     println!("Status:  not installed");
-    match pick_asset(&release.assets, &spec.name, false, false) {
+    match pick_asset(&release.assets, &spec.name, false, ctx.verbose) {
         Ok(a) => println!("Asset:   {}", a.name),
         Err(e) => println!("Asset:   (unresolved: {e})"),
     }
@@ -1316,14 +1352,18 @@ pub fn prune() -> Result<(), String> {
     Ok(())
 }
 
-pub fn run(input: &str, args: &[String]) -> Result<(), String> {
+pub fn run(input: &str, args: &[String], pick: bool, ctx: &Ctx) -> Result<(), String> {
     let spec = parse_spec(input)?;
     println!("Resolving {}...", spec.repo());
-    let release = fetch_release(&spec)?;
-    let was_cached = version_dir(&spec.owner, &spec.name, &release.tag_name).is_dir();
-    let job = preflight_extract(spec.clone(), release.clone(), true, false, false)?;
+    let release = fetch_release(&spec, ctx)?;
+    // `run` always includes data — bypassing it could leave the binary
+    // non-functional (gvim/vim need share/), and `run` is the "just try it"
+    // path where surprises are worst. Use `install --no-data` if you need a
+    // bare binary on disk.
+    let job = preflight_extract(spec.clone(), release.clone(), true, pick, true, ctx)?;
     let vdir = job.vdir.clone();
-    if !was_cached {
+    let needs_download = job.asset.is_some();
+    if needs_download {
         let multi = if io::stderr().is_terminal() {
             MultiProgress::new()
         } else {
@@ -1340,9 +1380,8 @@ pub fn run(input: &str, args: &[String]) -> Result<(), String> {
             cb.set_prefix(format!("{} {} (data)", spec.name, release.tag_name));
             cb
         });
-        do_extract(&job, &bar, cbar.as_ref(), &multi)?;
-    }
-    if was_cached {
+        do_extract(&job, &bar, cbar.as_ref(), &multi, ctx)?;
+    } else {
         let has_links = fs::read_dir(bin_dir())
             .map(|it| {
                 it.flatten().any(|e| {

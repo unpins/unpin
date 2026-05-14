@@ -44,6 +44,24 @@ pub fn bin_dir() -> PathBuf {
     }
 }
 
+pub fn config_path() -> PathBuf {
+    #[cfg(unix)]
+    {
+        if let Ok(x) = env::var("XDG_CONFIG_HOME")
+            && !x.is_empty()
+        {
+            return PathBuf::from(x).join("unpin").join("config");
+        }
+        PathBuf::from(env::var("HOME").unwrap_or_default()).join(".config/unpin/config")
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(env::var("APPDATA").unwrap_or_default())
+            .join("unpin")
+            .join("config")
+    }
+}
+
 /// Substrings that, when present in an asset name (case-insensitive), positively
 /// identify it as built for the current OS. An asset that contains none of these
 /// is treated as "no OS marker" — see `classify_for_current_os`.

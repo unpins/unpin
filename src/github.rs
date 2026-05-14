@@ -1,11 +1,9 @@
-use std::env;
 use std::io::{self, Read};
-use std::sync::OnceLock;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use nanoserde::DeJson;
 
-use crate::http;
+use crate::ctx::Ctx;
 
 const USER_AGENT: &str = concat!("unpin/", env!("CARGO_PKG_VERSION"));
 
@@ -24,76 +22,36 @@ pub struct Asset {
     pub browser_download_url: String,
 }
 
-pub fn fetch_latest(repo: &str) -> Result<Release, String> {
+pub fn fetch_latest(repo: &str, ctx: &Ctx) -> Result<Release, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    fetch_release(&url)
+    fetch_release_url(&url, ctx)
 }
 
-pub fn fetch_tag(repo: &str, tag: &str) -> Result<Release, String> {
+pub fn fetch_tag(repo: &str, tag: &str, ctx: &Ctx) -> Result<Release, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-    fetch_release(&url)
+    fetch_release_url(&url, ctx)
 }
 
-fn fetch_release(url: &str) -> Result<Release, String> {
-    let body = api_get(url)?;
+fn fetch_release_url(url: &str, ctx: &Ctx) -> Result<Release, String> {
+    let body = api_get(url, ctx)?;
     DeJson::deserialize_json(&body).map_err(|e| format!("parse release JSON: {e}"))
 }
 
-/// Resolved once per process. Order:
-/// 1. `UNPIN_GITHUB_TOKEN` — tool-scoped, lets users hand unpin a narrow PAT
-///    (e.g. `public_repo`-only) without overriding `GITHUB_TOKEN` globally.
-/// 2. `GITHUB_TOKEN`
-/// 3. `GH_TOKEN` (what the `gh` CLI itself reads)
-/// 4. `gh auth token` — **opt-in** via `UNPIN_USE_GH_AUTH=1`. Disabled by
-///    default because the token stored by `gh auth login` carries the full
-///    set of scopes the user granted at login time (often `repo` + `workflow`),
-///    which is far broader than what unpin actually needs (read-only release
-///    metadata). Matching the security-conservative majority (eget, ubi,
-///    cargo-binstall) instead of aqua/mise's silent shell-out.
-///
-/// Authenticated requests raise the API rate limit from 60/hour (anonymous,
-/// by IP) to 5000/hour (per user).
-fn auth_header() -> Option<String> {
-    static AUTH_HEADER: OnceLock<Option<String>> = OnceLock::new();
-    AUTH_HEADER.get_or_init(resolve_auth_header).clone()
-}
-
-fn resolve_auth_header() -> Option<String> {
-    for var in ["UNPIN_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Ok(t) = env::var(var)
-            && !t.is_empty()
-        {
-            return Some(format!("Bearer {t}"));
-        }
-    }
-    if env::var("UNPIN_USE_GH_AUTH").ok().as_deref() != Some("1") {
-        return None;
-    }
-    let output = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let token = std::str::from_utf8(&output.stdout).ok()?.trim();
-    if token.is_empty() {
-        return None;
-    }
-    Some(format!("Bearer {token}"))
-}
-
-fn api_get(url: &str) -> Result<String, String> {
-    let client = http::default_client();
-    let auth = auth_header();
+fn api_get(url: &str, ctx: &Ctx) -> Result<String, String> {
     let mut headers: Vec<(&str, &str)> = vec![
         ("User-Agent", USER_AGENT),
         ("Accept", "application/vnd.github+json"),
     ];
-    if let Some(ref h) = auth {
+    if let Some(ref h) = ctx.auth {
         headers.push(("Authorization", h));
     }
-    let resp = client.get(url, &headers)?;
+    if ctx.verbose {
+        eprintln!("  GET {url}");
+    }
+    let resp = ctx.http.get(url, &headers)?;
+    if ctx.verbose {
+        eprintln!("  -> HTTP {}", resp.status);
+    }
     if resp.status < 200 || resp.status >= 300 {
         if resp.status == 404 {
             return Err("not found (check package name or version)".into());
@@ -116,11 +74,16 @@ fn github_error_message(body: &[u8]) -> Option<String> {
 }
 
 /// Convenience download into memory. Used for small payloads (checksum files).
-/// Renders no progress.
-pub fn download(url: &str) -> Result<Vec<u8>, String> {
+/// Renders no progress. Called only from the serial preflight phase, so a raw
+/// `eprintln!` for the verbose URL log is safe (no `MultiProgress` rendering
+/// to race against).
+pub fn download(url: &str, ctx: &Ctx) -> Result<Vec<u8>, String> {
+    if ctx.verbose {
+        eprintln!("  GET {url}");
+    }
     let bar = ProgressBar::hidden();
     let mut buf = Vec::new();
-    let mut reader = download_stream_into(url, &bar)?;
+    let mut reader = download_stream_into(url, &bar, ctx)?;
     std::io::copy(&mut reader, &mut buf).map_err(|e| format!("read {url}: {e}"))?;
     Ok(buf)
 }
@@ -133,10 +96,17 @@ pub fn download(url: &str) -> Result<Vec<u8>, String> {
 /// Once the HTTP response is in, this only sets the length (or, in the rare
 /// `Content-Length`-missing case, swaps to a spinner style). The style itself
 /// is whatever the caller pre-configured.
-pub fn download_stream_into(url: &str, bar: &ProgressBar) -> Result<ProgressStream, String> {
-    let client = http::default_client();
+pub fn download_stream_into(
+    url: &str,
+    bar: &ProgressBar,
+    ctx: &Ctx,
+) -> Result<ProgressStream, String> {
     let headers: Vec<(&str, &str)> = vec![("User-Agent", USER_AGENT)];
-    let stream = client.get_streaming(url, &headers)?;
+    // Verbose URL printing happens at the call site — it has the right
+    // serialization context (`MultiProgress::println` in the parallel-worker
+    // path, plain `eprintln!` in serial helpers like `download()`). Logging
+    // here with `eprintln!` would race with bar rendering on a TTY.
+    let stream = ctx.http.get_streaming(url, &headers)?;
     if stream.status() < 200 || stream.status() >= 300 {
         return Err(format!("HTTP {} downloading {url}", stream.status()));
     }
@@ -154,7 +124,7 @@ pub fn download_stream_into(url: &str, bar: &ProgressBar) -> Result<ProgressStre
 }
 
 pub struct ProgressStream {
-    inner: Box<dyn http::HttpStream + Send>,
+    inner: Box<dyn crate::http::HttpStream + Send>,
     bar: ProgressBar,
 }
 

@@ -25,7 +25,10 @@ pub trait HttpStream: Read {
 /// - Returns the response as-is (no error mapping on non-2xx). Callers decide.
 /// - `get` buffers the body; suitable for JSON API responses.
 /// - `get_streaming` does not buffer; suitable for release-asset downloads.
-pub trait HttpClient {
+///
+/// `Send + Sync` so a single client built in `Ctx` can be shared with workers
+/// in `parallel_extract`.
+pub trait HttpClient: Send + Sync {
     fn get(&self, url: &str, headers: Headers) -> Result<HttpResponse, String>;
     fn get_streaming(
         &self,
@@ -34,18 +37,25 @@ pub trait HttpClient {
     ) -> Result<Box<dyn HttpStream + Send>, String>;
 }
 
-pub fn default_client() -> Box<dyn HttpClient> {
-    Box::new(minreq_backend::MinreqClient)
+/// Build the default HTTP client with a timeout (in seconds) baked in. The
+/// timeout covers connect + read; minreq applies it to both
+/// `TcpStream::connect_timeout` and the underlying socket's read-timeout.
+/// Without it, a stuck TCP handshake to api.github.com hangs indefinitely on
+/// `Resolving...`.
+pub fn default_client(timeout_secs: u64) -> Box<dyn HttpClient> {
+    Box::new(minreq_backend::MinreqClient { timeout_secs })
 }
 
 mod minreq_backend {
     use super::*;
 
-    pub struct MinreqClient;
+    pub struct MinreqClient {
+        pub(super) timeout_secs: u64,
+    }
 
     impl HttpClient for MinreqClient {
         fn get(&self, url: &str, headers: Headers) -> Result<HttpResponse, String> {
-            let mut req = minreq::get(url);
+            let mut req = minreq::get(url).with_timeout(self.timeout_secs);
             for (k, v) in headers {
                 req = req.with_header(*k, *v);
             }
@@ -62,7 +72,7 @@ mod minreq_backend {
             url: &str,
             headers: Headers,
         ) -> Result<Box<dyn HttpStream + Send>, String> {
-            let mut req = minreq::get(url);
+            let mut req = minreq::get(url).with_timeout(self.timeout_secs);
             for (k, v) in headers {
                 req = req.with_header(*k, *v);
             }
@@ -103,4 +113,3 @@ mod minreq_backend {
         }
     }
 }
-

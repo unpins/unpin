@@ -3,6 +3,8 @@ use std::process::ExitCode;
 use bpaf::{construct, positional, pure, short, Parser};
 
 mod archive;
+mod config;
+mod ctx;
 mod github;
 mod http;
 mod install;
@@ -12,13 +14,13 @@ mod sigint;
 
 #[derive(Clone, Debug)]
 enum Cmd {
-    Install { assume_yes: bool, jobs: u8, pick: bool, verbose: bool, pkgs: Vec<String> },
-    Update { assume_yes: bool, jobs: u8, pick: bool, verbose: bool, names: Vec<String> },
+    Install { assume_yes: bool, jobs: u8, pick: bool, verbose: bool, no_data: bool, pkgs: Vec<String> },
+    Update { assume_yes: bool, jobs: u8, pick: bool, verbose: bool, no_data: bool, names: Vec<String> },
     Remove { assume_yes: bool, names: Vec<String> },
     List,
-    Info { pkgs: Vec<String> },
+    Info { verbose: bool, pkgs: Vec<String> },
     Prune,
-    Run { pkg: String, args: Vec<String> },
+    Run { pick: bool, verbose: bool, pkg: String, args: Vec<String> },
     Completion { shell: Shell },
 }
 
@@ -65,7 +67,13 @@ fn pick_flag() -> impl Parser<bool> {
 fn verbose_flag() -> impl Parser<bool> {
     short('v')
         .long("verbose")
-        .help("Show release assets that were filtered out")
+        .help("Print every HTTP request and show release assets that were filtered out")
+        .switch()
+}
+
+fn no_data_flag() -> impl Parser<bool> {
+    bpaf::long("no-data")
+        .help("Skip the per-release runtime data tarball (overrides config `data = true`)")
         .switch()
 }
 
@@ -75,10 +83,11 @@ fn cli() -> bpaf::OptionParser<Cmd> {
         let jobs = jobs_flag();
         let pick = pick_flag();
         let verbose = verbose_flag();
+        let no_data = no_data_flag();
         let pkgs = positional::<String>("PKG")
             .help("owner/repo (or bare name for unpins/<name>), optionally with @version")
             .some("expected at least one package");
-        construct!(Cmd::Install { assume_yes(yes), jobs, pick, verbose, pkgs })
+        construct!(Cmd::Install { assume_yes(yes), jobs, pick, verbose, no_data, pkgs })
             .to_options()
             .descr("Install one or more packages from GitHub releases. Default command — `unpin owner/repo` is equivalent to `unpin install owner/repo`.")
             .command("install")
@@ -89,10 +98,11 @@ fn cli() -> bpaf::OptionParser<Cmd> {
         let jobs = jobs_flag();
         let pick = pick_flag();
         let verbose = verbose_flag();
+        let no_data = no_data_flag();
         let names = positional::<String>("NAME")
             .help("names of installed packages; empty = update all")
             .many();
-        construct!(Cmd::Update { assume_yes(yes), jobs, pick, verbose, names })
+        construct!(Cmd::Update { assume_yes(yes), jobs, pick, verbose, no_data, names })
             .to_options()
             .descr("Update one, several, or (with no args) all installed packages.")
             .command("update")
@@ -114,13 +124,16 @@ fn cli() -> bpaf::OptionParser<Cmd> {
         .descr("List installed packages.")
         .command("list");
 
-    let info = positional::<String>("PKG")
-        .help("installed name, owner/repo, or bare name for unpins/<name>")
-        .some("expected at least one package")
-        .map(|pkgs| Cmd::Info { pkgs })
-        .to_options()
-        .descr("Show details about one or more packages (installed or remote).")
-        .command("info");
+    let info = {
+        let verbose = verbose_flag();
+        let pkgs = positional::<String>("PKG")
+            .help("installed name, owner/repo, or bare name for unpins/<name>")
+            .some("expected at least one package");
+        construct!(Cmd::Info { verbose, pkgs })
+            .to_options()
+            .descr("Show details about one or more packages (installed or remote).")
+            .command("info")
+    };
 
     let prune = pure(Cmd::Prune)
         .to_options()
@@ -128,12 +141,14 @@ fn cli() -> bpaf::OptionParser<Cmd> {
         .command("prune");
 
     let run = {
+        let pick = pick_flag();
+        let verbose = verbose_flag();
         let pkg = positional::<String>("PKG").help("owner/repo (or bare name for unpins/<name>), optionally with @version");
         let args = positional::<String>("ARG")
             .help("arguments forwarded to the binary")
             .strict()
             .many();
-        construct!(Cmd::Run { pkg, args })
+        construct!(Cmd::Run { pick, verbose, pkg, args })
             .to_options()
             .descr("Run a package's binary without installing it (no entry added to PATH).")
             .command("run")
@@ -164,8 +179,14 @@ fn print_banner() {
 fn print_auth_footer() {
     println!();
     println!("Auth (optional, raises GitHub API rate limit from 60/h to 5000/h):");
-    println!("  UNPIN_GITHUB_TOKEN | GITHUB_TOKEN | GH_TOKEN   token from env var");
-    println!("  UNPIN_USE_GH_AUTH=1                            use `gh auth token`");
+    println!("  GITHUB_TOKEN | GH_TOKEN          token from env var");
+    println!("  use_gh_auth = true (in config)   use `gh auth token`");
+    println!();
+    println!("Config file: {}", platform::config_path().display());
+    println!("  Flat `key = value` with `#` comments. Recognized keys:");
+    println!("    http_timeout = <seconds>   per-request HTTP timeout (default: 30)");
+    println!("    use_gh_auth  = true|false  shell out to `gh auth token` (default: false)");
+    println!("    data         = true|false  download per-release data tarball  (default: true)");
 }
 
 fn term_width() -> usize {
@@ -228,17 +249,25 @@ fn main() -> ExitCode {
         }
     };
     let result = match cmd {
-        Cmd::Install { assume_yes, jobs, pick, verbose, pkgs } => {
-            install::install_many(&pkgs, assume_yes, jobs, pick, verbose)
+        Cmd::Install { assume_yes, jobs, pick, verbose, no_data, pkgs } => {
+            let ctx = ctx::Ctx::new(verbose);
+            install::install_many(&pkgs, assume_yes, jobs, pick, no_data, &ctx)
         }
-        Cmd::Update { assume_yes, jobs, pick, verbose, names } => {
-            install::update(&names, assume_yes, jobs, pick, verbose)
+        Cmd::Update { assume_yes, jobs, pick, verbose, no_data, names } => {
+            let ctx = ctx::Ctx::new(verbose);
+            install::update(&names, assume_yes, jobs, pick, no_data, &ctx)
         }
         Cmd::Remove { assume_yes, names } => install::remove_many(&names, assume_yes),
         Cmd::List => install::list(),
-        Cmd::Info { pkgs } => install::info_many(&pkgs),
+        Cmd::Info { verbose, pkgs } => {
+            let ctx = ctx::Ctx::new(verbose);
+            install::info_many(&pkgs, &ctx)
+        }
         Cmd::Prune => install::prune(),
-        Cmd::Run { pkg, args } => install::run(&pkg, &args),
+        Cmd::Run { pick, verbose, pkg, args } => {
+            let ctx = ctx::Ctx::new(verbose);
+            install::run(&pkg, &args, pick, &ctx)
+        }
         Cmd::Completion { shell } => {
             // bpaf's `autocomplete` feature exposes hidden `--bpaf-complete-style-<shell>`
             // flags that print the script for that shell. We re-enter the parser with
