@@ -152,10 +152,11 @@ fn classify_excluded(name_lower: &str) -> Option<&'static str> {
     if name_lower.contains(".bsdiff") {
         return Some("unsupported format");
     }
-    // Bare `.zst` (not `.tar.zst`) is single-stream compression; we only handle
-    // the tar-zst container.
-    if name_lower.ends_with(".zst") && !name_lower.ends_with(".tar.zst") {
-        return Some("unsupported format");
+    // Data companion of another release asset: `<pkg>-<tag>-data.tar.zst`. One
+    // per release (platform-agnostic runtime data, e.g. vim/share/vim/<ver>).
+    // Excluded from the picker — preflight pairs it with the primary by tag.
+    if name_lower.ends_with("-data.tar.zst") {
+        return Some("data companion");
     }
     if !platform::current_os_keys().iter().any(|k| name_lower.contains(k)) {
         return Some("no OS tag");
@@ -380,6 +381,29 @@ pub struct ExtractJob {
     /// `None` → already cached, worker skips the download path entirely.
     pub asset: Option<Asset>,
     pub expected_sha256: Option<String>,
+    /// Data tarball companion (e.g. `<pkg>-<tag>-data.tar.zst`) bundled with the
+    /// release. Extracted into the same `vdir` after the primary. `None` for
+    /// packages without runtime data (the common case).
+    pub companion: Option<Asset>,
+    pub companion_expected_sha256: Option<String>,
+}
+
+/// Find `<pkg>-<tag>-data.tar.zst` in the release's assets. Tries both raw
+/// `tag` and `v`-stripped (GitHub releases typically tag as `v9.2.0` but our
+/// build emits the data asset using the bare version). Returns `None` for
+/// packages that don't ship a runtime tarball.
+fn find_companion<'a>(pkg: &str, tag: &str, assets: &'a [Asset]) -> Option<&'a Asset> {
+    let pkg_l = pkg.to_ascii_lowercase();
+    let tag_l = tag.to_ascii_lowercase();
+    let tag_v = tag_l.trim_start_matches('v');
+    let candidates = [
+        format!("{pkg_l}-{tag_l}-data.tar.zst"),
+        format!("{pkg_l}-{tag_v}-data.tar.zst"),
+    ];
+    assets.iter().find(|a| {
+        let n = a.name.to_ascii_lowercase();
+        candidates.contains(&n)
+    })
 }
 
 /// Serial preflight: pick asset, resolve checksum, decide if download is needed.
@@ -392,17 +416,26 @@ fn preflight_extract(
     verbose: bool,
 ) -> Result<ExtractJob, String> {
     let vdir = version_dir(&spec.owner, &spec.name, &release.tag_name);
-    if vdir.is_dir() && !pick {
+    let companion_peek = find_companion(&spec.name, &release.tag_name, &release.assets);
+    // Cache is complete iff the version dir exists AND, if a companion exists,
+    // share/ is present (the companion's payload). Without this, a download
+    // interrupted between primary and companion leaves a half-installed vdir
+    // that the cache check would happily accept.
+    let cache_complete =
+        vdir.is_dir() && (companion_peek.is_none() || vdir.join("share").is_dir());
+    if cache_complete && !pick {
         return Ok(ExtractJob {
             spec,
             release,
             vdir,
             asset: None,
             expected_sha256: None,
+            companion: None,
+            companion_expected_sha256: None,
         });
     }
     let asset = pick_asset(&release.assets, &spec.name, pick, verbose)?.clone();
-    // --pick on a cached version: wipe before re-extracting the chosen asset.
+    // --pick (or incomplete cache) on a cached version: wipe before re-extracting.
     if vdir.is_dir() {
         fs::remove_dir_all(&vdir)
             .map_err(|e| format!("remove {}: {e}", vdir.display()))?;
@@ -418,28 +451,145 @@ fn preflight_extract(
             None
         }
     };
+    let companion = find_companion(&spec.name, &release.tag_name, &release.assets).cloned();
+    let companion_expected_sha256 = match companion.as_ref() {
+        Some(c) => match find_checksum_url(&release.assets, &c.name) {
+            Some(url) => Some(fetch_expected_sha256(&url)?),
+            None => {
+                if !assume_yes
+                    && !prompt_yes_no(
+                        "Data companion has no SHA-256 checksum. Continue without verification?",
+                    )
+                {
+                    return Err("aborted: missing companion checksum".into());
+                }
+                None
+            }
+        },
+        None => None,
+    };
     Ok(ExtractJob {
         spec,
         release,
         vdir,
         asset: Some(asset),
         expected_sha256,
+        companion,
+        companion_expected_sha256,
     })
 }
 
-/// Worker body: download + extract + verify. The bar must already be
-/// registered with `multi` (pre-added on the main thread). Safe to call from a
-/// worker thread in `thread::scope`.
+/// Orchestrate one ExtractJob: download+extract primary, and (if present)
+/// data companion **concurrently** via `thread::scope`. They write disjoint
+/// subtrees of the same vdir (e.g. `bin/` vs `share/`), so there's no
+/// contention. Bars must be pre-added to `multi` on the main thread — see
+/// the comment in `parallel_extract` for why.
 ///
-/// On success the bar is cleared from the terminal. On failure the bar is
-/// re-styled red, the reason is set as its message, and it is abandoned —
-/// leaving the failure visible above any later output.
-fn do_extract(job: &ExtractJob, bar: &ProgressBar, multi: &MultiProgress) -> Result<(), String> {
-    let Some(asset) = job.asset.as_ref() else {
+/// Per-job cleanup (sigint hook + CleanupGuard) is armed here and only
+/// disarmed when *all* tasks succeed; any failure rolls back the vdir.
+fn do_extract(
+    job: &ExtractJob,
+    primary_bar: &ProgressBar,
+    companion_bar: Option<&ProgressBar>,
+    multi: &MultiProgress,
+) -> Result<(), String> {
+    let Some(primary_asset) = job.asset.as_ref() else {
         return Ok(()); // cached
     };
-    let result = do_extract_inner(job, asset, bar, multi);
-    match &result {
+    let rdir = repo_dir(&job.spec.owner, &job.spec.name);
+    fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
+    crate::sigint::push_cleanup(&job.vdir);
+    let mut guard = CleanupGuard::arm(job.vdir.clone());
+
+    let repo = job.spec.repo();
+    let result = if let (Some(companion), Some(cbar)) =
+        (job.companion.as_ref(), companion_bar)
+    {
+        // Run primary + companion in parallel. Each task handles its own bar
+        // finalization (clear on Ok, red+abandon on Err) inside
+        // `download_extract_verify`, so the UI doesn't wait on the slowest leg
+        // before showing failures. The join below propagates the first error;
+        // CleanupGuard then wipes the vdir for a clean retry.
+        let (r_prim, r_comp) = thread::scope(|s| {
+            let h_prim = s.spawn(|| {
+                download_extract_verify(
+                    primary_asset,
+                    job.expected_sha256.as_deref(),
+                    &job.vdir,
+                    primary_bar,
+                    multi,
+                    &repo,
+                    false,
+                )
+            });
+            let h_comp = s.spawn(|| {
+                download_extract_verify(
+                    companion,
+                    job.companion_expected_sha256.as_deref(),
+                    &job.vdir,
+                    cbar,
+                    multi,
+                    &repo,
+                    true,
+                )
+            });
+            (h_prim.join().unwrap(), h_comp.join().unwrap())
+        });
+        r_prim.and(r_comp)
+    } else {
+        download_extract_verify(
+            primary_asset,
+            job.expected_sha256.as_deref(),
+            &job.vdir,
+            primary_bar,
+            multi,
+            &repo,
+            false,
+        )
+    };
+
+    if result.is_ok() {
+        crate::sigint::pop_cleanup(&job.vdir);
+        guard.disarm();
+    }
+    result
+}
+
+/// One download → extract → verify step against a single bar. The caller
+/// pre-adds the bar to a shared `MultiProgress`. On success the bar is
+/// cleared; on failure it's re-styled red and abandoned so the reason stays
+/// visible. The vdir is shared between primary and companion calls — both
+/// tar streams write disjoint subtrees, so concurrent invocations are safe.
+fn download_extract_verify(
+    asset: &Asset,
+    expected_sha256: Option<&str>,
+    vdir: &Path,
+    bar: &ProgressBar,
+    multi: &MultiProgress,
+    repo: &str,
+    is_companion: bool,
+) -> Result<(), String> {
+    let r = (|| -> Result<(), String> {
+        let stream = github::download_stream_into(&asset.browser_download_url, bar)?;
+        let mut hashing = HashingReader::new(stream);
+        archive::extract(&asset.name, &mut hashing, vdir)?;
+        let got = hashing.finalize_hex();
+        if let Some(expected) = expected_sha256 {
+            if !got.eq_ignore_ascii_case(expected) {
+                return Err(format!(
+                    "checksum mismatch for {}: expected {expected}, got {got}",
+                    asset.name
+                ));
+            }
+            let suffix = if is_companion { " (data)" } else { "" };
+            let _ = multi.println(format!(
+                "  verified {repo}{suffix}  ({})",
+                &expected[..16]
+            ));
+        }
+        Ok(())
+    })();
+    match &r {
         Ok(()) => bar.finish_and_clear(),
         Err(e) => {
             bar.set_style(github::download_error_style());
@@ -447,43 +597,7 @@ fn do_extract(job: &ExtractJob, bar: &ProgressBar, multi: &MultiProgress) -> Res
             bar.abandon();
         }
     }
-    result
-}
-
-fn do_extract_inner(
-    job: &ExtractJob,
-    asset: &Asset,
-    bar: &ProgressBar,
-    multi: &MultiProgress,
-) -> Result<(), String> {
-    let rdir = repo_dir(&job.spec.owner, &job.spec.name);
-    fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
-
-    crate::sigint::push_cleanup(&job.vdir);
-    let mut guard = CleanupGuard::arm(job.vdir.clone());
-
-    let stream = github::download_stream_into(&asset.browser_download_url, bar)?;
-    let mut hashing = HashingReader::new(stream);
-    archive::extract(&asset.name, &mut hashing, &job.vdir)?;
-    let got = hashing.finalize_hex();
-
-    if let Some(expected) = job.expected_sha256.as_ref() {
-        if !got.eq_ignore_ascii_case(expected) {
-            return Err(format!(
-                "checksum mismatch for {}: expected {expected}, got {got}",
-                asset.name
-            ));
-        }
-        let _ = multi.println(format!(
-            "  verified {}  ({})",
-            job.spec.repo(),
-            &expected[..16]
-        ));
-    }
-
-    crate::sigint::pop_cleanup(&job.vdir);
-    guard.disarm();
-    Ok(())
+    r
 }
 
 struct CleanupGuard {
@@ -712,14 +826,18 @@ fn parallel_extract(prepared: &[(String, ExtractJob)], n_workers: usize) -> Vec<
             (n.max(j.spec.name.chars().count()), t.max(j.release.tag_name.chars().count()))
         });
 
-    // Pre-add a bar for every job that needs a download. Cached jobs get None
-    // (no slot, no bar). multi.add MUST happen before set_style/set_prefix —
-    // those methods tick the bar, and on a fresh `ProgressBar::new` the draw
-    // target is still the default stderr writer. A tick there renders the bar
-    // directly to stderr (showing "100%" because length=0/position=0), and
-    // that line stays in scrollback when multi.add later swaps the target —
-    // producing one ghost row per bar above the live render area.
-    let bars: Vec<Option<ProgressBar>> = prepared
+    // Pre-add bars for every job that needs a download. Cached jobs get None
+    // (no slot, no bars). Jobs with a data companion get *two* bars — both are
+    // added here so they ride together below cached-announce lines and so the
+    // companion's bar exists when its worker spawns.
+    //
+    // multi.add MUST happen before set_style/set_prefix — those methods tick
+    // the bar, and on a fresh `ProgressBar::new` the draw target is still the
+    // default stderr writer. A tick there renders the bar directly to stderr
+    // (showing "100%" because length=0/position=0), and that line stays in
+    // scrollback when multi.add later swaps the target — producing one ghost
+    // row per bar above the live render area.
+    let bars: Vec<Option<(ProgressBar, Option<ProgressBar>)>> = prepared
         .iter()
         .map(|(_, job)| {
             job.asset.as_ref()?;
@@ -729,7 +847,16 @@ fn parallel_extract(prepared: &[(String, ExtractJob)], n_workers: usize) -> Vec<
                 "{:<name_w$}  {:<tag_w$}",
                 job.spec.name, job.release.tag_name
             ));
-            Some(bar)
+            let cbar = job.companion.as_ref().map(|_| {
+                let cb = multi.add(ProgressBar::new(0));
+                cb.set_style(github::download_progress_style());
+                cb.set_prefix(format!(
+                    "{:<name_w$}  {:<tag_w$}  (data)",
+                    job.spec.name, job.release.tag_name
+                ));
+                cb
+            });
+            Some((bar, cbar))
         })
         .collect();
 
@@ -770,8 +897,8 @@ fn parallel_extract(prepared: &[(String, ExtractJob)], n_workers: usize) -> Vec<
                     Err(_) => break,
                 };
                 let (_label, job) = &prepared_w[i];
-                let bar = bars_w[i].as_ref().expect("downloadable job has a pre-added bar");
-                let result = do_extract(job, bar, &multi_w);
+                let (bar, cbar) = bars_w[i].as_ref().expect("downloadable job has pre-added bars");
+                let result = do_extract(job, bar, cbar.as_ref(), &multi_w);
                 let _ = result_tx_w.send((i, result));
             });
         }
@@ -1207,7 +1334,13 @@ pub fn run(input: &str, args: &[String]) -> Result<(), String> {
         let bar = multi.add(ProgressBar::new(0));
         bar.set_style(github::download_progress_style());
         bar.set_prefix(format!("{} {}", spec.name, release.tag_name));
-        do_extract(&job, &bar, &multi)?;
+        let cbar = job.companion.as_ref().map(|_| {
+            let cb = multi.add(ProgressBar::new(0));
+            cb.set_style(github::download_progress_style());
+            cb.set_prefix(format!("{} {} (data)", spec.name, release.tag_name));
+            cb
+        });
+        do_extract(&job, &bar, cbar.as_ref(), &multi)?;
     }
     if was_cached {
         let has_links = fs::read_dir(bin_dir())
@@ -1359,11 +1492,51 @@ mod tests {
     }
 
     #[test]
-    fn classify_excludes_bsdiff_and_bare_zst() {
+    fn classify_excludes_bsdiff() {
         assert_eq!(classify_excluded("update.bsdiff"), Some("unsupported format"));
-        assert_eq!(classify_excluded("payload.zst"), Some("unsupported format"));
-        // .tar.zst is fine — caught by the OS-key check below, not unsupported.
-        assert_ne!(classify_excluded("rg-linux.tar.zst"), Some("unsupported format"));
+    }
+
+    #[test]
+    fn classify_accepts_bare_zst_binary() {
+        // unpins ships primary binaries as bare zstd (e.g. gvim-9.2-linux.zst).
+        // Must not be rejected as "unsupported format" — archive.rs handles it.
+        #[cfg(target_os = "linux")]
+        assert_eq!(classify_excluded("gvim-9.2.0-x86_64-linux.zst"), None);
+        // Windows `.exe.zst` on Linux gets rejected via auxiliary/other-platform keys.
+        #[cfg(target_os = "linux")]
+        assert!(classify_excluded("gvim-9.2.0-x86_64-windows.exe.zst").is_some());
+    }
+
+    #[test]
+    fn classify_excludes_data_companion() {
+        // <pkg>-<tag>-data.tar.zst is platform-agnostic runtime data, paired
+        // with the primary asset in preflight. Not directly installable.
+        assert_eq!(classify_excluded("gvim-9.2.0-data.tar.zst"), Some("data companion"));
+        assert_eq!(classify_excluded("gvim-v9.2.0-data.tar.zst"), Some("data companion"));
+        // Regular .tar.zst is not a companion — only the `-data.tar.zst` suffix.
+        assert_ne!(classify_excluded("rg-linux.tar.zst"), Some("data companion"));
+    }
+
+    #[test]
+    fn find_companion_matches_tagged_data_asset() {
+        let assets = vec![
+            Asset { name: "gvim-9.2.0-x86_64-linux.zst".into(), browser_download_url: "u1".into() },
+            Asset { name: "gvim-9.2.0-x86_64-windows.exe.zst".into(), browser_download_url: "u2".into() },
+            Asset { name: "gvim-9.2.0-data.tar.zst".into(), browser_download_url: "u3".into() },
+        ];
+        let c = find_companion("gvim", "v9.2.0", &assets).unwrap();
+        assert_eq!(c.name, "gvim-9.2.0-data.tar.zst");
+        // Same release without 'v' prefix in tag still matches the bare-version asset.
+        let c2 = find_companion("gvim", "9.2.0", &assets).unwrap();
+        assert_eq!(c2.name, "gvim-9.2.0-data.tar.zst");
+    }
+
+    #[test]
+    fn find_companion_returns_none_when_absent() {
+        let assets = vec![
+            Asset { name: "tree-2.2.1-x86_64-linux.zst".into(), browser_download_url: "u".into() },
+        ];
+        assert!(find_companion("tree", "v2.2.1", &assets).is_none());
     }
 
     #[test]

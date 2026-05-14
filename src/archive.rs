@@ -22,6 +22,27 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
         unpack_tar(reader, dest)
     } else if lower.ends_with(".zip") {
         unpack_zip_stream(reader, dest)
+    } else if lower.ends_with(".zst") {
+        // Single-stream zstd (no tar inside). Asset name minus `.zst` is the
+        // binary name. Place under `bin/` so siblings extracted from a `.tar.zst`
+        // data companion (which puts files at `share/...`) line up: vim's
+        // argv[0]-walk then resolves <exe_dir>/../share/vim/<ver>.
+        let mut zst = ruzstd::StreamingDecoder::new(reader)
+            .map_err(|e| format!("zstd init for {asset_name}: {e}"))?;
+        let stem = asset_name
+            .strip_suffix(".zst")
+            .or_else(|| asset_name.strip_suffix(".ZST"))
+            .unwrap_or(asset_name);
+        let bin_dir = dest.join("bin");
+        fs::create_dir_all(&bin_dir)
+            .map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
+        let path = bin_dir.join(stem);
+        let mut out = fs::File::create(&path)
+            .map_err(|e| format!("create {}: {e}", path.display()))?;
+        io::copy(&mut zst, &mut out).map_err(|e| format!("write {}: {e}", path.display()))?;
+        platform::set_unix_mode(&path, 0o755)
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+        Ok(())
     } else {
         // Bare binary: stream directly to a file with the asset's name. On
         // Unix the file is chmod'd +x; on Windows we rely on the `.exe`
@@ -358,6 +379,18 @@ mod tests {
         extract("downloaded-binary", &bytes[..], tmp.path()).unwrap();
         let p = tmp.path().join("downloaded-binary");
         assert_eq!(read_file(&p), bytes);
+        assert_eq!(mode_of(&p), 0o755);
+    }
+
+    #[test]
+    fn extract_bare_zst_decompresses_into_bin_with_755() {
+        // Asset like `gvim-9.2-x86_64-linux.zst` should land at `<dest>/bin/gvim-9.2-x86_64-linux`.
+        let payload = b"\x7fELFimagine this is a binary";
+        let compressed = zstd::encode_all(&payload[..], 3).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        extract("gvim-9.2.0-x86_64-linux.zst", &compressed[..], tmp.path()).unwrap();
+        let p = tmp.path().join("bin/gvim-9.2.0-x86_64-linux");
+        assert_eq!(read_file(&p), payload);
         assert_eq!(mode_of(&p), 0o755);
     }
 
