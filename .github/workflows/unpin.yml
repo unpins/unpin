@@ -23,6 +23,5 @@ jobs:
       # unpin is the bootstrap: users download it by hand from unpins.org,
       # so the artifact gets a stable filename without version embedded.
       bootstrap_naming: true
-      with_windows: true
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
