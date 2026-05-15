@@ -9,12 +9,24 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     unpins-lib.url = "github:unpins/nix-lib";
+    # rustup-distributed toolchain. Pulls `rust-std-<triple>` as a binary
+    # download for each cross target — avoids the multi-hour cross-rustc
+    # bootstrap that pkgsCross.<x>.rustPlatform triggers for musl targets
+    # not pre-built on cache.nixos.org (i686-musl, muslpi, musl-power,
+    # riscv64-musl).
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, unpins-lib }:
+  outputs = { self, nixpkgs, unpins-lib, rust-overlay }:
     let
       ulib = unpins-lib.lib;
-      nixpkgsFor = ulib.forAllNative (system: import nixpkgs { inherit system; });
+      nixpkgsFor = ulib.forAllNative (system: import nixpkgs {
+        inherit system;
+        overlays = [ rust-overlay.overlays.default ];
+      });
 
       version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
 
@@ -62,32 +74,59 @@
           buildInputs = [ cross.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
         });
 
-      # musl targets default to +crt-static, so plain `pkgsCross.musl32.rustPlatform`
-      # already yields a static binary. Going through `pkgsStatic` on top would
-      # force a static-rustc rebuild (uncached, ~10GB tmpfs blowup).
-      linuxI686Unpin = mkUnpin {
-        rustPlatform = nixpkgsFor.x86_64-linux.pkgsCross.musl32.rustPlatform;
+      # Rustup-distributed toolchain with every cross target we ship. rustup
+      # supplies `rust-std-<triple>` as a precompiled tarball, so adding a
+      # target costs a download instead of the ~40 min `pkgsCross.<x>.rustc`
+      # source build. The same toolchain drv is shared by every mkCross call
+      # below, so all 4 musl crosses fetch it exactly once.
+      rustToolchain = pkgs: pkgs.rust-bin.stable.latest.default.override {
+        targets = [
+          "i686-unknown-linux-musl"
+          "armv7-unknown-linux-musleabihf"
+          "powerpc64le-unknown-linux-musl"
+          "riscv64gc-unknown-linux-musl"
+        ];
       };
 
-      # Cross from x86_64-linux to musl-power (powerpc64le-musl).
-      linuxPpc64leUnpin = mkUnpin {
-        rustPlatform = nixpkgsFor.x86_64-linux.pkgsCross.musl-power.rustPlatform;
-      };
+      # Cross build for musl targets: rust-overlay rustc (native binary, no
+      # source build) + rustup's `rust-std-<triple>` + the cross C toolchain
+      # bundled in `crossPkgs.stdenv` for ring/xz2 (have C+asm) and the final
+      # link. Replaces the old `pkgsCross.<x>.rustPlatform` path that built
+      # cross-rustc from source.
+      #
+      # Why crossPkgs.makeRustPlatform (not pkgs.makeRustPlatform): the cross
+      # stdenv generates `cargoBuildHook` with `--target <triple>` baked in
+      # and pre-sets `CC_<TARGET>` / `CARGO_TARGET_<TARGET>_LINKER` to the
+      # cross toolchain. Native makeRustPlatform hardcodes the build host's
+      # target instead, which `CARGO_BUILD_TARGET` env can't override (the
+      # hook passes `--target` on the cargo command line). The rustc/cargo
+      # override threads rust-overlay's native binary through unchanged.
+      mkCross = crossPkgs:
+        let rust = rustToolchain crossPkgs.buildPackages; in
+        mkUnpin {
+          rustPlatform = crossPkgs.makeRustPlatform { cargo = rust; rustc = rust; };
+          auditable = false;
+          # rust-overlay's musl target specs default to `crt-static = false`
+          # (rustup's convention), unlike nixpkgs's pkgsStatic which flips it
+          # on. Without the explicit `+crt-static` the binary keeps a musl
+          # dynamic-link interpreter and action-build's portability check
+          # rejects it.
+          env.RUSTFLAGS = "-C target-feature=+crt-static";
+        };
+
+      linuxI686Unpin   = mkCross nixpkgsFor.x86_64-linux.pkgsCross.musl32;
+      linuxPpc64leUnpin = mkCross nixpkgsFor.x86_64-linux.pkgsCross.musl-power;
 
       # riscv64-musl isn't pre-cooked in pkgsCross — spell the triple out.
-      linuxRiscv64Unpin = mkUnpin {
-        rustPlatform = (import nixpkgs {
-          system = "x86_64-linux";
-          crossSystem = { config = "riscv64-unknown-linux-musl"; };
-        }).rustPlatform;
-      };
+      linuxRiscv64Unpin = mkCross (import nixpkgs {
+        system = "x86_64-linux";
+        overlays = [ rust-overlay.overlays.default ];
+        crossSystem = { config = "riscv64-unknown-linux-musl"; };
+      });
 
-      # Cross from aarch64-linux to muslpi (armv6l-musleabihf). Same +crt-static
-      # default as musl32 above. Built on the ubuntu-24.04-arm GH runner so
-      # this attr lives under packages.aarch64-linux.
-      linuxArmv7lUnpin = mkUnpin {
-        rustPlatform = nixpkgsFor.aarch64-linux.pkgsCross.muslpi.rustPlatform;
-      };
+      # Built on the ubuntu-24.04-arm GH runner, so this attr lives under
+      # packages.aarch64-linux.
+      linuxArmv7lUnpin = mkCross nixpkgsFor.aarch64-linux.pkgsCross.muslpi;
 
       nativePackages = ulib.forAllNative (system: { default = nativeUnpin system; });
     in
