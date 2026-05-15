@@ -69,6 +69,13 @@
         rustPlatform = nixpkgsFor.x86_64-linux.pkgsCross.musl32.rustPlatform;
       };
 
+      # Cross from aarch64-linux to muslpi (armv6l-musleabihf). Same +crt-static
+      # default as musl32 above. Built on the ubuntu-24.04-arm GH runner so
+      # this attr lives under packages.aarch64-linux.
+      linuxArmv7lUnpin = mkUnpin {
+        rustPlatform = nixpkgsFor.aarch64-linux.pkgsCross.muslpi.rustPlatform;
+      };
+
       nativePackages = ulib.forAllNative (system: { default = nativeUnpin system; });
     in
     {
@@ -76,6 +83,9 @@
         x86_64-linux = nativePackages.x86_64-linux // {
           "windows-x86_64" = windowsUnpin;
           "linux-i686" = linuxI686Unpin;
+        };
+        aarch64-linux = nativePackages.aarch64-linux // {
+          "linux-armv7l" = linuxArmv7lUnpin;
         };
         aarch64-darwin = nativePackages.aarch64-darwin // {
           "darwin-x86_64" = darwinX86Unpin;

@@ -128,7 +128,17 @@ pub fn current_arch_keys() -> &'static [&'static str] {
     {
         &["i686", "i386"]
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86")))]
+    // Rust `target_arch = "arm"` covers armv5/v6/v7. unpins builds via muslpi
+    // (armv6l-baseline, hardfloat) but labels assets "armv7l" since that's
+    // what `uname -m` returns on the dominant target hardware (Pi 2+, etc.).
+    // Bare "arm" is NOT a key — it would substring-match nothing meaningful
+    // (aarch64 doesn't contain "arm") but we keep the table free of overly
+    // generic tokens for consistency with the x86/x86_64 reasoning above.
+    #[cfg(target_arch = "arm")]
+    {
+        &["armv6l", "armv7l", "armhf", "armv6", "armv7"]
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm")))]
     {
         &[]
     }
@@ -137,17 +147,21 @@ pub fn current_arch_keys() -> &'static [&'static str] {
 pub fn other_arch_keys() -> &'static [&'static str] {
     #[cfg(target_arch = "x86_64")]
     {
-        &["i386", "i686", "armv7", "aarch64", "arm64"]
+        &["i386", "i686", "armv6", "armv7", "armhf", "aarch64", "arm64"]
     }
     #[cfg(target_arch = "aarch64")]
     {
-        &["i386", "i686", "armv7", "x86_64", "amd64", "x64"]
+        &["i386", "i686", "armv6", "armv7", "armhf", "x86_64", "amd64", "x64"]
     }
     #[cfg(target_arch = "x86")]
     {
-        &["x86_64", "amd64", "x64", "aarch64", "arm64", "armv7"]
+        &["x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv7", "armhf"]
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86")))]
+    #[cfg(target_arch = "arm")]
+    {
+        &["i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64"]
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm")))]
     {
         &[]
     }
