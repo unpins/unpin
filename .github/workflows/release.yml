@@ -11,12 +11,11 @@ jobs:
   release:
     permissions:
       contents: write
-    uses: unpins/action-build/.github/workflows/release.yml@v1
+    uses: unpins/action-build/.github/workflows/release.yml@main
     with:
       package_name: 'unpin'
       package_data: false
       bootstrap_naming: true
-      with_windows: true
       own_software: true
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}

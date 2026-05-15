@@ -16,7 +16,7 @@ jobs:
     # must grant it even though we never set create_release=true here.
     permissions:
       contents: write
-    uses: unpins/action-build/.github/workflows/build.yml@v1
+    uses: unpins/action-build/.github/workflows/build.yml@main
     with:
       package_name: 'unpin'
       package_data: false
