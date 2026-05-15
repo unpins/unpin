@@ -120,7 +120,15 @@ pub fn current_arch_keys() -> &'static [&'static str] {
     {
         &["aarch64", "arm64"]
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    // Rust `target_arch = "x86"` covers i386/i486/i586/i686. unpins builds for
+    // i686-unknown-linux-musl; "x86" is intentionally NOT a current-arch key —
+    // it's a substring of "x86_64" and would risk picking the wrong asset for
+    // a third-party release that drops the `_64` suffix. Stay precise.
+    #[cfg(target_arch = "x86")]
+    {
+        &["i686", "i386"]
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86")))]
     {
         &[]
     }
@@ -135,7 +143,11 @@ pub fn other_arch_keys() -> &'static [&'static str] {
     {
         &["i386", "i686", "armv7", "x86_64", "amd64", "x64"]
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(target_arch = "x86")]
+    {
+        &["x86_64", "amd64", "x64", "aarch64", "arm64", "armv7"]
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86")))]
     {
         &[]
     }

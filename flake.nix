@@ -62,12 +62,20 @@
           buildInputs = [ cross.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
         });
 
+      # musl targets default to +crt-static, so plain `pkgsCross.musl32.rustPlatform`
+      # already yields a static binary. Going through `pkgsStatic` on top would
+      # force a static-rustc rebuild (uncached, ~10GB tmpfs blowup).
+      linuxI686Unpin = mkUnpin {
+        rustPlatform = nixpkgsFor.x86_64-linux.pkgsCross.musl32.rustPlatform;
+      };
+
       nativePackages = ulib.forAllNative (system: { default = nativeUnpin system; });
     in
     {
       packages = nativePackages // {
         x86_64-linux = nativePackages.x86_64-linux // {
           "windows-x86_64" = windowsUnpin;
+          "linux-i686" = linuxI686Unpin;
         };
         aarch64-darwin = nativePackages.aarch64-darwin // {
           "darwin-x86_64" = darwinX86Unpin;
