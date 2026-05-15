@@ -138,7 +138,20 @@ pub fn current_arch_keys() -> &'static [&'static str] {
     {
         &["armv6l", "armv7l", "armhf", "armv6", "armv7"]
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm")))]
+    // PowerPC 64-bit. `target_arch = "powerpc64"` covers both BE and LE; we
+    // only ship LE (musl-power → powerpc64le-musl). Debian's label is
+    // "ppc64el" but uname + Rust ecosystem use "ppc64le".
+    #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+    {
+        &["ppc64le", "powerpc64le"]
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        &["riscv64"]
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm",
+                  all(target_arch = "powerpc64", target_endian = "little"),
+                  target_arch = "riscv64")))]
     {
         &[]
     }
@@ -147,21 +160,31 @@ pub fn current_arch_keys() -> &'static [&'static str] {
 pub fn other_arch_keys() -> &'static [&'static str] {
     #[cfg(target_arch = "x86_64")]
     {
-        &["i386", "i686", "armv6", "armv7", "armhf", "aarch64", "arm64"]
+        &["i386", "i686", "armv6", "armv7", "armhf", "aarch64", "arm64", "ppc64le", "powerpc64le", "riscv64"]
     }
     #[cfg(target_arch = "aarch64")]
     {
-        &["i386", "i686", "armv6", "armv7", "armhf", "x86_64", "amd64", "x64"]
+        &["i386", "i686", "armv6", "armv7", "armhf", "x86_64", "amd64", "x64", "ppc64le", "powerpc64le", "riscv64"]
     }
     #[cfg(target_arch = "x86")]
     {
-        &["x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv7", "armhf"]
+        &["x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv7", "armhf", "ppc64le", "powerpc64le", "riscv64"]
     }
     #[cfg(target_arch = "arm")]
     {
-        &["i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64"]
+        &["i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "ppc64le", "powerpc64le", "riscv64"]
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm")))]
+    #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+    {
+        &["i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv7", "armhf", "riscv64"]
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        &["i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv7", "armhf", "ppc64le", "powerpc64le"]
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm",
+                  all(target_arch = "powerpc64", target_endian = "little"),
+                  target_arch = "riscv64")))]
     {
         &[]
     }

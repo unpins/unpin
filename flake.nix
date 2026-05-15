@@ -69,6 +69,19 @@
         rustPlatform = nixpkgsFor.x86_64-linux.pkgsCross.musl32.rustPlatform;
       };
 
+      # Cross from x86_64-linux to musl-power (powerpc64le-musl).
+      linuxPpc64leUnpin = mkUnpin {
+        rustPlatform = nixpkgsFor.x86_64-linux.pkgsCross.musl-power.rustPlatform;
+      };
+
+      # riscv64-musl isn't pre-cooked in pkgsCross — spell the triple out.
+      linuxRiscv64Unpin = mkUnpin {
+        rustPlatform = (import nixpkgs {
+          system = "x86_64-linux";
+          crossSystem = { config = "riscv64-unknown-linux-musl"; };
+        }).rustPlatform;
+      };
+
       # Cross from aarch64-linux to muslpi (armv6l-musleabihf). Same +crt-static
       # default as musl32 above. Built on the ubuntu-24.04-arm GH runner so
       # this attr lives under packages.aarch64-linux.
@@ -83,6 +96,8 @@
         x86_64-linux = nativePackages.x86_64-linux // {
           "windows-x86_64" = windowsUnpin;
           "linux-i686" = linuxI686Unpin;
+          "linux-ppc64le" = linuxPpc64leUnpin;
+          "linux-riscv64" = linuxRiscv64Unpin;
         };
         aarch64-linux = nativePackages.aarch64-linux // {
           "linux-armv7l" = linuxArmv7lUnpin;
