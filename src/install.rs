@@ -54,7 +54,7 @@ impl InstallOptions {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Spec {
     pub owner: String,
     pub name: String,
@@ -1075,16 +1075,13 @@ pub fn install_many(ctx: &Ctx, opts: &InstallOptions, inputs: &[String]) -> Resu
         .iter()
         .map(|s| parse_spec(s).map(|sp| (s.clone(), sp)))
         .collect::<Result<_, _>>()?;
-    // Dedup by (owner, name, version), preserving first-seen order: two
-    // identical args (or two args that normalize to the same spec, e.g.
-    // "ripgrep" and "unpins/ripgrep") would otherwise race on the same vdir
-    // in the parallel phase. Linear scan is fine — N is the CLI arg count.
+    // Dedup, preserving first-seen order: two identical args (or two args
+    // that normalize to the same spec, e.g. "ripgrep" and "unpins/ripgrep")
+    // would otherwise race on the same vdir in the parallel phase. Linear
+    // scan is fine — N is the CLI arg count.
     let mut specs: Vec<(String, Spec)> = Vec::with_capacity(parsed.len());
     for (label, spec) in parsed {
-        let dup = specs.iter().any(|(_, s)| {
-            s.owner == spec.owner && s.name == spec.name && s.version == spec.version
-        });
-        if !dup {
+        if !specs.iter().any(|(_, s)| s == &spec) {
             specs.push((label, spec));
         }
     }
