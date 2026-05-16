@@ -20,6 +20,12 @@ pub struct Release {
 pub struct Asset {
     pub name: String,
     pub browser_download_url: String,
+    /// Size in bytes as reported by the GitHub API. `0` when missing from the
+    /// response (older responses sometimes elide it). Used both for the asset
+    /// picker's human size column and as a fallback for the progress bar
+    /// length when the CDN doesn't return Content-Length.
+    #[nserde(default)]
+    pub size: u64,
 }
 
 pub fn fetch_latest(ctx: &Ctx, repo: &str) -> Result<Release, String> {
@@ -128,9 +134,14 @@ pub fn download_stream_into(
     if stream.status() < 200 || stream.status() >= 300 {
         return Err(format!("HTTP {} downloading {url}", stream.status()));
     }
-    match stream.content_length() {
-        Some(total) => bar.set_length(total),
-        None => {
+    match (stream.content_length(), bar.length().unwrap_or(0)) {
+        (Some(total), _) => bar.set_length(total),
+        // No Content-Length from the server, but the caller pre-seeded a
+        // length hint (typically `Asset.size` from the GitHub API). Keep
+        // the hint — it's nearly always accurate and gives a real
+        // percentage instead of spinner-only progress.
+        (None, hint) if hint > 0 => {}
+        (None, _) => {
             bar.set_style(download_progress_style_unknown());
             bar.enable_steady_tick(std::time::Duration::from_millis(120));
         }

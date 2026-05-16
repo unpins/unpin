@@ -342,8 +342,21 @@ fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, String> {
         "Available assets:"
     };
     println!("{header}");
+    let name_w = candidates.iter().map(|a| a.name.len()).max().unwrap_or(0);
     for (i, a) in candidates.iter().enumerate() {
-        println!("  [{}] {}", i + 1, a.name);
+        // GitHub-reported size on the right; some older API responses elide
+        // it (size == 0), so suppress the column for those entries rather
+        // than print a misleading "0 B".
+        if a.size > 0 {
+            println!(
+                "  [{}] {:<name_w$}  ({})",
+                i + 1,
+                a.name,
+                indicatif::HumanBytes(a.size),
+            );
+        } else {
+            println!("  [{}] {}", i + 1, a.name);
+        }
     }
     print!("Pick [1-{}]: ", candidates.len());
     io::stdout().flush().ok();
@@ -736,9 +749,13 @@ fn download_extract_verify(
                 .println(format!("  GET {}", asset.browser_download_url));
         }
         let stream = github::download_stream_into(ctx, &asset.browser_download_url, ui.bar)?;
-        // Capture Content-Length before wrapping. When no checksum is
-        // available, we fall back to this to detect a truncated body.
-        let content_length = stream.content_length();
+        // Capture expected length before wrapping. Server Content-Length is
+        // authoritative; fall back to `Asset.size` from the API when the CDN
+        // omits the header, so truncation still gets caught even on
+        // checksum-less releases.
+        let content_length = stream
+            .content_length()
+            .or_else(|| (asset.size > 0).then_some(asset.size));
         let mut hashing = HashingReader::new(stream);
         archive::extract(&asset.name, &mut hashing, vdir)?;
         // Defensive: every extractor today drains its input to EOF, but make
@@ -1359,20 +1376,29 @@ fn parallel_extract(
     let bars: Vec<Option<(ProgressBar, Option<ProgressBar>)>> = prepared
         .iter()
         .map(|(_, job)| {
-            job.asset.as_ref()?;
+            let asset = job.asset.as_ref()?;
             let bar = multi.add(ProgressBar::new(0));
             bar.set_style(github::download_progress_style());
             bar.set_prefix(format!(
                 "{:<name_w$}  {:<tag_w$}",
                 job.spec.name, job.release.tag_name
             ));
-            let cbar = job.companion.as_ref().map(|_| {
+            // Seed the bar with Asset.size as a fallback for CDNs that omit
+            // Content-Length. download_stream_into prefers the server value
+            // when it arrives, so this is purely a hint.
+            if asset.size > 0 {
+                bar.set_length(asset.size);
+            }
+            let cbar = job.companion.as_ref().map(|companion| {
                 let cb = multi.add(ProgressBar::new(0));
                 cb.set_style(github::download_progress_style());
                 cb.set_prefix(format!(
                     "{:<name_w$}  {:<tag_w$}  (data)",
                     job.spec.name, job.release.tag_name
                 ));
+                if companion.size > 0 {
+                    cb.set_length(companion.size);
+                }
                 cb
             });
             Some((bar, cbar))
@@ -1898,10 +1924,18 @@ pub fn run(ctx: &Ctx, input: &str, args: &[String], pick: bool) -> Result<i32, S
         let bar = multi.add(ProgressBar::new(0));
         bar.set_style(github::download_progress_style());
         bar.set_prefix(format!("{} {}", spec.name, release.tag_name));
-        let cbar = job.companion.as_ref().map(|_| {
+        if let Some(asset) = job.asset.as_ref()
+            && asset.size > 0
+        {
+            bar.set_length(asset.size);
+        }
+        let cbar = job.companion.as_ref().map(|companion| {
             let cb = multi.add(ProgressBar::new(0));
             cb.set_style(github::download_progress_style());
             cb.set_prefix(format!("{} {} (data)", spec.name, release.tag_name));
+            if companion.size > 0 {
+                cb.set_length(companion.size);
+            }
             cb
         });
         do_extract(ctx, &job, &bar, cbar.as_ref(), &multi)?;
@@ -2164,14 +2198,17 @@ mod tests {
             Asset {
                 name: "gvim-9.2.0-x86_64-linux.zst".into(),
                 browser_download_url: "u1".into(),
+                size: 0,
             },
             Asset {
                 name: "gvim-9.2.0-x86_64-windows.exe.zst".into(),
                 browser_download_url: "u2".into(),
+                size: 0,
             },
             Asset {
                 name: "gvim-9.2.0-data.tar.zst".into(),
                 browser_download_url: "u3".into(),
+                size: 0,
             },
         ];
         let c = find_companion("gvim", "v9.2.0", &assets).unwrap();
@@ -2186,6 +2223,7 @@ mod tests {
         let assets = vec![Asset {
             name: "tree-2.2.1-x86_64-linux.zst".into(),
             browser_download_url: "u".into(),
+            size: 0,
         }];
         assert!(find_companion("tree", "v2.2.1", &assets).is_none());
     }
