@@ -7,10 +7,52 @@ use std::thread;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
+use crate::aliases::{self, AliasMode};
 use crate::archive;
 use crate::ctx::Ctx;
 use crate::github::{self, Asset, Release};
 use crate::platform;
+
+/// Owner under which curated unpins-org packages live. Aliases declared by an
+/// embedded UNPIN_META block are honored only when `spec.owner` matches this —
+/// `<owner>/<repo>` installs from arbitrary publishers always skip aliases,
+/// even with `--aliases` on the CLI. The catalog-only gate is the primary
+/// defense against PATH-shadow attacks via a malicious release.
+const CATALOG_OWNER: &str = "unpins";
+
+/// Resolved per-invocation policy for one `install`/`update` call. Bundled
+/// so the pipeline functions don't carry a five-arg tail of policy flags.
+/// `main.rs` builds this from CLI args + config before entering install code.
+pub struct InstallOptions {
+    pub assume_yes: bool,
+    pub jobs: u8,
+    pub pick: bool,
+    pub include_data: bool,
+    pub alias_mode: AliasMode,
+}
+
+impl InstallOptions {
+    /// Combine CLI overrides with config defaults. `alias_override` comes
+    /// from `--aliases`/`--no-aliases`/`--ask-aliases` resolution; `no_data`
+    /// from `--no-data`. Caller owns the `ctx` so config lookups happen
+    /// here at the boundary rather than scattered in pipeline functions.
+    pub fn resolve(
+        ctx: &Ctx,
+        assume_yes: bool,
+        jobs: u8,
+        pick: bool,
+        no_data: bool,
+        alias_override: Option<AliasMode>,
+    ) -> Self {
+        Self {
+            assume_yes,
+            jobs,
+            pick,
+            include_data: !no_data && ctx.cfg.data(),
+            alias_mode: alias_override.unwrap_or_else(|| ctx.cfg.aliases()),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Spec {
@@ -44,7 +86,7 @@ pub fn parse_spec(input: &str) -> Result<Spec, String> {
         return Err("empty package name".into());
     }
     Ok(Spec {
-        owner: "unpins".to_owned(),
+        owner: CATALOG_OWNER.to_owned(),
         name: base.to_owned(),
         version,
     })
@@ -141,13 +183,22 @@ fn active_version(owner: &str, name: &str) -> Option<String> {
 /// Classify an asset that should be excluded from the picker. Returns a short
 /// human reason, or `None` if the asset is potentially installable.
 fn classify_excluded(name_lower: &str) -> Option<&'static str> {
-    if platform::other_os_keys().iter().any(|k| name_lower.contains(k)) {
+    if platform::other_os_keys()
+        .iter()
+        .any(|k| name_lower.contains(k))
+    {
         return Some("other platform");
     }
-    if platform::other_arch_keys().iter().any(|k| name_lower.contains(k)) {
+    if platform::other_arch_keys()
+        .iter()
+        .any(|k| name_lower.contains(k))
+    {
         return Some("other arch");
     }
-    if platform::auxiliary_keys().iter().any(|k| name_lower.contains(k)) {
+    if platform::auxiliary_keys()
+        .iter()
+        .any(|k| name_lower.contains(k))
+    {
         return Some("auxiliary");
     }
     if name_lower.contains(".bsdiff") {
@@ -159,7 +210,10 @@ fn classify_excluded(name_lower: &str) -> Option<&'static str> {
     if name_lower.ends_with("-data.tar.zst") {
         return Some("data companion");
     }
-    if !platform::current_os_keys().iter().any(|k| name_lower.contains(k)) {
+    if !platform::current_os_keys()
+        .iter()
+        .any(|k| name_lower.contains(k))
+    {
         return Some("no OS tag");
     }
     None
@@ -364,11 +418,11 @@ fn link_binary(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, Str
     Ok(true)
 }
 
-fn fetch_release(spec: &Spec, ctx: &Ctx) -> Result<Release, String> {
+fn fetch_release(ctx: &Ctx, spec: &Spec) -> Result<Release, String> {
     let repo = spec.repo();
     match &spec.version {
-        Some(tag) => github::fetch_tag(&repo, tag, ctx),
-        None => github::fetch_latest(&repo, ctx),
+        Some(tag) => github::fetch_tag(ctx, &repo, tag),
+        None => github::fetch_latest(ctx, &repo),
     }
 }
 
@@ -410,12 +464,12 @@ fn find_companion<'a>(pkg: &str, tag: &str, assets: &'a [Asset]) -> Option<&'a A
 /// Serial preflight: pick asset, resolve checksum, decide if download is needed.
 /// May prompt the user (asset picker, missing-checksum confirmation).
 fn preflight_extract(
+    ctx: &Ctx,
     spec: Spec,
     release: Release,
     assume_yes: bool,
     pick: bool,
     include_data: bool,
-    ctx: &Ctx,
 ) -> Result<ExtractJob, String> {
     let vdir = version_dir(&spec.owner, &spec.name, &release.tag_name);
     // `--no-data` (or `data = false` in config) suppresses the companion lookup
@@ -432,8 +486,7 @@ fn preflight_extract(
     // share/ is present (the companion's payload). Without this, a download
     // interrupted between primary and companion leaves a half-installed vdir
     // that the cache check would happily accept.
-    let cache_complete =
-        vdir.is_dir() && (companion_peek.is_none() || vdir.join("share").is_dir());
+    let cache_complete = vdir.is_dir() && (companion_peek.is_none() || vdir.join("share").is_dir());
     if cache_complete && !pick {
         return Ok(ExtractJob {
             spec,
@@ -448,11 +501,10 @@ fn preflight_extract(
     let asset = pick_asset(&release.assets, &spec.name, pick, ctx.verbose)?.clone();
     // --pick (or incomplete cache) on a cached version: wipe before re-extracting.
     if vdir.is_dir() {
-        fs::remove_dir_all(&vdir)
-            .map_err(|e| format!("remove {}: {e}", vdir.display()))?;
+        fs::remove_dir_all(&vdir).map_err(|e| format!("remove {}: {e}", vdir.display()))?;
     }
     let expected_sha256 = match find_checksum_url(&release.assets, &asset.name) {
-        Some(url) => Some(fetch_expected_sha256(&url, ctx)?),
+        Some(url) => Some(fetch_expected_sha256(ctx, &url)?),
         None => {
             if !assume_yes
                 && !prompt_yes_no("No SHA-256 checksum found. Continue without verification?")
@@ -469,7 +521,7 @@ fn preflight_extract(
     };
     let companion_expected_sha256 = match companion.as_ref() {
         Some(c) => match find_checksum_url(&release.assets, &c.name) {
-            Some(url) => Some(fetch_expected_sha256(&url, ctx)?),
+            Some(url) => Some(fetch_expected_sha256(ctx, &url)?),
             None => {
                 if !assume_yes
                     && !prompt_yes_no(
@@ -494,6 +546,16 @@ fn preflight_extract(
     })
 }
 
+/// Per-download UI handle: which bar to drive, the shared MultiProgress
+/// (for serialized `println` so log lines don't interleave with bar
+/// renders), and the label/flavor used in messages.
+struct ProgressContext<'a> {
+    bar: &'a ProgressBar,
+    multi: &'a MultiProgress,
+    repo: &'a str,
+    is_companion: bool,
+}
+
 /// Orchestrate one ExtractJob: download+extract primary, and (if present)
 /// data companion **concurrently** via `thread::scope`. They write disjoint
 /// subtrees of the same vdir (e.g. `bin/` vs `share/`), so there's no
@@ -503,11 +565,11 @@ fn preflight_extract(
 /// Per-job cleanup (sigint hook + CleanupGuard) is armed here and only
 /// disarmed when *all* tasks succeed; any failure rolls back the vdir.
 fn do_extract(
+    ctx: &Ctx,
     job: &ExtractJob,
     primary_bar: &ProgressBar,
     companion_bar: Option<&ProgressBar>,
     multi: &MultiProgress,
-    ctx: &Ctx,
 ) -> Result<(), String> {
     let Some(primary_asset) = job.asset.as_ref() else {
         return Ok(()); // cached
@@ -518,9 +580,19 @@ fn do_extract(
     let mut guard = CleanupGuard::arm(job.vdir.clone());
 
     let repo = job.spec.repo();
-    let result = if let (Some(companion), Some(cbar)) =
-        (job.companion.as_ref(), companion_bar)
-    {
+    let primary_ui = ProgressContext {
+        bar: primary_bar,
+        multi,
+        repo: &repo,
+        is_companion: false,
+    };
+    let result = if let (Some(companion), Some(cbar)) = (job.companion.as_ref(), companion_bar) {
+        let companion_ui = ProgressContext {
+            bar: cbar,
+            multi,
+            repo: &repo,
+            is_companion: true,
+        };
         // Run primary + companion in parallel. Each task handles its own bar
         // finalization (clear on Ok, red+abandon on Err) inside
         // `download_extract_verify`, so the UI doesn't wait on the slowest leg
@@ -529,26 +601,20 @@ fn do_extract(
         let (r_prim, r_comp) = thread::scope(|s| {
             let h_prim = s.spawn(|| {
                 download_extract_verify(
+                    ctx,
+                    &primary_ui,
                     primary_asset,
                     job.expected_sha256.as_deref(),
                     &job.vdir,
-                    primary_bar,
-                    multi,
-                    &repo,
-                    false,
-                    ctx,
                 )
             });
             let h_comp = s.spawn(|| {
                 download_extract_verify(
+                    ctx,
+                    &companion_ui,
                     companion,
                     job.companion_expected_sha256.as_deref(),
                     &job.vdir,
-                    cbar,
-                    multi,
-                    &repo,
-                    true,
-                    ctx,
                 )
             });
             (h_prim.join().unwrap(), h_comp.join().unwrap())
@@ -556,14 +622,11 @@ fn do_extract(
         r_prim.and(r_comp)
     } else {
         download_extract_verify(
+            ctx,
+            &primary_ui,
             primary_asset,
             job.expected_sha256.as_deref(),
             &job.vdir,
-            primary_bar,
-            multi,
-            &repo,
-            false,
-            ctx,
         )
     };
 
@@ -580,14 +643,11 @@ fn do_extract(
 /// visible. The vdir is shared between primary and companion calls — both
 /// tar streams write disjoint subtrees, so concurrent invocations are safe.
 fn download_extract_verify(
+    ctx: &Ctx,
+    ui: &ProgressContext,
     asset: &Asset,
     expected_sha256: Option<&str>,
     vdir: &Path,
-    bar: &ProgressBar,
-    multi: &MultiProgress,
-    repo: &str,
-    is_companion: bool,
-    ctx: &Ctx,
 ) -> Result<(), String> {
     let r = (|| -> Result<(), String> {
         if ctx.verbose {
@@ -595,9 +655,11 @@ fn download_extract_verify(
             // interleaving on a TTY. In non-TTY mode (hidden draw target)
             // this is a no-op; api_get URLs from Phase A still print via
             // eprintln, so the user sees what was resolved even when piping.
-            let _ = multi.println(format!("  GET {}", asset.browser_download_url));
+            let _ = ui
+                .multi
+                .println(format!("  GET {}", asset.browser_download_url));
         }
-        let stream = github::download_stream_into(&asset.browser_download_url, bar, ctx)?;
+        let stream = github::download_stream_into(ctx, &asset.browser_download_url, ui.bar)?;
         let mut hashing = HashingReader::new(stream);
         archive::extract(&asset.name, &mut hashing, vdir)?;
         let got = hashing.finalize_hex();
@@ -608,20 +670,21 @@ fn download_extract_verify(
                     asset.name
                 ));
             }
-            let suffix = if is_companion { " (data)" } else { "" };
-            let _ = multi.println(format!(
-                "  verified {repo}{suffix}  ({})",
+            let suffix = if ui.is_companion { " (data)" } else { "" };
+            let _ = ui.multi.println(format!(
+                "  verified {}{suffix}  ({})",
+                ui.repo,
                 &expected[..16]
             ));
         }
         Ok(())
     })();
     match &r {
-        Ok(()) => bar.finish_and_clear(),
+        Ok(()) => ui.bar.finish_and_clear(),
         Err(e) => {
-            bar.set_style(github::download_error_style());
-            bar.set_message(e.clone());
-            bar.abandon();
+            ui.bar.set_style(github::download_error_style());
+            ui.bar.set_message(e.clone());
+            ui.bar.abandon();
         }
     }
     r
@@ -680,11 +743,28 @@ impl<R: io::Read> io::Read for HashingReader<R> {
     }
 }
 
-fn link_all_executables(spec: &Spec, vdir: &Path, assume_yes: bool) -> Result<Vec<String>, String> {
+/// Outcome of `link_all_executables`. Primary names go into the install
+/// summary line; alias names get a separate `aliases:` line; notes ride a
+/// `note:` line (e.g. when aliases were declared but skipped — non-catalog
+/// source, `--no-aliases`, etc).
+#[derive(Default)]
+struct LinkSummary {
+    primary: Vec<String>,
+    aliases: Vec<String>,
+    notes: Vec<String>,
+}
+
+fn link_all_executables(
+    spec: &Spec,
+    vdir: &Path,
+    assume_yes: bool,
+    alias_mode: AliasMode,
+) -> Result<LinkSummary, String> {
     let mut files = Vec::new();
     walk_files(vdir, &mut files).map_err(|e| format!("walk {}: {e}", vdir.display()))?;
 
-    let mut executables: Vec<PathBuf> = files.iter().filter(|p| is_executable(p)).cloned().collect();
+    let mut executables: Vec<PathBuf> =
+        files.iter().filter(|p| is_executable(p)).cloned().collect();
     // If nothing has +x set (rare; some archives lose modes), promote any file
     // matching spec.name so the user still gets a working symlink.
     if executables.is_empty()
@@ -697,7 +777,7 @@ fn link_all_executables(spec: &Spec, vdir: &Path, assume_yes: bool) -> Result<Ve
     }
 
     let bin = bin_dir();
-    let mut linked = Vec::new();
+    let mut summary = LinkSummary::default();
     for target in &executables {
         let basename = target
             .file_name()
@@ -706,21 +786,238 @@ fn link_all_executables(spec: &Spec, vdir: &Path, assume_yes: bool) -> Result<Ve
         let short = short_binary_name(basename);
         let link = bin.join(platform::link_filename(short));
         if link_binary(target, &link, assume_yes)? {
-            linked.push(short.to_owned());
+            summary.primary.push(short.to_owned());
+        }
+
+        // Aliases scan + create. We attempt this on every primary executable;
+        // most packages have one, but a multi-binary release with two
+        // alias-bearing primaries would just contribute both lists. The
+        // catalog-only gate is enforced inside `link_aliases_for`.
+        let alias_outcome = link_aliases_for(target, spec, alias_mode, assume_yes)?;
+        // Dedup across primaries: two binaries declaring the same alias
+        // name would silently overwrite each other in bin_dir (last write
+        // wins), and the summary line would show "aliases: lzma lzma".
+        // First-seen wins.
+        for a in alias_outcome.linked {
+            if !summary.aliases.contains(&a) {
+                summary.aliases.push(a);
+            }
+        }
+        if let Some(note) = alias_outcome.note {
+            summary.notes.push(note);
         }
     }
-    Ok(linked)
+    Ok(summary)
 }
 
-pub fn install_many(
-    inputs: &[String],
+/// Outcome of attempting to install aliases for a single primary binary.
+struct AliasOutcome {
+    linked: Vec<String>,
+    /// One-line note for the install summary when aliases were declared but
+    /// skipped (non-catalog source, `--no-aliases`, user said no at prompt).
+    note: Option<String>,
+}
+
+fn link_aliases_for(
+    primary: &Path,
+    spec: &Spec,
+    alias_mode: AliasMode,
     assume_yes: bool,
-    jobs: u8,
-    pick: bool,
-    no_data: bool,
-    ctx: &Ctx,
-) -> Result<(), String> {
-    let include_data = !no_data && ctx.cfg.data();
+) -> Result<AliasOutcome, String> {
+    let meta = match aliases::read_meta(primary)? {
+        None => {
+            return Ok(AliasOutcome {
+                linked: vec![],
+                note: None,
+            });
+        }
+        Some(m) if m.aliases.is_empty() => {
+            return Ok(AliasOutcome {
+                linked: vec![],
+                note: None,
+            });
+        }
+        Some(m) => m,
+    };
+
+    // Catalog gate: aliases declared by `<owner>/<repo>` packages are *always*
+    // ignored regardless of config or CLI flag. The risk is shadowing of
+    // commands like `sudo`/`ssh`/`git` from a publisher whose CI we don't
+    // audit; honoring aliases there would silently expand the trust surface.
+    if spec.owner != CATALOG_OWNER {
+        return Ok(AliasOutcome {
+            linked: vec![],
+            note: Some(format!(
+                "{} alias(es) declared but ignored (non-catalog source)",
+                meta.aliases.len()
+            )),
+        });
+    }
+
+    // Mode resolution. AliasMode::Ask prompts once for the whole list — N
+    // prompts for an N-alias package would just train Y-mashing.
+    let install = match alias_mode {
+        AliasMode::No => false,
+        AliasMode::Yes => true,
+        AliasMode::Ask => {
+            let q = format!(
+                "Install {} alias(es) for {} ({})?",
+                meta.aliases.len(),
+                spec.repo(),
+                meta.aliases.join(", ")
+            );
+            prompt_yes_no(&q)
+        }
+    };
+    if !install {
+        return Ok(AliasOutcome {
+            linked: vec![],
+            note: Some(format!("{} alias(es) skipped", meta.aliases.len())),
+        });
+    }
+
+    if meta.aliases.len() > aliases::MAX_ALIASES {
+        return Err(format!(
+            "package declares {} aliases (max {})",
+            meta.aliases.len(),
+            aliases::MAX_ALIASES
+        ));
+    }
+
+    // Validate every name BEFORE creating any link. If one is bad we want a
+    // clean failure, not half a manifest on disk that the user has to clean
+    // up by hand. The validator catches blocklisted names (sudo, ssh, ...),
+    // path traversal, Windows reserved names, and length/charset violations.
+    for name in &meta.aliases {
+        aliases::validate_alias(name)?;
+    }
+
+    let bin = bin_dir();
+    let mut linked = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for name in &meta.aliases {
+        let link_path = bin.join(platform::alias_link_filename(name));
+        if link_alias(primary, &link_path, assume_yes)? {
+            linked.push(name.clone());
+        } else {
+            // `link_alias` returned Ok(false): user declined an overwrite
+            // prompt. Surface this in the summary so the install line
+            // isn't a half-truth ("aliases: foo bar" while baz quietly
+            // didn't land).
+            skipped.push(name.clone());
+        }
+    }
+
+    // No sidecar manifest written — the binary itself is the authoritative
+    // source for which aliases this version declared. `remove`/`prune`
+    // re-scan via `aliases_from_vdir` when they need the list.
+    let note = if skipped.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{} alias(es) not installed (existing files): {}",
+            skipped.len(),
+            skipped.join(", ")
+        ))
+    };
+    Ok(AliasOutcome { linked, note })
+}
+
+/// Create an alias link at `link`, prompting on collision the same way
+/// `link_binary` does. The actual filesystem op (`platform::create_alias_link`)
+/// is symlink on Unix and NTFS hardlink on Windows.
+fn link_alias(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, String> {
+    let parent = link.parent().ok_or("alias link has no parent")?;
+    fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+
+    if link.exists() || fs::symlink_metadata(link).is_ok() {
+        // `read_link` recognizes our own symlinks (Unix) and `.cmd` wrappers
+        // (Windows primary-binary path) but NOT NTFS hardlinks — those have
+        // no introspectable target. So on Windows an existing alias hardlink
+        // looks "unmanaged" and triggers the prompt. That's the safe call:
+        // we'd rather pester than silently overwrite a pre-existing file.
+        let managed = platform::read_link(link)
+            .map(|t| t.starts_with(data_dir()))
+            .unwrap_or(false);
+        if !managed && !assume_yes {
+            let q = format!(
+                "{} already exists and was not installed by unpin. Overwrite (alias)?",
+                link.display()
+            );
+            if !prompt_yes_no(&q) {
+                eprintln!(
+                    "Skipped alias {}",
+                    link.file_name().unwrap_or_default().to_string_lossy()
+                );
+                return Ok(false);
+            }
+        }
+        let _ = fs::remove_file(link);
+    }
+    platform::create_alias_link(target, link)
+        .map_err(|e| format!("alias {} -> {}: {e}", link.display(), target.display()))?;
+    Ok(true)
+}
+
+/// Scan every executable in `vdir` for an embedded UNPIN_META block and
+/// return the union of alias names declared. Windows-only: alias entries
+/// in `bin_dir` are NTFS hardlinks with no introspectable target, so the
+/// only way to learn their names at cleanup time is to re-derive from the
+/// binary itself. On Unix, alias entries are symlinks — `read_link` on
+/// `bin_dir` covers them directly without any binary I/O.
+///
+/// Errors during scan are swallowed: a corrupted/missing binary at cleanup
+/// time means we just don't clean up some aliases. That's a degraded but
+/// safe outcome (the orphan link in bin_dir is the user's recovery hint).
+#[cfg(windows)]
+fn aliases_from_vdir(vdir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    if walk_files(vdir, &mut files).is_err() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for f in &files {
+        if !is_executable(f) {
+            continue;
+        }
+        if let Ok(Some(meta)) = aliases::read_meta(f) {
+            for a in meta.aliases {
+                if !out.contains(&a) {
+                    out.push(a);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Sweep `bin_dir` for symlinks (or `.cmd` wrappers) whose target lives
+/// under `root` but no longer exists on disk. Used by `prune` before AND
+/// after orphan-vdir removal: the second call catches alias symlinks that
+/// just became dangling when their owning vdir was wiped (Unix-only flow;
+/// the Windows hardlink path uses `aliases_from_vdir` instead).
+fn sweep_dangling_links(bin: &Path, root: &Path) -> usize {
+    let mut removed = 0usize;
+    if let Ok(entries) = fs::read_dir(bin) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let target = match platform::read_link(&path) {
+                Some(t) => t,
+                None => continue,
+            };
+            if !target.starts_with(root) {
+                continue;
+            }
+            if fs::metadata(&target).is_err() && fs::remove_file(&path).is_ok() {
+                println!("Removed dangling {}", path.display());
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+pub fn install_many(ctx: &Ctx, opts: &InstallOptions, inputs: &[String]) -> Result<(), String> {
     let parsed: Vec<(String, Spec)> = inputs
         .iter()
         .map(|s| parse_spec(s).map(|sp| (s.clone(), sp)))
@@ -738,7 +1035,7 @@ pub fn install_many(
             specs.push((label, spec));
         }
     }
-    run_pipeline(specs, assume_yes, jobs, pick, include_data, Vec::new(), ctx)
+    run_pipeline(ctx, opts, specs, Vec::new())
 }
 
 /// Three-phase pipeline shared by `install` and `update`.
@@ -748,13 +1045,10 @@ pub fn install_many(
 /// end — interleaving stdout (progress) with stderr (errors) was producing
 /// out-of-order output, and Phase B failed bars stay visible in red anyway.
 fn run_pipeline(
-    specs: Vec<(String, Spec)>,
-    assume_yes: bool,
-    jobs: u8,
-    pick: bool,
-    include_data: bool,
-    mut errors: Vec<String>,
     ctx: &Ctx,
+    opts: &InstallOptions,
+    specs: Vec<(String, Spec)>,
+    mut errors: Vec<String>,
 ) -> Result<(), String> {
     if specs.is_empty() {
         if errors.is_empty() {
@@ -771,14 +1065,21 @@ fn run_pipeline(
     // ---- Phase A: serial preflight (fetch release, pick asset, prompt) ----
     for (label, spec) in specs {
         println!("Resolving {}...", spec.repo());
-        let release = match fetch_release(&spec, ctx) {
+        let release = match fetch_release(ctx, &spec) {
             Ok(r) => r,
             Err(e) => {
                 errors.push(format!("unpin: {label}: {e}"));
                 continue;
             }
         };
-        match preflight_extract(spec, release, assume_yes, pick, include_data, ctx) {
+        match preflight_extract(
+            ctx,
+            spec,
+            release,
+            opts.assume_yes,
+            opts.pick,
+            opts.include_data,
+        ) {
             Ok(job) => prepared.push((label, job)),
             Err(e) => {
                 errors.push(format!("unpin: {label}: {e}"));
@@ -787,8 +1088,8 @@ fn run_pipeline(
     }
 
     // ---- Phase B: parallel download + extract + verify ----
-    let n_workers = pick_jobs(jobs, prepared.len());
-    let extract_results = parallel_extract(&prepared, n_workers, ctx);
+    let n_workers = pick_jobs(opts.jobs, prepared.len());
+    let extract_results = parallel_extract(ctx, &prepared, n_workers);
 
     // ---- Phase C: serial linking + final summary (may prompt to overwrite) ----
     for ((label, job), result) in prepared.iter().zip(extract_results.into_iter()) {
@@ -796,17 +1097,23 @@ fn run_pipeline(
             errors.push(format!("unpin: {label}: {e}"));
             continue;
         }
-        match link_all_executables(&job.spec, &job.vdir, assume_yes) {
-            Ok(linked) => {
-                if linked.is_empty() {
+        match link_all_executables(&job.spec, &job.vdir, opts.assume_yes, opts.alias_mode) {
+            Ok(summary) => {
+                if summary.primary.is_empty() {
                     println!("Installed {} {}", job.spec.repo(), job.release.tag_name);
                 } else {
                     println!(
                         "Installed {} {} ({})",
                         job.spec.repo(),
                         job.release.tag_name,
-                        linked.join(", ")
+                        summary.primary.join(", ")
                     );
+                }
+                if !summary.aliases.is_empty() {
+                    println!("  aliases: {}", summary.aliases.join(" "));
+                }
+                for note in &summary.notes {
+                    println!("  note: {note}");
                 }
             }
             Err(e) => {
@@ -826,7 +1133,11 @@ fn run_pipeline(
 }
 
 fn pick_jobs(requested: u8, n_inputs: usize) -> usize {
-    let req = if requested == 0 { 4 } else { requested as usize };
+    let req = if requested == 0 {
+        4
+    } else {
+        requested as usize
+    };
     req.min(n_inputs).max(1)
 }
 
@@ -838,9 +1149,9 @@ fn pick_jobs(requested: u8, n_inputs: usize) -> usize {
 /// stderr lines, which remain in scrollback when the bar is later attached —
 /// producing ghost copies. Configure first, tick later.
 fn parallel_extract(
+    ctx: &Ctx,
     prepared: &[(String, ExtractJob)],
     n_workers: usize,
-    ctx: &Ctx,
 ) -> Vec<Result<(), String>> {
     let is_tty = io::stderr().is_terminal();
     let multi = if is_tty {
@@ -849,16 +1160,18 @@ fn parallel_extract(
         MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
     };
 
-    let mut results: Vec<Result<(), String>> =
-        (0..prepared.len()).map(|_| Ok(())).collect();
+    let mut results: Vec<Result<(), String>> = (0..prepared.len()).map(|_| Ok(())).collect();
 
     // Compute per-column widths so all bars share the same name/tag alignment.
-    let (name_w, tag_w) = prepared
-        .iter()
-        .filter(|(_, j)| j.asset.is_some())
-        .fold((0usize, 0usize), |(n, t), (_, j)| {
-            (n.max(j.spec.name.chars().count()), t.max(j.release.tag_name.chars().count()))
-        });
+    let (name_w, tag_w) = prepared.iter().filter(|(_, j)| j.asset.is_some()).fold(
+        (0usize, 0usize),
+        |(n, t), (_, j)| {
+            (
+                n.max(j.spec.name.chars().count()),
+                t.max(j.release.tag_name.chars().count()),
+            )
+        },
+    );
 
     // Pre-add bars for every job that needs a download. Cached jobs get None
     // (no slot, no bars). Jobs with a data companion get *two* bars — both are
@@ -898,7 +1211,11 @@ fn parallel_extract(
     // the bars; in non-TTY just print to stdout (multi is hidden there).
     for (_, job) in prepared {
         if job.asset.is_none() {
-            let msg = format!("Using {} {} (cached)", job.spec.repo(), job.release.tag_name);
+            let msg = format!(
+                "Using {} {} (cached)",
+                job.spec.repo(),
+                job.release.tag_name
+            );
             if is_tty {
                 let _ = multi.println(msg);
             } else {
@@ -925,15 +1242,19 @@ fn parallel_extract(
             let work_rx_w = &work_rx;
             let prepared_w = prepared;
             let bars_w = &bars;
-            s.spawn(move || loop {
-                let i = match work_rx_w.lock().unwrap().recv() {
-                    Ok(i) => i,
-                    Err(_) => break,
-                };
-                let (_label, job) = &prepared_w[i];
-                let (bar, cbar) = bars_w[i].as_ref().expect("downloadable job has pre-added bars");
-                let result = do_extract(job, bar, cbar.as_ref(), &multi_w, ctx);
-                let _ = result_tx_w.send((i, result));
+            s.spawn(move || {
+                loop {
+                    let i = match work_rx_w.lock().unwrap().recv() {
+                        Ok(i) => i,
+                        Err(_) => break,
+                    };
+                    let (_label, job) = &prepared_w[i];
+                    let (bar, cbar) = bars_w[i]
+                        .as_ref()
+                        .expect("downloadable job has pre-added bars");
+                    let result = do_extract(ctx, job, bar, cbar.as_ref(), &multi_w);
+                    let _ = result_tx_w.send((i, result));
+                }
             });
         }
         drop(result_tx);
@@ -955,8 +1276,8 @@ fn find_checksum_url(assets: &[Asset], asset_name: &str) -> Option<String> {
     None
 }
 
-fn fetch_expected_sha256(url: &str, ctx: &Ctx) -> Result<String, String> {
-    let body = github::download(url, ctx)?;
+fn fetch_expected_sha256(ctx: &Ctx, url: &str) -> Result<String, String> {
+    let body = github::download(ctx, url)?;
     let text = std::str::from_utf8(&body).map_err(|e| format!("checksum body: {e}"))?;
     parse_sha256(text)
 }
@@ -1089,8 +1410,7 @@ pub fn remove_many(names: &[String], assume_yes: bool) -> Result<(), String> {
 }
 
 fn remove_one(name: &str) -> Result<(), String> {
-    let (owner, repo) = resolve_installed(name)?
-        .ok_or_else(|| format!("not installed: {name}"))?;
+    let (owner, repo) = resolve_installed(name)?.ok_or_else(|| format!("not installed: {name}"))?;
     let rdir = repo_dir(&owner, &repo);
 
     let mut versions: Vec<String> = fs::read_dir(&rdir)
@@ -1103,7 +1423,28 @@ fn remove_one(name: &str) -> Result<(), String> {
         .unwrap_or_default();
     versions.sort();
 
-    if let Ok(entries) = fs::read_dir(bin_dir()) {
+    // Windows-only alias cleanup: hardlinks can't be reverse-mapped from
+    // `bin_dir`, so we re-derive the alias names by scanning the binary's
+    // UNPIN_META block and unlinking each. On Unix the read_link sweep
+    // below catches alias symlinks naturally — no extra I/O needed.
+    let bin = bin_dir();
+    #[cfg(windows)]
+    {
+        let mut alias_names: Vec<String> = Vec::new();
+        for v in &versions {
+            for n in aliases_from_vdir(&version_dir(&owner, &repo, v)) {
+                if !alias_names.contains(&n) {
+                    alias_names.push(n);
+                }
+            }
+        }
+        for n in &alias_names {
+            let p = bin.join(platform::alias_link_filename(n));
+            let _ = fs::remove_file(&p);
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(&bin) {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(target) = platform::read_link(&path)
@@ -1128,15 +1469,7 @@ fn remove_one(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn update(
-    names: &[String],
-    assume_yes: bool,
-    jobs: u8,
-    pick: bool,
-    no_data: bool,
-    ctx: &Ctx,
-) -> Result<(), String> {
-    let include_data = !no_data && ctx.cfg.data();
+pub fn update(ctx: &Ctx, opts: &InstallOptions, names: &[String]) -> Result<(), String> {
     let targets: Vec<(String, String)> = if names.is_empty() {
         installed_repos()
     } else {
@@ -1144,8 +1477,7 @@ pub fn update(
         // `update foo unpins/foo`) would otherwise race on the same vdir.
         let mut out: Vec<(String, String)> = Vec::with_capacity(names.len());
         for n in names {
-            let r = resolve_installed(n)?
-                .ok_or_else(|| format!("not installed: {n}"))?;
+            let r = resolve_installed(n)?.ok_or_else(|| format!("not installed: {n}"))?;
             if !out.contains(&r) {
                 out.push(r);
             }
@@ -1169,7 +1501,7 @@ pub fn update(
             name: repo.clone(),
             version: None,
         };
-        let release = match github::fetch_latest(&spec.repo(), ctx) {
+        let release = match github::fetch_latest(ctx, &spec.repo()) {
             Ok(r) => r,
             Err(e) => {
                 errors.push(format!("unpin: {owner}/{repo}: {e}"));
@@ -1186,7 +1518,7 @@ pub fn update(
         specs.push((format!("{owner}/{repo}"), spec));
     }
 
-    run_pipeline(specs, assume_yes, jobs, pick, include_data, errors, ctx)
+    run_pipeline(ctx, opts, specs, errors)
 }
 
 fn installed_repos() -> Vec<(String, String)> {
@@ -1218,13 +1550,13 @@ fn installed_repos() -> Vec<(String, String)> {
     out
 }
 
-pub fn info_many(inputs: &[String], ctx: &Ctx) -> Result<(), String> {
+pub fn info_many(ctx: &Ctx, inputs: &[String]) -> Result<(), String> {
     let mut last_err: Option<String> = None;
     for (i, input) in inputs.iter().enumerate() {
         if i > 0 {
             println!();
         }
-        if let Err(e) = info(input, ctx) {
+        if let Err(e) = info(ctx, input) {
             eprintln!("unpin: {input}: {e}");
             last_err = Some(e);
         }
@@ -1235,7 +1567,7 @@ pub fn info_many(inputs: &[String], ctx: &Ctx) -> Result<(), String> {
     }
 }
 
-fn info(input: &str, ctx: &Ctx) -> Result<(), String> {
+fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
     if let Some((owner, repo)) = resolve_installed(input)? {
         let rdir = repo_dir(&owner, &repo);
         let mut versions: Vec<String> = fs::read_dir(&rdir)
@@ -1276,11 +1608,14 @@ fn info(input: &str, ctx: &Ctx) -> Result<(), String> {
     }
 
     let spec = parse_spec(input)?;
-    let release = fetch_release(&spec, ctx)?;
+    let release = fetch_release(ctx, &spec)?;
     println!("Repo:    {}", spec.repo());
     println!("Version: {} (latest)", release.tag_name);
     if !release.published_at.is_empty() {
-        println!("Date:    {}", &release.published_at[..release.published_at.len().min(10)]);
+        println!(
+            "Date:    {}",
+            &release.published_at[..release.published_at.len().min(10)]
+        );
     }
     println!("Status:  not installed");
     match pick_asset(&release.assets, &spec.name, false, ctx.verbose) {
@@ -1295,22 +1630,11 @@ pub fn prune() -> Result<(), String> {
 
     let bin = bin_dir();
     let root = data_dir();
-    if let Ok(entries) = fs::read_dir(&bin) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let target = match platform::read_link(&path) {
-                Some(t) => t,
-                None => continue,
-            };
-            if !target.starts_with(&root) {
-                continue;
-            }
-            if fs::metadata(&target).is_err() && fs::remove_file(&path).is_ok() {
-                println!("Removed dangling {}", path.display());
-                removed += 1;
-            }
-        }
-    }
+    // Phase 1: catch dangling symlinks/wrappers that already existed before
+    // this prune run (e.g. user deleted a binary by hand). Must run BEFORE
+    // phase 2 — otherwise phase 2's "live links" calculation would treat
+    // those dangling pointers as anchors and refuse to remove their vdirs.
+    removed += sweep_dangling_links(&bin, &root);
 
     // Orphan version dirs: no live link in bin_dir points into them.
     let linked_targets: Vec<PathBuf> = fs::read_dir(&bin)
@@ -1335,6 +1659,19 @@ pub fn prune() -> Result<(), String> {
             if linked_targets.iter().any(|t| t.starts_with(&vpath)) {
                 continue;
             }
+            // Windows-only: alias entries in bin_dir are NTFS hardlinks
+            // (no target to dangle), so removing this vdir leaves them
+            // behind unless we re-derive the names here. On Unix the
+            // post-loop dangling sweep catches alias symlinks naturally
+            // once their targets vanish.
+            #[cfg(windows)]
+            for n in aliases_from_vdir(&vpath) {
+                let p = bin.join(platform::alias_link_filename(&n));
+                if fs::remove_file(&p).is_ok() {
+                    println!("Removed alias {}", p.display());
+                    removed += 1;
+                }
+            }
             let v = ver_entry.file_name().to_string_lossy().into_owned();
             if fs::remove_dir_all(&vpath).is_ok() {
                 println!("Removed orphan {owner}/{repo}@{v}");
@@ -1346,21 +1683,30 @@ pub fn prune() -> Result<(), String> {
         let _ = fs::remove_dir(data_dir().join(&owner));
     }
 
+    // Phase 3 (Unix-only): orphan-vdir removal above just broke any alias
+    // symlinks pointing into those vdirs. Re-sweep so prune cleans in one
+    // invocation instead of leaving newly-dangling entries for the next
+    // run. On Windows the per-vdir rescan handles this inline.
+    #[cfg(not(windows))]
+    {
+        removed += sweep_dangling_links(&bin, &root);
+    }
+
     if removed == 0 {
         println!("Nothing to prune");
     }
     Ok(())
 }
 
-pub fn run(input: &str, args: &[String], pick: bool, ctx: &Ctx) -> Result<(), String> {
+pub fn run(ctx: &Ctx, input: &str, args: &[String], pick: bool) -> Result<(), String> {
     let spec = parse_spec(input)?;
     println!("Resolving {}...", spec.repo());
-    let release = fetch_release(&spec, ctx)?;
+    let release = fetch_release(ctx, &spec)?;
     // `run` always includes data — bypassing it could leave the binary
     // non-functional (gvim/vim need share/), and `run` is the "just try it"
     // path where surprises are worst. Use `install --no-data` if you need a
     // bare binary on disk.
-    let job = preflight_extract(spec.clone(), release.clone(), true, pick, true, ctx)?;
+    let job = preflight_extract(ctx, spec.clone(), release.clone(), true, pick, true)?;
     let vdir = job.vdir.clone();
     let needs_download = job.asset.is_some();
     if needs_download {
@@ -1380,7 +1726,7 @@ pub fn run(input: &str, args: &[String], pick: bool, ctx: &Ctx) -> Result<(), St
             cb.set_prefix(format!("{} {} (data)", spec.name, release.tag_name));
             cb
         });
-        do_extract(&job, &bar, cbar.as_ref(), &multi, ctx)?;
+        do_extract(ctx, &job, &bar, cbar.as_ref(), &multi)?;
     } else {
         let has_links = fs::read_dir(bin_dir())
             .map(|it| {
@@ -1509,22 +1855,37 @@ mod tests {
     fn classify_picks_up_other_os_assets() {
         // Test relies on host OS — the function uses platform::other_os_keys.
         #[cfg(target_os = "linux")]
-        assert_eq!(classify_excluded("tool-darwin-x86_64.tar.gz"), Some("other platform"));
+        assert_eq!(
+            classify_excluded("tool-darwin-x86_64.tar.gz"),
+            Some("other platform")
+        );
         #[cfg(target_os = "linux")]
-        assert_eq!(classify_excluded("tool-windows-x86_64.zip"), Some("other platform"));
+        assert_eq!(
+            classify_excluded("tool-windows-x86_64.zip"),
+            Some("other platform")
+        );
     }
 
     #[test]
     fn classify_filters_other_arch() {
         // On x86_64 we exclude aarch64 binaries.
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        assert_eq!(classify_excluded("tool-linux-aarch64.tar.gz"), Some("other arch"));
+        assert_eq!(
+            classify_excluded("tool-linux-aarch64.tar.gz"),
+            Some("other arch")
+        );
     }
 
     #[test]
     fn classify_excludes_auxiliary() {
-        assert_eq!(classify_excluded("rg-14.1.0-linux.tar.gz.sha256"), Some("auxiliary"));
-        assert_eq!(classify_excluded("rg-14.1.0-linux.tar.gz.sig"), Some("auxiliary"));
+        assert_eq!(
+            classify_excluded("rg-14.1.0-linux.tar.gz.sha256"),
+            Some("auxiliary")
+        );
+        assert_eq!(
+            classify_excluded("rg-14.1.0-linux.tar.gz.sig"),
+            Some("auxiliary")
+        );
         assert_eq!(classify_excluded("rg-14.1.0.deb"), Some("auxiliary"));
         assert_eq!(classify_excluded("rg-14.1.0.rpm"), Some("auxiliary"));
         assert_eq!(classify_excluded("rg-14.1.0.appimage"), Some("auxiliary"));
@@ -1532,7 +1893,10 @@ mod tests {
 
     #[test]
     fn classify_excludes_bsdiff() {
-        assert_eq!(classify_excluded("update.bsdiff"), Some("unsupported format"));
+        assert_eq!(
+            classify_excluded("update.bsdiff"),
+            Some("unsupported format")
+        );
     }
 
     #[test]
@@ -1550,18 +1914,36 @@ mod tests {
     fn classify_excludes_data_companion() {
         // <pkg>-<tag>-data.tar.zst is platform-agnostic runtime data, paired
         // with the primary asset in preflight. Not directly installable.
-        assert_eq!(classify_excluded("gvim-9.2.0-data.tar.zst"), Some("data companion"));
-        assert_eq!(classify_excluded("gvim-v9.2.0-data.tar.zst"), Some("data companion"));
+        assert_eq!(
+            classify_excluded("gvim-9.2.0-data.tar.zst"),
+            Some("data companion")
+        );
+        assert_eq!(
+            classify_excluded("gvim-v9.2.0-data.tar.zst"),
+            Some("data companion")
+        );
         // Regular .tar.zst is not a companion — only the `-data.tar.zst` suffix.
-        assert_ne!(classify_excluded("rg-linux.tar.zst"), Some("data companion"));
+        assert_ne!(
+            classify_excluded("rg-linux.tar.zst"),
+            Some("data companion")
+        );
     }
 
     #[test]
     fn find_companion_matches_tagged_data_asset() {
         let assets = vec![
-            Asset { name: "gvim-9.2.0-x86_64-linux.zst".into(), browser_download_url: "u1".into() },
-            Asset { name: "gvim-9.2.0-x86_64-windows.exe.zst".into(), browser_download_url: "u2".into() },
-            Asset { name: "gvim-9.2.0-data.tar.zst".into(), browser_download_url: "u3".into() },
+            Asset {
+                name: "gvim-9.2.0-x86_64-linux.zst".into(),
+                browser_download_url: "u1".into(),
+            },
+            Asset {
+                name: "gvim-9.2.0-x86_64-windows.exe.zst".into(),
+                browser_download_url: "u2".into(),
+            },
+            Asset {
+                name: "gvim-9.2.0-data.tar.zst".into(),
+                browser_download_url: "u3".into(),
+            },
         ];
         let c = find_companion("gvim", "v9.2.0", &assets).unwrap();
         assert_eq!(c.name, "gvim-9.2.0-data.tar.zst");
@@ -1572,9 +1954,10 @@ mod tests {
 
     #[test]
     fn find_companion_returns_none_when_absent() {
-        let assets = vec![
-            Asset { name: "tree-2.2.1-x86_64-linux.zst".into(), browser_download_url: "u".into() },
-        ];
+        let assets = vec![Asset {
+            name: "tree-2.2.1-x86_64-linux.zst".into(),
+            browser_download_url: "u".into(),
+        }];
         assert!(find_companion("tree", "v2.2.1", &assets).is_none());
     }
 
@@ -1638,7 +2021,10 @@ mod tests {
     fn parse_sha256_accepts_sha256sum_format() {
         let body = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  rg.tar.gz\n";
         let got = parse_sha256(body).unwrap();
-        assert_eq!(got, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+        assert_eq!(
+            got,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
     }
 
     #[test]
@@ -1647,7 +2033,10 @@ mod tests {
         let body = "SHA256 hash of ripgrep-15.1.0-x86_64-pc-windows-gnu.zip:\r\n\
                     9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08\r\n";
         let got = parse_sha256(body).unwrap();
-        assert_eq!(got, "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
+        assert_eq!(
+            got,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
     }
 
     #[test]

@@ -27,7 +27,12 @@ impl Ctx {
         let cfg = Config::load();
         let http = http::default_client(cfg.http_timeout());
         let auth = resolve_auth_header(&cfg);
-        Self { cfg, http, auth, verbose }
+        Self {
+            cfg,
+            http,
+            auth,
+            verbose,
+        }
     }
 }
 

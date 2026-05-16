@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 
+use crate::aliases::AliasMode;
 use crate::platform;
 
 #[derive(Debug, Default)]
@@ -78,6 +79,22 @@ impl Config {
     pub fn data(&self) -> bool {
         self.get_bool("data").unwrap_or(true)
     }
+
+    /// How to handle multi-call aliases declared by a catalog package's
+    /// embedded UNPIN_META block. Default [`AliasMode::Yes`] — install them
+    /// silently and print the list. CLI `--aliases` / `--no-aliases` and
+    /// the per-install prompt (when `ask`) override this for a single
+    /// invocation. Garbage values fall back to the default.
+    ///
+    /// Aliases are *always* off for non-catalog `<owner>/<repo>` installs
+    /// regardless of this setting — the catalog gate is enforced at the
+    /// install site, not here.
+    pub fn aliases(&self) -> AliasMode {
+        self.map
+            .get("aliases")
+            .and_then(|s| AliasMode::parse(s))
+            .unwrap_or(AliasMode::Yes)
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +149,22 @@ mod tests {
         assert_eq!(cfg.http_timeout(), 30);
         assert!(!cfg.use_gh_auth());
         assert!(cfg.data());
+        assert_eq!(cfg.aliases(), AliasMode::Yes);
+    }
+
+    #[test]
+    fn aliases_parses_each_mode_and_falls_back_on_garbage() {
+        for (text, want) in [
+            ("aliases = yes\n", AliasMode::Yes),
+            ("aliases = no\n", AliasMode::No),
+            ("aliases = ask\n", AliasMode::Ask),
+            ("aliases = ASK\n", AliasMode::Ask),
+        ] {
+            assert_eq!(Config::parse(text).aliases(), want, "parsing `{text}`");
+        }
+        // Garbage value falls back to default Yes — same forgiving model
+        // as http_timeout.
+        assert_eq!(Config::parse("aliases = maybe\n").aliases(), AliasMode::Yes);
     }
 
     #[test]

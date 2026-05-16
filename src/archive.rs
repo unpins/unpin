@@ -34,11 +34,10 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
             .or_else(|| asset_name.strip_suffix(".ZST"))
             .unwrap_or(asset_name);
         let bin_dir = dest.join("bin");
-        fs::create_dir_all(&bin_dir)
-            .map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
+        fs::create_dir_all(&bin_dir).map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
         let path = bin_dir.join(stem);
-        let mut out = fs::File::create(&path)
-            .map_err(|e| format!("create {}: {e}", path.display()))?;
+        let mut out =
+            fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
         io::copy(&mut zst, &mut out).map_err(|e| format!("write {}: {e}", path.display()))?;
         platform::set_unix_mode(&path, 0o755)
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
@@ -48,8 +47,8 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
         // Unix the file is chmod'd +x; on Windows we rely on the `.exe`
         // extension (the file ships with it).
         let path = dest.join(asset_name);
-        let mut out = fs::File::create(&path)
-            .map_err(|e| format!("create {}: {e}", path.display()))?;
+        let mut out =
+            fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
         let mut r = reader;
         io::copy(&mut r, &mut out).map_err(|e| format!("write {}: {e}", path.display()))?;
         platform::set_unix_mode(&path, 0o755)
@@ -98,13 +97,11 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
             continue;
         }
         if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
         let mut out = fs::File::create(&out_path)
             .map_err(|e| format!("create {}: {e}", out_path.display()))?;
-        io::copy(&mut entry, &mut out)
-            .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+        io::copy(&mut entry, &mut out).map_err(|e| format!("write {}: {e}", out_path.display()))?;
         paths.push((raw_name, out_path));
     }
 
@@ -189,18 +186,13 @@ fn parse_central_directory(buf: &[u8]) -> std::collections::HashMap<String, u32>
         if sig != CD_SIG {
             break;
         }
-        let version_made_by =
-            u16::from_le_bytes([buf[pos + 4], buf[pos + 5]]);
+        let version_made_by = u16::from_le_bytes([buf[pos + 4], buf[pos + 5]]);
         let host_system = (version_made_by >> 8) as u8; // 3 = Unix
         let name_len = u16::from_le_bytes([buf[pos + 28], buf[pos + 29]]) as usize;
         let extra_len = u16::from_le_bytes([buf[pos + 30], buf[pos + 31]]) as usize;
         let comment_len = u16::from_le_bytes([buf[pos + 32], buf[pos + 33]]) as usize;
-        let external_attrs = u32::from_le_bytes([
-            buf[pos + 38],
-            buf[pos + 39],
-            buf[pos + 40],
-            buf[pos + 41],
-        ]);
+        let external_attrs =
+            u32::from_le_bytes([buf[pos + 38], buf[pos + 39], buf[pos + 40], buf[pos + 41]]);
 
         let name_start = pos + 46;
         let name_end = name_start + name_len;

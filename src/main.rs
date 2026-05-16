@@ -1,7 +1,8 @@
 use std::process::ExitCode;
 
-use bpaf::{construct, positional, pure, short, Parser};
+use bpaf::{Parser, construct, positional, pure, short};
 
+mod aliases;
 mod archive;
 mod config;
 mod ctx;
@@ -14,14 +15,47 @@ mod sigint;
 
 #[derive(Clone, Debug)]
 enum Cmd {
-    Install { assume_yes: bool, jobs: u8, pick: bool, verbose: bool, no_data: bool, pkgs: Vec<String> },
-    Update { assume_yes: bool, jobs: u8, pick: bool, verbose: bool, no_data: bool, names: Vec<String> },
-    Remove { assume_yes: bool, names: Vec<String> },
+    Install {
+        assume_yes: bool,
+        jobs: u8,
+        pick: bool,
+        verbose: bool,
+        no_data: bool,
+        aliases_yes: bool,
+        aliases_no: bool,
+        aliases_ask: bool,
+        pkgs: Vec<String>,
+    },
+    Update {
+        assume_yes: bool,
+        jobs: u8,
+        pick: bool,
+        verbose: bool,
+        no_data: bool,
+        aliases_yes: bool,
+        aliases_no: bool,
+        aliases_ask: bool,
+        names: Vec<String>,
+    },
+    Remove {
+        assume_yes: bool,
+        names: Vec<String>,
+    },
     List,
-    Info { verbose: bool, pkgs: Vec<String> },
+    Info {
+        verbose: bool,
+        pkgs: Vec<String>,
+    },
     Prune,
-    Run { pick: bool, verbose: bool, pkg: String, args: Vec<String> },
-    Completion { shell: Shell },
+    Run {
+        pick: bool,
+        verbose: bool,
+        pkg: String,
+        args: Vec<String>,
+    },
+    Completion {
+        shell: Shell,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,7 +74,9 @@ impl std::str::FromStr for Shell {
             "zsh" => Ok(Shell::Zsh),
             "fish" => Ok(Shell::Fish),
             "elvish" => Ok(Shell::Elvish),
-            _ => Err(format!("unknown shell '{s}' (supported: bash, zsh, fish, elvish)")),
+            _ => Err(format!(
+                "unknown shell '{s}' (supported: bash, zsh, fish, elvish)"
+            )),
         }
     }
 }
@@ -77,6 +113,24 @@ fn no_data_flag() -> impl Parser<bool> {
         .switch()
 }
 
+fn aliases_yes_flag() -> impl Parser<bool> {
+    bpaf::long("aliases")
+        .help("Install multi-call aliases declared by the package (overrides config `aliases = no/ask`)")
+        .switch()
+}
+
+fn aliases_no_flag() -> impl Parser<bool> {
+    bpaf::long("no-aliases")
+        .help("Skip multi-call aliases (overrides config; wins over --aliases/--ask-aliases)")
+        .switch()
+}
+
+fn aliases_ask_flag() -> impl Parser<bool> {
+    bpaf::long("ask-aliases")
+        .help("Prompt before installing aliases (overrides config `aliases = yes/no`; loses to --no-aliases)")
+        .switch()
+}
+
 fn cli() -> bpaf::OptionParser<Cmd> {
     let install = {
         let yes = yes_flag();
@@ -84,10 +138,15 @@ fn cli() -> bpaf::OptionParser<Cmd> {
         let pick = pick_flag();
         let verbose = verbose_flag();
         let no_data = no_data_flag();
+        let aliases_yes = aliases_yes_flag();
+        let aliases_no = aliases_no_flag();
+        let aliases_ask = aliases_ask_flag();
         let pkgs = positional::<String>("PKG")
             .help("owner/repo (or bare name for unpins/<name>), optionally with @version")
             .some("expected at least one package");
-        construct!(Cmd::Install { assume_yes(yes), jobs, pick, verbose, no_data, pkgs })
+        construct!(Cmd::Install {
+            assume_yes(yes), jobs, pick, verbose, no_data, aliases_yes, aliases_no, aliases_ask, pkgs
+        })
             .to_options()
             .descr("Install one or more packages from GitHub releases. Default command — `unpin owner/repo` is equivalent to `unpin install owner/repo`.")
             .command("install")
@@ -99,13 +158,18 @@ fn cli() -> bpaf::OptionParser<Cmd> {
         let pick = pick_flag();
         let verbose = verbose_flag();
         let no_data = no_data_flag();
+        let aliases_yes = aliases_yes_flag();
+        let aliases_no = aliases_no_flag();
+        let aliases_ask = aliases_ask_flag();
         let names = positional::<String>("NAME")
             .help("names of installed packages; empty = update all")
             .many();
-        construct!(Cmd::Update { assume_yes(yes), jobs, pick, verbose, no_data, names })
-            .to_options()
-            .descr("Update one, several, or (with no args) all installed packages.")
-            .command("update")
+        construct!(Cmd::Update {
+            assume_yes(yes), jobs, pick, verbose, no_data, aliases_yes, aliases_no, aliases_ask, names
+        })
+        .to_options()
+        .descr("Update one, several, or (with no args) all installed packages.")
+        .command("update")
     };
 
     let remove = {
@@ -143,20 +207,25 @@ fn cli() -> bpaf::OptionParser<Cmd> {
     let run = {
         let pick = pick_flag();
         let verbose = verbose_flag();
-        let pkg = positional::<String>("PKG").help("owner/repo (or bare name for unpins/<name>), optionally with @version");
+        let pkg = positional::<String>("PKG")
+            .help("owner/repo (or bare name for unpins/<name>), optionally with @version");
         let args = positional::<String>("ARG")
             .help("arguments forwarded to the binary")
             .strict()
             .many();
-        construct!(Cmd::Run { pick, verbose, pkg, args })
-            .to_options()
-            .descr("Run a package's binary without installing it (no entry added to PATH).")
-            .command("run")
+        construct!(Cmd::Run {
+            pick,
+            verbose,
+            pkg,
+            args
+        })
+        .to_options()
+        .descr("Run a package's binary without installing it (no entry added to PATH).")
+        .command("run")
     };
 
     let completion = {
-        let shell = positional::<Shell>("SHELL")
-            .help("bash | zsh | fish | elvish");
+        let shell = positional::<Shell>("SHELL").help("bash | zsh | fish | elvish");
         construct!(Cmd::Completion { shell })
             .to_options()
             .descr("Print a shell completion script. Pipe it to your shell's completion directory (see README).")
@@ -187,6 +256,9 @@ fn print_auth_footer() {
     println!("    http_timeout = <seconds>   per-request HTTP timeout (default: 30)");
     println!("    use_gh_auth  = true|false  shell out to `gh auth token` (default: false)");
     println!("    data         = true|false  download per-release data tarball  (default: true)");
+    println!("    aliases      = yes|no|ask  install multi-call aliases declared by");
+    println!("                               catalog packages (default: yes; non-catalog");
+    println!("                               <owner>/<repo> installs always skip)");
 }
 
 fn term_width() -> usize {
@@ -198,8 +270,32 @@ fn term_width() -> usize {
 }
 
 const SUBCOMMANDS: &[&str] = &[
-    "install", "update", "remove", "list", "info", "prune", "run", "completion",
+    "install",
+    "update",
+    "remove",
+    "list",
+    "info",
+    "prune",
+    "run",
+    "completion",
 ];
+
+/// Resolve `--aliases` / `--ask-aliases` / `--no-aliases` to an explicit
+/// override, or `None` to fall back to config.
+///
+/// Precedence (safest wins so a mistaken `--aliases` next to `--no-aliases`
+/// doesn't install): `--no-aliases` > `--ask-aliases` > `--aliases`.
+fn resolve_alias_override(yes: bool, no: bool, ask: bool) -> Option<aliases::AliasMode> {
+    if no {
+        Some(aliases::AliasMode::No)
+    } else if ask {
+        Some(aliases::AliasMode::Ask)
+    } else if yes {
+        Some(aliases::AliasMode::Yes)
+    } else {
+        None
+    }
+}
 
 fn main() -> ExitCode {
     panic::install();
@@ -208,7 +304,11 @@ fn main() -> ExitCode {
     // `unpin run pkg -- --version` forwards the flag to the child instead of
     // being intercepted here.
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    let pre_ddash: Vec<&str> = raw.iter().map(String::as_str).take_while(|a| *a != "--").collect();
+    let pre_ddash: Vec<&str> = raw
+        .iter()
+        .map(String::as_str)
+        .take_while(|a| *a != "--")
+        .collect();
     if pre_ddash.iter().any(|a| *a == "--version" || *a == "-V") {
         println!("unpin {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
@@ -249,24 +349,67 @@ fn main() -> ExitCode {
         }
     };
     let result = match cmd {
-        Cmd::Install { assume_yes, jobs, pick, verbose, no_data, pkgs } => {
+        Cmd::Install {
+            assume_yes,
+            jobs,
+            pick,
+            verbose,
+            no_data,
+            aliases_yes,
+            aliases_no,
+            aliases_ask,
+            pkgs,
+        } => {
             let ctx = ctx::Ctx::new(verbose);
-            install::install_many(&pkgs, assume_yes, jobs, pick, no_data, &ctx)
+            let alias_override = resolve_alias_override(aliases_yes, aliases_no, aliases_ask);
+            let opts = install::InstallOptions::resolve(
+                &ctx,
+                assume_yes,
+                jobs,
+                pick,
+                no_data,
+                alias_override,
+            );
+            install::install_many(&ctx, &opts, &pkgs)
         }
-        Cmd::Update { assume_yes, jobs, pick, verbose, no_data, names } => {
+        Cmd::Update {
+            assume_yes,
+            jobs,
+            pick,
+            verbose,
+            no_data,
+            aliases_yes,
+            aliases_no,
+            aliases_ask,
+            names,
+        } => {
             let ctx = ctx::Ctx::new(verbose);
-            install::update(&names, assume_yes, jobs, pick, no_data, &ctx)
+            let alias_override = resolve_alias_override(aliases_yes, aliases_no, aliases_ask);
+            let opts = install::InstallOptions::resolve(
+                &ctx,
+                assume_yes,
+                jobs,
+                pick,
+                no_data,
+                alias_override,
+            );
+            install::update(&ctx, &opts, &names)
         }
         Cmd::Remove { assume_yes, names } => install::remove_many(&names, assume_yes),
         Cmd::List => install::list(),
         Cmd::Info { verbose, pkgs } => {
             let ctx = ctx::Ctx::new(verbose);
-            install::info_many(&pkgs, &ctx)
+            install::info_many(&ctx, &pkgs)
         }
         Cmd::Prune => install::prune(),
-        Cmd::Run { pick, verbose, pkg, args } => {
+        Cmd::Run {
+            pick,
+            verbose,
+            pkg,
+            args,
+        } => {
             let ctx = ctx::Ctx::new(verbose);
-            install::run(&pkg, &args, pick, &ctx)
+            install::run(&ctx, &pkg, &args, pick)
         }
         Cmd::Completion { shell } => {
             // bpaf's `autocomplete` feature exposes hidden `--bpaf-complete-style-<shell>`

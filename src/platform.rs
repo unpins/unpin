@@ -103,7 +103,9 @@ pub fn other_os_keys() -> &'static [&'static str] {
     }
     #[cfg(target_os = "windows")]
     {
-        &["linux", "darwin", "macos", "apple", "freebsd", "openbsd", "netbsd"]
+        &[
+            "linux", "darwin", "macos", "apple", "freebsd", "openbsd", "netbsd",
+        ]
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -149,9 +151,14 @@ pub fn current_arch_keys() -> &'static [&'static str] {
     {
         &["riscv64"]
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm",
-                  all(target_arch = "powerpc64", target_endian = "little"),
-                  target_arch = "riscv64")))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "arm",
+        all(target_arch = "powerpc64", target_endian = "little"),
+        target_arch = "riscv64"
+    )))]
     {
         &[]
     }
@@ -160,31 +167,98 @@ pub fn current_arch_keys() -> &'static [&'static str] {
 pub fn other_arch_keys() -> &'static [&'static str] {
     #[cfg(target_arch = "x86_64")]
     {
-        &["i386", "i686", "armv6", "armv7", "armhf", "aarch64", "arm64", "ppc64le", "powerpc64le", "riscv64"]
+        &[
+            "i386",
+            "i686",
+            "armv6",
+            "armv7",
+            "armhf",
+            "aarch64",
+            "arm64",
+            "ppc64le",
+            "powerpc64le",
+            "riscv64",
+        ]
     }
     #[cfg(target_arch = "aarch64")]
     {
-        &["i386", "i686", "armv6", "armv7", "armhf", "x86_64", "amd64", "x64", "ppc64le", "powerpc64le", "riscv64"]
+        &[
+            "i386",
+            "i686",
+            "armv6",
+            "armv7",
+            "armhf",
+            "x86_64",
+            "amd64",
+            "x64",
+            "ppc64le",
+            "powerpc64le",
+            "riscv64",
+        ]
     }
     #[cfg(target_arch = "x86")]
     {
-        &["x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv7", "armhf", "ppc64le", "powerpc64le", "riscv64"]
+        &[
+            "x86_64",
+            "amd64",
+            "x64",
+            "aarch64",
+            "arm64",
+            "armv6",
+            "armv7",
+            "armhf",
+            "ppc64le",
+            "powerpc64le",
+            "riscv64",
+        ]
     }
     #[cfg(target_arch = "arm")]
     {
-        &["i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "ppc64le", "powerpc64le", "riscv64"]
+        &[
+            "i386",
+            "i686",
+            "x86_64",
+            "amd64",
+            "x64",
+            "aarch64",
+            "arm64",
+            "ppc64le",
+            "powerpc64le",
+            "riscv64",
+        ]
     }
     #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
     {
-        &["i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv7", "armhf", "riscv64"]
+        &[
+            "i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv7",
+            "armhf", "riscv64",
+        ]
     }
     #[cfg(target_arch = "riscv64")]
     {
-        &["i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv7", "armhf", "ppc64le", "powerpc64le"]
+        &[
+            "i386",
+            "i686",
+            "x86_64",
+            "amd64",
+            "x64",
+            "aarch64",
+            "arm64",
+            "armv6",
+            "armv7",
+            "armhf",
+            "ppc64le",
+            "powerpc64le",
+        ]
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm",
-                  all(target_arch = "powerpc64", target_endian = "little"),
-                  target_arch = "riscv64")))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "arm",
+        all(target_arch = "powerpc64", target_endian = "little"),
+        target_arch = "riscv64"
+    )))]
     {
         &[]
     }
@@ -197,16 +271,39 @@ pub fn auxiliary_keys() -> &'static [&'static str] {
     #[cfg(unix)]
     {
         &[
-            ".deb", ".rpm", ".appimage", ".7z", ".tar.bz2", ".sig", ".sha256", ".sha512", ".asc",
-            ".pem", ".gpg", ".sbom", ".msi", ".exe",
+            ".deb",
+            ".rpm",
+            ".appimage",
+            ".7z",
+            ".tar.bz2",
+            ".sig",
+            ".sha256",
+            ".sha512",
+            ".asc",
+            ".pem",
+            ".gpg",
+            ".sbom",
+            ".msi",
+            ".exe",
         ]
     }
     #[cfg(windows)]
     {
         // .msi stays — it's a Windows installer we can't headlessly extract.
         &[
-            ".deb", ".rpm", ".appimage", ".7z", ".tar.bz2", ".sig", ".sha256", ".sha512", ".asc",
-            ".pem", ".gpg", ".sbom", ".msi",
+            ".deb",
+            ".rpm",
+            ".appimage",
+            ".7z",
+            ".tar.bz2",
+            ".sig",
+            ".sha256",
+            ".sha512",
+            ".asc",
+            ".pem",
+            ".gpg",
+            ".sbom",
+            ".msi",
         ]
     }
 }
@@ -282,6 +379,21 @@ pub fn link_filename(name: &str) -> String {
     }
 }
 
+/// File name for a multi-call **alias** link. On Windows aliases use NTFS
+/// hardlinks (so argv[0] preserves the alias name, which `.cmd` wrappers
+/// can't do — they pass the resolved target path instead), and a hardlinked
+/// executable needs an `.exe` extension to be invocable via PATHEXT.
+pub fn alias_link_filename(name: &str) -> String {
+    #[cfg(unix)]
+    {
+        name.to_owned()
+    }
+    #[cfg(windows)]
+    {
+        format!("{name}.exe")
+    }
+}
+
 /// Magic first line in Windows `.cmd` wrappers so `read_link` can distinguish
 /// our wrappers from any other `.cmd` the user might place in the same folder.
 /// Without it, a stray `tool.cmd` whose body happens to match the
@@ -321,6 +433,25 @@ pub fn create_link(target: &Path, link_path: &Path) -> io::Result<()> {
             target.display()
         );
         fs::write(link_path, body)
+    }
+}
+
+/// Create a multi-call **alias** link. Aliases need argv[0] to carry the
+/// alias name (so the binary's argv[0] dispatch picks the right code path);
+/// `.cmd` wrappers can't do that — they invoke the target with its own
+/// path. So:
+///   - Unix: symlink (kernel preserves the symlink name in argv[0]).
+///   - Windows: NTFS hardlink (same inode, different name; needs no admin
+///     and no Developer Mode, only that `target` and `link_path` live on
+///     the same NTFS volume — they always do for unpin's layout).
+pub fn create_alias_link(target: &Path, link_path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link_path)
+    }
+    #[cfg(windows)]
+    {
+        fs::hard_link(target, link_path)
     }
 }
 
@@ -414,9 +545,7 @@ mod tests {
     #[test]
     fn cmd_wrapper_ignores_extra_lines() {
         // Trailing content shouldn't trip the parser (we only consume two lines).
-        let body = format!(
-            "{WINDOWS_WRAPPER_MARKER}\r\n@\"C:\\x.exe\" %*\r\nrem extra\r\n"
-        );
+        let body = format!("{WINDOWS_WRAPPER_MARKER}\r\n@\"C:\\x.exe\" %*\r\nrem extra\r\n");
         assert_eq!(parse_cmd_wrapper(&body), Some("C:\\x.exe"));
     }
 
@@ -465,5 +594,16 @@ mod tests {
         assert_eq!(f, "rg");
         #[cfg(windows)]
         assert_eq!(f, "rg.cmd");
+    }
+
+    #[test]
+    fn alias_link_filename_uses_exe_on_windows() {
+        // Aliases need the `.exe` extension on Windows because they're
+        // NTFS hardlinks to the actual binary, not `.cmd` wrappers.
+        let f = alias_link_filename("xzcat");
+        #[cfg(unix)]
+        assert_eq!(f, "xzcat");
+        #[cfg(windows)]
+        assert_eq!(f, "xzcat.exe");
     }
 }

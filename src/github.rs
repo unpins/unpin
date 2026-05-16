@@ -22,22 +22,22 @@ pub struct Asset {
     pub browser_download_url: String,
 }
 
-pub fn fetch_latest(repo: &str, ctx: &Ctx) -> Result<Release, String> {
+pub fn fetch_latest(ctx: &Ctx, repo: &str) -> Result<Release, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    fetch_release_url(&url, ctx)
+    fetch_release_url(ctx, &url)
 }
 
-pub fn fetch_tag(repo: &str, tag: &str, ctx: &Ctx) -> Result<Release, String> {
+pub fn fetch_tag(ctx: &Ctx, repo: &str, tag: &str) -> Result<Release, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-    fetch_release_url(&url, ctx)
+    fetch_release_url(ctx, &url)
 }
 
-fn fetch_release_url(url: &str, ctx: &Ctx) -> Result<Release, String> {
-    let body = api_get(url, ctx)?;
+fn fetch_release_url(ctx: &Ctx, url: &str) -> Result<Release, String> {
+    let body = api_get(ctx, url)?;
     DeJson::deserialize_json(&body).map_err(|e| format!("parse release JSON: {e}"))
 }
 
-fn api_get(url: &str, ctx: &Ctx) -> Result<String, String> {
+fn api_get(ctx: &Ctx, url: &str) -> Result<String, String> {
     let mut headers: Vec<(&str, &str)> = vec![
         ("User-Agent", USER_AGENT),
         ("Accept", "application/vnd.github+json"),
@@ -56,8 +56,7 @@ fn api_get(url: &str, ctx: &Ctx) -> Result<String, String> {
         if resp.status == 404 {
             return Err("not found (check package name or version)".into());
         }
-        let msg = github_error_message(&resp.body)
-            .unwrap_or_else(|| "request failed".to_string());
+        let msg = github_error_message(&resp.body).unwrap_or_else(|| "request failed".to_string());
         return Err(format!("HTTP {}: {msg}", resp.status));
     }
     String::from_utf8(resp.body).map_err(|e| format!("decode body for {url}: {e}"))
@@ -70,20 +69,22 @@ struct ErrorBody {
 
 fn github_error_message(body: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(body).ok()?;
-    DeJson::deserialize_json(s).ok().map(|e: ErrorBody| e.message)
+    DeJson::deserialize_json(s)
+        .ok()
+        .map(|e: ErrorBody| e.message)
 }
 
 /// Convenience download into memory. Used for small payloads (checksum files).
 /// Renders no progress. Called only from the serial preflight phase, so a raw
 /// `eprintln!` for the verbose URL log is safe (no `MultiProgress` rendering
 /// to race against).
-pub fn download(url: &str, ctx: &Ctx) -> Result<Vec<u8>, String> {
+pub fn download(ctx: &Ctx, url: &str) -> Result<Vec<u8>, String> {
     if ctx.verbose {
         eprintln!("  GET {url}");
     }
     let bar = ProgressBar::hidden();
     let mut buf = Vec::new();
-    let mut reader = download_stream_into(url, &bar, ctx)?;
+    let mut reader = download_stream_into(ctx, url, &bar)?;
     std::io::copy(&mut reader, &mut buf).map_err(|e| format!("read {url}: {e}"))?;
     Ok(buf)
 }
@@ -97,9 +98,9 @@ pub fn download(url: &str, ctx: &Ctx) -> Result<Vec<u8>, String> {
 /// `Content-Length`-missing case, swaps to a spinner style). The style itself
 /// is whatever the caller pre-configured.
 pub fn download_stream_into(
+    ctx: &Ctx,
     url: &str,
     bar: &ProgressBar,
-    ctx: &Ctx,
 ) -> Result<ProgressStream, String> {
     let headers: Vec<(&str, &str)> = vec![("User-Agent", USER_AGENT)];
     // Verbose URL printing happens at the call site — it has the right
@@ -155,18 +156,14 @@ pub fn download_progress_style() -> ProgressStyle {
 
 /// Style used when `Content-Length` was not provided. Spinner + bytes + rate, no bar.
 pub fn download_progress_style_unknown() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "  {prefix:.cyan}  {spinner} {bytes:>9}  {bytes_per_sec:>10}",
-    )
-    .unwrap()
+    ProgressStyle::with_template("  {prefix:.cyan}  {spinner} {bytes:>9}  {bytes_per_sec:>10}")
+        .unwrap()
 }
 
 /// Style for a failed download: prefix + red bar (frozen at the failure point)
 /// + the error reason in red. Caller sets the reason via `bar.set_message(...)`.
 pub fn download_error_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "  {prefix:.red}  {bar:14.red/red} {percent:>3}%  {wide_msg:.red}",
-    )
-    .unwrap()
-    .progress_chars("▰▰▱")
+    ProgressStyle::with_template("  {prefix:.red}  {bar:14.red/red} {percent:>3}%  {wide_msg:.red}")
+        .unwrap()
+        .progress_chars("▰▰▱")
 }
