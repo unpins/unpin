@@ -1,7 +1,8 @@
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
@@ -122,6 +123,41 @@ pub(super) fn prompt_yes_no(question: &str) -> bool {
         return false;
     }
     matches!(line.trim_start().chars().next(), Some('y' | 'Y'))
+}
+
+/// Cross-process advisory lock at `<repo_dir>/.unpin.lock`. Wraps
+/// [`platform::InstallLock`] to integrate with the sigint cleanup hook —
+/// holding this guard guarantees the lock file is removed on normal Drop,
+/// process panic, *and* SIGINT (ctrl-c) without leaking a stale lock.
+///
+/// Hold this for the smallest window that fully covers the destructive
+/// operation: pipeline.rs holds one from preflight through linking; prune
+/// and remove_one each grab one for the duration of their `remove_dir_all`
+/// pass. Reads (info, list) deliberately skip the lock — they tolerate the
+/// occasional racy result instead of paying for serialization.
+pub(super) struct RepoLock {
+    inner: platform::InstallLock,
+}
+
+impl RepoLock {
+    /// 1-hour stale window: long enough that a slow install on a thin
+    /// network doesn't get its lock stolen, short enough that a genuinely
+    /// abandoned lock (SIGKILL, power loss) recovers automatically without
+    /// requiring the user to find and `rm` the file.
+    pub(super) const STALE_AFTER: Duration = Duration::from_secs(3600);
+
+    pub(super) fn acquire(repo_dir: &Path) -> Result<Self, String> {
+        let inner = platform::acquire_install_lock(repo_dir, Self::STALE_AFTER)?;
+        crate::sigint::push_cleanup(inner.path());
+        Ok(Self { inner })
+    }
+}
+
+impl Drop for RepoLock {
+    fn drop(&mut self) {
+        crate::sigint::pop_cleanup(self.inner.path());
+        // platform::InstallLock::drop runs next and removes the file.
+    }
 }
 
 pub(super) fn fetch_release(ctx: &Ctx, spec: &Spec) -> Result<Release, String> {
@@ -478,6 +514,7 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
 
 pub fn prune() -> Result<(), String> {
     let mut removed = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
 
     let bin = bin_dir();
     let root = data_dir();
@@ -485,6 +522,10 @@ pub fn prune() -> Result<(), String> {
     // this prune run (e.g. user deleted a binary by hand). Must run BEFORE
     // phase 2 — otherwise phase 2's "live links" calculation would treat
     // those dangling pointers as anchors and refuse to remove their vdirs.
+    //
+    // No lock here: phase 1 only removes links whose target is *already*
+    // missing on disk. A concurrent install creating fresh links into a
+    // valid target can't trigger a remove because metadata(target) succeeds.
     removed += sweep_dangling_links(&bin, &root);
 
     // Orphan version dirs: no live link in bin_dir points into them.
@@ -498,6 +539,21 @@ pub fn prune() -> Result<(), String> {
 
     for (owner, repo) in installed_repos() {
         let rdir = repo_dir(&owner, &repo);
+        // Take the lock for this repo before scanning + removing version
+        // dirs. Without this prune races with a concurrent `install`/`update`
+        // in Phase B: the in-flight vdir exists on disk but has no link in
+        // bin_dir yet (linking is Phase C), so the linked_targets check
+        // above would classify it as orphan and remove_dir_all would
+        // happily nuke the extraction in progress. With the lock, prune
+        // either gets exclusive access or skips that repo entirely until
+        // the install finishes.
+        let _lock = match RepoLock::acquire(&rdir) {
+            Ok(l) => l,
+            Err(_) => {
+                skipped.push(format!("{owner}/{repo}"));
+                continue;
+            }
+        };
         let versions = match fs::read_dir(&rdir) {
             Ok(e) => e,
             Err(_) => continue,
@@ -543,7 +599,14 @@ pub fn prune() -> Result<(), String> {
         removed += sweep_dangling_links(&bin, &root);
     }
 
-    if removed == 0 {
+    if !skipped.is_empty() {
+        eprintln!(
+            "Skipped {} package(s) with an active install lock: {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
+    if removed == 0 && skipped.is_empty() {
         println!("Nothing to prune");
     }
     Ok(())

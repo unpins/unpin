@@ -12,7 +12,6 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
@@ -20,12 +19,11 @@ use crate::aliases::AliasMode;
 use crate::archive;
 use crate::ctx::Ctx;
 use crate::github::{self, Asset, Release};
-use crate::platform;
 
 use super::asset::{fetch_expected_sha256, find_checksum_url, find_companion, pick_asset};
 use super::linker::link_all_executables;
 use super::spec::Spec;
-use super::{fetch_release, prompt_yes_no, repo_dir, version_dir};
+use super::{RepoLock, fetch_release, prompt_yes_no, repo_dir, version_dir};
 
 /// Resolved per-invocation policy for one `install`/`update` call. Bundled
 /// so the pipeline functions don't carry a five-arg tail of policy flags.
@@ -80,36 +78,7 @@ pub struct ExtractJob {
     /// (right before the first destructive write) through the end of Phase C
     /// linking. `None` for cached jobs (no write happens, no lock needed).
     /// Field is private so the lock can only be released via Drop.
-    _lock: Option<PipelineLock>,
-}
-
-/// Local wrapper that pairs an `InstallLock` with sigint cleanup. Acquiring
-/// pushes the lock path onto the ctrl-c cleanup list so an interrupted
-/// install doesn't leave a stale `.unpin.lock` behind; Drop pops it back
-/// off, then `InstallLock::Drop` removes the file.
-struct PipelineLock {
-    inner: platform::InstallLock,
-}
-
-impl PipelineLock {
-    /// 1-hour stale-after window: long enough that a slow install on a thin
-    /// network doesn't get its lock stolen, short enough that a genuinely
-    /// abandoned lock (SIGKILL, power loss) recovers automatically without
-    /// requiring the user to find and `rm` the file.
-    const STALE_AFTER: Duration = Duration::from_secs(3600);
-
-    fn acquire(repo_dir: &Path) -> Result<Self, String> {
-        let inner = platform::acquire_install_lock(repo_dir, Self::STALE_AFTER)?;
-        crate::sigint::push_cleanup(inner.path());
-        Ok(Self { inner })
-    }
-}
-
-impl Drop for PipelineLock {
-    fn drop(&mut self) {
-        crate::sigint::pop_cleanup(self.inner.path());
-        // platform::InstallLock::drop runs next and removes the file.
-    }
+    _lock: Option<RepoLock>,
 }
 
 /// Serial preflight: pick asset, resolve checksum, decide if download is needed.
@@ -155,7 +124,7 @@ pub fn preflight_extract(
     // and *before* the first destructive write. Holding it through the
     // prompt would force a parallel install on the same package to error
     // out while the user is at coffee.
-    let lock = PipelineLock::acquire(&repo_dir(&spec.owner, &spec.name))?;
+    let lock = RepoLock::acquire(&repo_dir(&spec.owner, &spec.name))?;
     // --pick (or incomplete cache) on a cached version: wipe before re-extracting.
     if vdir.is_dir() {
         fs::remove_dir_all(&vdir).map_err(|e| format!("remove {}: {e}", vdir.display()))?;
