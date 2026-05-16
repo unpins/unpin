@@ -51,7 +51,10 @@ pub const MARKER_END: &[u8] = b"\xff\xffUNPIN_META_END_7f3a4e\xff\xff";
 /// Hard caps so a malformed (or malicious) marker can't blow up memory or
 /// flood `bin_dir/` with junk entries.
 pub const MAX_PAYLOAD_BYTES: usize = 8 * 1024;
-pub const MAX_ALIASES: usize = 64;
+// Sized for full-coreutils-class multicalls (~100 applets) with headroom.
+// Payload size is the actual bound — at ~10 chars + comma per alias, 256
+// names fit in well under MAX_PAYLOAD_BYTES (8 KB allows ~800).
+pub const MAX_ALIASES: usize = 256;
 pub const MAX_ALIAS_LEN: usize = 64;
 
 /// Names we refuse to shadow even from a catalog package: shadowing `sudo`
