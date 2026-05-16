@@ -13,7 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 minreq = { version = "2", default-features = false, features = ["https-rustls"] }
-bpaf = { version = "0.9", default-features = false, features = ["bright-color", "autocomplete"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+clap_complete = { version = "4", default-features = false }
 nanoserde = { version = "0.2", default-features = false, features = ["json", "std"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 xz2 = { version = "0.1", features = ["static"] }
