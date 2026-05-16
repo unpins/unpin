@@ -41,16 +41,19 @@ enum Cmd {
 }
 
 impl Cmd {
-    fn run(self) -> Result<(), String> {
+    /// `Ok(code)` carries the desired process exit code. Most subcommands
+    /// produce 0 on success; `run` forwards the child's exit code so callers
+    /// can chain unpin into shell pipelines without losing failure signals.
+    fn run(self) -> Result<i32, String> {
         match self {
-            Cmd::Install(c) => c.run(),
-            Cmd::Update(c) => c.run(),
-            Cmd::Remove(c) => c.run(),
-            Cmd::List => install::list(),
-            Cmd::Info(c) => c.run(),
-            Cmd::Prune => install::prune(),
+            Cmd::Install(c) => c.run().map(|()| 0),
+            Cmd::Update(c) => c.run().map(|()| 0),
+            Cmd::Remove(c) => c.run().map(|()| 0),
+            Cmd::List => install::list().map(|()| 0),
+            Cmd::Info(c) => c.run().map(|()| 0),
+            Cmd::Prune => install::prune().map(|()| 0),
             Cmd::Run(c) => c.run(),
-            Cmd::Completion(c) => c.run(),
+            Cmd::Completion(c) => c.run().map(|()| 0),
         }
     }
 }
@@ -141,7 +144,7 @@ struct RunCmd {
 }
 
 impl RunCmd {
-    fn run(self) -> Result<(), String> {
+    fn run(self) -> Result<i32, String> {
         let ctx = ctx::Ctx::new(self.verbose);
         install::run(&ctx, &self.pkg, &self.args, self.pick)
     }
@@ -384,7 +387,12 @@ fn main() -> ExitCode {
         }
     };
     match cli.command.run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(0) => ExitCode::SUCCESS,
+        // Child exit codes are 8-bit on Unix (waitpid masks the low byte); on
+        // Windows they fit a DWORD but ExitCode caps at u8 anyway. Truncating
+        // is the same thing the shell does after a child dies, so callers see
+        // the conventional value.
+        Ok(code) => ExitCode::from((code & 0xff) as u8),
         Err(e) => {
             eprintln!("unpin: {e}");
             ExitCode::FAILURE

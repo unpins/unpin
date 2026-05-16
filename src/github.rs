@@ -146,6 +146,15 @@ pub struct ProgressStream {
     bar: ProgressBar,
 }
 
+impl ProgressStream {
+    /// Server-declared body length, if it provided a Content-Length header.
+    /// Capture this *before* wrapping the stream in e.g. a `HashingReader` —
+    /// once wrapped, the inner method is no longer reachable.
+    pub fn content_length(&self) -> Option<u64> {
+        self.inner.content_length()
+    }
+}
+
 impl Read for ProgressStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;

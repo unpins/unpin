@@ -694,8 +694,16 @@ fn download_extract_verify(
                 .println(format!("  GET {}", asset.browser_download_url));
         }
         let stream = github::download_stream_into(ctx, &asset.browser_download_url, ui.bar)?;
+        // Capture Content-Length before wrapping. When no checksum is
+        // available, we fall back to this to detect a truncated body.
+        let content_length = stream.content_length();
         let mut hashing = HashingReader::new(stream);
         archive::extract(&asset.name, &mut hashing, vdir)?;
+        // Defensive: every extractor today drains its input to EOF, but make
+        // the byte count and the hash reflect the whole response regardless
+        // of which path was taken — cheap insurance for future formats.
+        let _ = io::copy(&mut hashing, &mut io::sink());
+        let got_bytes = ui.bar.position();
         let got = hashing.finalize_hex();
         if let Some(expected) = expected_sha256 {
             if !got.eq_ignore_ascii_case(expected) {
@@ -709,6 +717,17 @@ fn download_extract_verify(
                 "  verified {}{suffix}  ({})",
                 ui.repo,
                 &expected[..16]
+            ));
+        } else if let Some(total) = content_length
+            && got_bytes != total
+        {
+            // Belt-and-suspenders for releases without a published checksum:
+            // a server that closes mid-stream still lets `io::copy` succeed
+            // with a short read (EOF != error). The length compare catches
+            // the resulting truncated binary that archive::extract didn't.
+            return Err(format!(
+                "truncated download for {}: read {got_bytes} of {total} bytes",
+                asset.name
             ));
         }
         Ok(())
@@ -1734,7 +1753,11 @@ pub fn prune() -> Result<(), String> {
     Ok(())
 }
 
-pub fn run(ctx: &Ctx, input: &str, args: &[String], pick: bool) -> Result<(), String> {
+/// Returns the child's exit code (0 on success, non-zero on the child's own
+/// failure, 128+signal on Unix when the child died from a signal). The caller
+/// is expected to map this to its own process exit so destructors at this
+/// level still run — calling `std::process::exit` here skipped them.
+pub fn run(ctx: &Ctx, input: &str, args: &[String], pick: bool) -> Result<i32, String> {
     let spec = parse_spec(input)?;
     println!("Resolving {}...", spec.repo());
     let release = fetch_release(ctx, &spec)?;
@@ -1807,8 +1830,7 @@ pub fn run(ctx: &Ctx, input: &str, args: &[String], pick: bool) -> Result<(), St
         .status()
         .map_err(|e| format!("exec {}: {e}", bin.display()))?;
     match status.code() {
-        Some(0) => Ok(()),
-        Some(code) => std::process::exit(code),
+        Some(code) => Ok(code),
         None => {
             // Unix: child terminated by signal. Mirror shell convention 128+sig
             // so callers (CI, shell scripts) see a non-zero exit. On Windows
@@ -1818,11 +1840,11 @@ pub fn run(ctx: &Ctx, input: &str, args: &[String], pick: bool) -> Result<(), St
             {
                 use std::os::unix::process::ExitStatusExt;
                 let sig = status.signal().unwrap_or(0);
-                std::process::exit(128 + sig);
+                Ok(128 + sig)
             }
             #[cfg(not(unix))]
             {
-                std::process::exit(1);
+                Ok(1)
             }
         }
     }
