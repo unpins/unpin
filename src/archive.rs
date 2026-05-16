@@ -126,12 +126,157 @@ fn unsupported_compression_suffix(lower_name: &str) -> Option<&'static str> {
 }
 
 fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    let dir = cap_std::fs::Dir::open_ambient_dir(dest, cap_std::ambient_authority())
+        .map_err(|e| format!("open {}: {e}", dest.display()))?;
+
+    // We use tar-rs's `entries()` iterator (which handles the binary format,
+    // GNU long-path extensions, PAX headers etc.) and route each entry's
+    // filesystem effect through cap-std. That way tar-rs still owns format
+    // parsing — well-tested ground we don't want to reinvent — but every
+    // mutation lands through `openat2(RESOLVE_BENEATH)` (Linux) or its
+    // emulation, refusing traversal at the syscall layer. Replaces
+    // `archive.unpack(dest)` which used tar-rs's internal canonicalize +
+    // starts_with check (TOCTOU-vulnerable in theory).
+    //
+    // Unsupported entry kinds (char/block device, FIFO, sparse files)
+    // are silently skipped: unpins release tarballs don't ship them. We
+    // also don't preserve mtimes, uids, or xattrs — none of which matter
+    // for installing a CLI binary into PATH.
+    //
+    // Directory permissions are *deferred* to the end of unpacking and
+    // applied deepest-first — mirroring tar-rs's own strategy (alexcrichton/
+    // tar-rs#242). Nix-built unpins tarballs ship dirs with mode 0o555
+    // (read-only), so if we applied perms inline we'd lose write access
+    // to a parent before mkdir-ing its descendants. Files keep inline
+    // chmod because each one is a leaf — locking it down can't block any
+    // subsequent write.
+    #[cfg(unix)]
+    let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+
     let mut archive = tar::Archive::new(reader);
-    archive.set_preserve_permissions(true);
-    archive.set_overwrite(true);
-    archive
-        .unpack(dest)
-        .map_err(|e| format!("unpack tar to {}: {e}", dest.display()))
+    for entry in archive.entries().map_err(|e| format!("read tar: {e}"))? {
+        let mut entry = entry.map_err(|e| format!("read tar entry: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("entry path: {e}"))?
+            .into_owned();
+        // Skip empty/"." entries — some tar writers emit a synthetic
+        // root-dir entry that maps to dest itself; create_dir_all("") would
+        // be a no-op but is_dir handling later gets confused.
+        if path.as_os_str().is_empty() || path == Path::new(".") {
+            continue;
+        }
+        let entry_type = entry.header().entry_type();
+        let mode = entry.header().mode().ok();
+
+        match entry_type {
+            tar::EntryType::Directory => {
+                dir.create_dir_all(&path)
+                    .map_err(|e| format!("mkdir {}: {e}", path.display()))?;
+                // Defer chmod — see comment above the loop.
+                #[cfg(unix)]
+                if let Some(m) = mode {
+                    dir_modes.push((path, m));
+                }
+            }
+            tar::EntryType::Regular | tar::EntryType::Continuous => {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    dir.create_dir_all(parent)
+                        .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+                }
+                // set_overwrite(true) equivalent: drop a stale entry first
+                // so the create() that follows doesn't trip over an
+                // already-symlinked path (mostly a no-op since we extract
+                // into a freshly-wiped .part, but cheap insurance for
+                // tarballs that intentionally duplicate paths).
+                let _ = dir.remove_file(&path);
+                let mut out = dir
+                    .create(&path)
+                    .map_err(|e| format!("create {}: {e}", path.display()))?;
+                io::copy(&mut entry, &mut out)
+                    .map_err(|e| format!("write {}: {e}", path.display()))?;
+                #[cfg(unix)]
+                if let Some(m) = mode {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = cap_std::fs::Permissions::from_std(fs::Permissions::from_mode(m));
+                    out.set_permissions(perms)
+                        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+                }
+            }
+            tar::EntryType::Symlink => {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    dir.create_dir_all(parent)
+                        .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+                }
+                let target = entry
+                    .link_name()
+                    .map_err(|e| format!("symlink target for {}: {e}", path.display()))?
+                    .ok_or_else(|| format!("symlink {} has empty target", path.display()))?;
+                let _ = dir.remove_file(&path);
+                // cap-std refuses creating a symlink that would itself
+                // escape, AND refuses following symlinks that point
+                // outside on subsequent opens (RESOLVE_BENEATH). So even
+                // if a malicious archive ships `evil -> /etc` followed by
+                // a write to `evil/passwd`, the write step's
+                // dir.create_dir_all("evil") refuses to traverse the
+                // outside-pointing symlink. Defense-in-depth holds.
+                #[cfg(unix)]
+                dir.symlink(&*target, &path)
+                    .map_err(|e| format!("symlink {}: {e}", path.display()))?;
+                #[cfg(windows)]
+                {
+                    // Windows distinguishes file vs dir symlinks at creation;
+                    // tarballs we extract here are file-targeting in practice.
+                    use cap_std::fs::DirExt;
+                    dir.symlink_file(&*target, &path)
+                        .map_err(|e| format!("symlink {}: {e}", path.display()))?;
+                }
+            }
+            tar::EntryType::Link => {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    dir.create_dir_all(parent)
+                        .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+                }
+                let src = entry
+                    .link_name()
+                    .map_err(|e| format!("hardlink src for {}: {e}", path.display()))?
+                    .ok_or_else(|| format!("hardlink {} has empty src", path.display()))?;
+                let _ = dir.remove_file(&path);
+                dir.hard_link(&*src, &dir, &path)
+                    .map_err(|e| format!("hardlink {}: {e}", path.display()))?;
+            }
+            _ => {
+                // Character device, block device, FIFO, GNU sparse, etc.
+                // unpins archives don't ship any of these.
+            }
+        }
+    }
+
+    // Now the deferred dir chmods. Deepest-first so that locking a parent
+    // to 0o555 can't block an `set_permissions` call on its still-mutable
+    // child. Sort by path-bytes descending — same heuristic tar-rs uses
+    // for the topological-by-depth ordering.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        dir_modes.sort_by(|a, b| {
+            b.0.as_os_str()
+                .as_encoded_bytes()
+                .cmp(a.0.as_os_str().as_encoded_bytes())
+        });
+        for (path, m) in dir_modes {
+            let perms = cap_std::fs::Permissions::from_std(fs::Permissions::from_mode(m));
+            let _ = dir.set_permissions(&path, perms);
+        }
+    }
+    Ok(())
 }
 
 fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
@@ -212,7 +357,11 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                         let n = f.read(&mut head).unwrap_or(0);
                         let is_elf = n >= 4 && &head[..4] == b"\x7fELF";
                         let is_shebang = n >= 2 && &head[..2] == b"#!";
-                        if is_elf || is_shebang { Some(0o755) } else { None }
+                        if is_elf || is_shebang {
+                            Some(0o755)
+                        } else {
+                            None
+                        }
                     }
                     Err(_) => None,
                 }
@@ -533,6 +682,54 @@ mod tests {
         assert!(
             !parent.path().join("escape").exists(),
             "escape file was created"
+        );
+    }
+
+    #[test]
+    fn extract_tar_refuses_symlink_then_write_through_attack() {
+        // Classic tar-bomb: entry A is a symlink `evil -> /tmp/outside`,
+        // entry B writes to `evil/file`. Without cap-std the kernel would
+        // follow the symlink at open(2) time and write through it. With
+        // cap-std's RESOLVE_BENEATH on every dir traversal the second
+        // entry's `create_dir_all("evil")` refuses to walk the symlink.
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("sandbox");
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        // Entry A: symlink "evil" pointing at /tmp/.../outside (absolute → outside dest)
+        let mut h = tar::Header::new_gnu();
+        h.set_path("evil").unwrap();
+        h.set_size(0);
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_link_name(&outside).unwrap();
+        h.set_cksum();
+        builder.append(&h, std::io::empty()).unwrap();
+        // Entry B: regular file "evil/escaped" with malicious content
+        let mut h = tar::Header::new_gnu();
+        h.set_path("evil/escaped").unwrap();
+        let payload = b"got you";
+        h.set_size(payload.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        builder.append(&h, &payload[..]).unwrap();
+        let tar_bytes = builder.into_inner().unwrap();
+
+        // cap-std refuses at TWO points: it won't create a symlink whose
+        // target leaves the dir, and it won't traverse one if creation
+        // somehow succeeded. The symlink creation refusal fires first here,
+        // so we error on entry A — but either error path is acceptable as
+        // long as nothing lands outside.
+        let err = extract("pkg.tar", &tar_bytes[..], &dest).unwrap_err();
+        assert!(
+            err.contains("symlink") || err.contains("create") || err.contains("mkdir"),
+            "got: {err}"
+        );
+        assert!(
+            !outside.join("escaped").exists(),
+            "wrote through symlink to {}",
+            outside.join("escaped").display()
         );
     }
 
