@@ -553,7 +553,13 @@ pub fn prune() -> Result<(), String> {
 /// failure, 128+signal on Unix when the child died from a signal). The caller
 /// is expected to map this to its own process exit so destructors at this
 /// level still run — calling `std::process::exit` here skipped them.
-pub fn run(ctx: &Ctx, input: &str, args: &[String], pick: bool) -> Result<i32, String> {
+pub fn run(
+    ctx: &Ctx,
+    input: &str,
+    args: &[String],
+    pick: bool,
+    assume_yes: bool,
+) -> Result<i32, String> {
     let spec = parse_spec(input)?;
     println!("Resolving {}...", spec.repo());
     let release = fetch_release(ctx, &spec)?;
@@ -561,7 +567,12 @@ pub fn run(ctx: &Ctx, input: &str, args: &[String], pick: bool) -> Result<i32, S
     // non-functional (gvim/vim need share/), and `run` is the "just try it"
     // path where surprises are worst. Use `install --no-data` if you need a
     // bare binary on disk.
-    let job = preflight_extract(ctx, spec.clone(), release.clone(), true, pick, true)?;
+    //
+    // `assume_yes` comes from the `-y` flag. Without it, `preflight_extract`
+    // prompts when a release lacks a SHA-256 checksum, and a non-TTY stdin
+    // turns the prompt into a refusal — `unpin run owner/repo` in a script
+    // won't silently execute unverified code.
+    let job = preflight_extract(ctx, spec.clone(), release.clone(), assume_yes, pick, true)?;
     let vdir = job.vdir.clone();
     let needs_download = job.asset.is_some();
     if needs_download {

@@ -163,9 +163,17 @@ pub fn preflight_extract(
     let expected_sha256 = match find_checksum_url(&release.assets, &asset.name) {
         Some(url) => Some(fetch_expected_sha256(ctx, &url)?),
         None => {
-            if !assume_yes
-                && !prompt_yes_no("No SHA-256 checksum found. Continue without verification?")
-            {
+            // No published checksum. `-y` (assume_yes) lets the user opt in
+            // explicitly; without it we prompt (TTY) or refuse (non-TTY).
+            // Either way, when we proceed we surface a stderr warning — the
+            // install/run path otherwise looks identical to a verified one,
+            // which would hide the trust gap from the user.
+            if assume_yes {
+                eprintln!(
+                    "warning: no SHA-256 checksum published for {}; downloading without verification",
+                    asset.name
+                );
+            } else if !prompt_yes_no("No SHA-256 checksum found. Continue without verification?") {
                 return Err("aborted: missing checksum".into());
             }
             None
@@ -180,11 +188,14 @@ pub fn preflight_extract(
         Some(c) => match find_checksum_url(&release.assets, &c.name) {
             Some(url) => Some(fetch_expected_sha256(ctx, &url)?),
             None => {
-                if !assume_yes
-                    && !prompt_yes_no(
-                        "Data companion has no SHA-256 checksum. Continue without verification?",
-                    )
-                {
+                if assume_yes {
+                    eprintln!(
+                        "warning: no SHA-256 checksum published for {} (data); downloading without verification",
+                        c.name
+                    );
+                } else if !prompt_yes_no(
+                    "Data companion has no SHA-256 checksum. Continue without verification?",
+                ) {
                     return Err("aborted: missing companion checksum".into());
                 }
                 None

@@ -128,6 +128,9 @@ struct RunCmd {
     /// Always prompt to choose the asset (instead of auto-picking)
     #[arg(short = 'p', long = "pick")]
     pick: bool,
+    /// Skip prompts (e.g. proceed without a SHA-256 checksum)
+    #[arg(short = 'y', long = "yes")]
+    assume_yes: bool,
     /// Print every HTTP request and show release assets that were filtered out
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
@@ -146,7 +149,7 @@ struct RunCmd {
 impl RunCmd {
     fn run(self) -> Result<i32, String> {
         let ctx = ctx::Ctx::new(self.verbose);
-        install::run(&ctx, &self.pkg, &self.args, self.pick)
+        install::run(&ctx, &self.pkg, &self.args, self.pick, self.assume_yes)
     }
 }
 
