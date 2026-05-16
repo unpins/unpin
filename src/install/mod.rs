@@ -299,6 +299,15 @@ fn remove_one(name: &str) -> Result<(), String> {
     let (owner, repo) = resolve_installed(name)?.ok_or("not installed")?;
     let rdir = repo_dir(&owner, &repo);
 
+    // Same lock the install pipeline takes. Without it a concurrent
+    // `unpin install` extracting into rdir would race against this
+    // `remove_dir_all` and end up either rolled-back-to-empty or
+    // confused with ENOENTs mid-tar. RepoLock will be dropped on its
+    // own after the function returns; remove_dir_all below wipes the
+    // lock file along with the rest of rdir, which is fine — Drop's
+    // `fs::remove_file` becomes a silent no-op.
+    let _lock = RepoLock::acquire(&rdir)?;
+
     let mut versions: Vec<String> = fs::read_dir(&rdir)
         .map(|it| {
             it.flatten()
