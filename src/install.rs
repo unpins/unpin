@@ -1430,21 +1430,22 @@ pub fn remove_many(names: &[String], assume_yes: bool) -> Result<(), String> {
         names.to_vec()
     };
 
-    let mut last_err: Option<String> = None;
+    let mut failures = 0usize;
     for name in &targets {
         if let Err(e) = remove_one(name) {
             eprintln!("unpin: {name}: {e}");
-            last_err = Some(e);
+            failures += 1;
         }
     }
-    match last_err {
-        Some(e) => Err(format!("one or more removes failed (last: {e})")),
-        None => Ok(()),
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(format!("{failures} remove(s) failed"))
     }
 }
 
 fn remove_one(name: &str) -> Result<(), String> {
-    let (owner, repo) = resolve_installed(name)?.ok_or_else(|| format!("not installed: {name}"))?;
+    let (owner, repo) = resolve_installed(name)?.ok_or("not installed")?;
     let rdir = repo_dir(&owner, &repo);
 
     let mut versions: Vec<String> = fs::read_dir(&rdir)
@@ -1585,19 +1586,20 @@ fn installed_repos() -> Vec<(String, String)> {
 }
 
 pub fn info_many(ctx: &Ctx, inputs: &[String]) -> Result<(), String> {
-    let mut last_err: Option<String> = None;
+    let mut failures = 0usize;
     for (i, input) in inputs.iter().enumerate() {
         if i > 0 {
             println!();
         }
         if let Err(e) = info(ctx, input) {
             eprintln!("unpin: {input}: {e}");
-            last_err = Some(e);
+            failures += 1;
         }
     }
-    match last_err {
-        Some(e) => Err(format!("one or more info lookups failed (last: {e})")),
-        None => Ok(()),
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(format!("{failures} info lookup(s) failed"))
     }
 }
 

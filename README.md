@@ -76,7 +76,7 @@ Common flags:
 | Flag                | Meaning                                                    |
 | ------------------- | ---------------------------------------------------------- |
 | `-y`, `--yes`       | Skip confirmation prompts                                  |
-| `-j N`, `--jobs N`  | Parallel workers for download + extract (default 4)        |
+| `-j N`, `--jobs N`  | Parallel workers for download + extract (default: min(N, 4)) |
 | `--pick`            | Always prompt when multiple release assets match           |
 | `-v`, `--verbose`   | Show filtered-out assets and the reason                    |
 | `-V`, `--version`   | Print `unpin <version>`                                    |

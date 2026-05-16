@@ -132,7 +132,11 @@ struct RunCmd {
     #[arg(value_name = "PKG")]
     pkg: String,
     /// arguments forwarded to the binary
-    #[arg(value_name = "ARG", trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(
+        value_name = "ARG",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     args: Vec<String>,
 }
 
@@ -153,7 +157,12 @@ struct CompletionCmd {
 impl CompletionCmd {
     fn run(self) -> Result<(), String> {
         let mut cmd = Cli::command();
-        clap_complete::generate(self.shell.generator(), &mut cmd, "unpin", &mut std::io::stdout());
+        clap_complete::generate(
+            self.shell.generator(),
+            &mut cmd,
+            "unpin",
+            &mut std::io::stdout(),
+        );
         Ok(())
     }
 }
@@ -164,7 +173,13 @@ struct InstallUpdateFlags {
     #[arg(short = 'y', long = "yes")]
     assume_yes: bool,
     /// Parallel downloads (default: min(N, 4))
-    #[arg(short = 'j', long = "jobs", value_name = "N", default_value_t = 0, hide_default_value = true)]
+    #[arg(
+        short = 'j',
+        long = "jobs",
+        value_name = "N",
+        default_value_t = 0,
+        hide_default_value = true
+    )]
     jobs: u8,
     /// Always prompt to choose the asset (instead of auto-picking)
     #[arg(short = 'p', long = "pick")]
