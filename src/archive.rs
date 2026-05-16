@@ -27,6 +27,15 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
         // binary name. Place under `bin/` so siblings extracted from a `.tar.zst`
         // data companion (which puts files at `share/...`) line up: vim's
         // argv[0]-walk then resolves <exe_dir>/../share/vim/<ver>.
+        //
+        // `stem` is attacker-controlled (taken verbatim from the GitHub asset
+        // name, minus the `.zst`). Routing the write through cap-std's
+        // capability-scoped Dir kills any path-traversal attempt at the
+        // syscall layer — `openat` with RESOLVE_BENEATH (Linux) or its
+        // emulated equivalent refuses to walk `..` or follow symlinks
+        // pointing outside the opened dir, even if a future bug let a
+        // tainted name reach here. `dest` itself is something we built
+        // (`<vdir>.part`), so opening it ambiently is safe.
         let mut zst = ruzstd::StreamingDecoder::new(reader)
             .map_err(|e| format!("zstd init for {asset_name}: {e}"))?;
         let stem = asset_name
@@ -35,12 +44,7 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
             .unwrap_or(asset_name);
         let bin_dir = dest.join("bin");
         fs::create_dir_all(&bin_dir).map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
-        let path = bin_dir.join(stem);
-        let mut out =
-            fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
-        io::copy(&mut zst, &mut out).map_err(|e| format!("write {}: {e}", path.display()))?;
-        platform::set_unix_mode(&path, 0o755)
-            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+        write_untrusted_name(&bin_dir, stem, &mut zst)?;
         Ok(())
     } else if let Some(suffix) = unsupported_compression_suffix(&lower) {
         // Catch known compression formats we don't implement before the bare-
@@ -53,16 +57,46 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
     } else {
         // Bare binary: stream directly to a file with the asset's name. On
         // Unix the file is chmod'd +x; on Windows we rely on the `.exe`
-        // extension (the file ships with it).
-        let path = dest.join(asset_name);
-        let mut out =
-            fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        // extension (the file ships with it). asset_name is attacker-
+        // controlled — same cap-std treatment as the .zst path.
         let mut r = reader;
-        io::copy(&mut r, &mut out).map_err(|e| format!("write {}: {e}", path.display()))?;
-        platform::set_unix_mode(&path, 0o755)
-            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+        write_untrusted_name(dest, asset_name, &mut r)?;
         Ok(())
     }
+}
+
+/// Write `name` inside `dir`, refusing any traversal/escape attempt at the
+/// syscall layer. `name` comes from the GitHub release (attacker-controlled);
+/// `dir` is one we built ourselves (`<vdir>.part` or `<vdir>.part/bin`).
+///
+/// Uses `cap_std::fs::Dir::open_ambient_dir` to scope all writes to `dir`.
+/// On Linux this routes through `openat2(RESOLVE_BENEATH)`, which refuses
+/// to traverse `..` or follow symlinks pointing outside the directory —
+/// even if a future code path let a poisoned name reach this function.
+/// macOS and Windows are emulated with equivalent guarantees.
+///
+/// Returns the same error shape as the `fs::File::create` path it replaced,
+/// so callers don't need to change error matching.
+fn write_untrusted_name<R: Read>(dir: &Path, name: &str, mut reader: R) -> Result<(), String> {
+    let capdir = cap_std::fs::Dir::open_ambient_dir(dir, cap_std::ambient_authority())
+        .map_err(|e| format!("open {}: {e}", dir.display()))?;
+    let mut out = capdir
+        .create(name)
+        .map_err(|e| format!("create {}/{name}: {e}", dir.display()))?;
+    io::copy(&mut reader, &mut out).map_err(|e| format!("write {}/{name}: {e}", dir.display()))?;
+    // Chmod via the open file's fd (capability-scoped): even if `name`
+    // would have escaped, we already failed at `capdir.create`. Going
+    // through the std-path `set_permissions(dir.join(name))` here would
+    // be the wrong shape anyway — it'd re-open by path and miss the
+    // protection.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = cap_std::fs::Permissions::from_std(fs::Permissions::from_mode(0o755));
+        out.set_permissions(perms)
+            .map_err(|e| format!("chmod {}/{name}: {e}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// Return a known compression suffix if `lower_name` ends with one we don't
@@ -442,6 +476,70 @@ mod tests {
         let p = tmp.path().join("bin/gvim-9.2.0-x86_64-linux");
         assert_eq!(read_file(&p), payload);
         assert_eq!(mode_of(&p), 0o755);
+    }
+
+    #[test]
+    fn extract_bare_binary_refuses_path_traversal_via_asset_name() {
+        // A malicious release with `asset_name = "../escape"` used to write
+        // outside `dest` (kernel resolves `..` at open(2) time). cap-std's
+        // capability-scoped Dir refuses to traverse `..` at the syscall
+        // layer, so the write fails before touching the filesystem outside
+        // dest.
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("sandbox");
+        fs::create_dir_all(&dest).unwrap();
+        let err = extract("../escape", &b"evil"[..], &dest).unwrap_err();
+        // We don't pin the exact OS error string — cap-std maps RESOLVE_BENEATH
+        // refusal to PermissionDenied on Linux, "the path is outside" on
+        // emulated targets, etc. What matters is the write failed AND nothing
+        // landed at the would-be escape path.
+        assert!(err.contains("create"), "got: {err}");
+        assert!(
+            !parent.path().join("escape").exists(),
+            "escape file was created at {}",
+            parent.path().join("escape").display()
+        );
+    }
+
+    #[test]
+    fn extract_bare_zst_refuses_traversal_in_stem() {
+        // Same protection on the .zst path: a stem like `../escape.zst`
+        // strips to `../escape`, which the cap-std Dir for <dest>/bin
+        // refuses to resolve.
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("sandbox");
+        fs::create_dir_all(&dest).unwrap();
+        let compressed = zstd::encode_all(&b"payload"[..], 3).unwrap();
+        let err = extract("../escape.zst", &compressed[..], &dest).unwrap_err();
+        assert!(err.contains("create"), "got: {err}");
+        assert!(
+            !parent.path().join("escape").exists(),
+            "escape file was created"
+        );
+    }
+
+    #[test]
+    fn extract_bare_binary_refuses_traversal_via_preexisting_symlink() {
+        // Stronger guarantee than the lexical check: even if `dest` somehow
+        // already contained a symlink pointing outside (e.g. left by a
+        // previous buggy run before .part renames landed), cap-std refuses
+        // to follow it. `validate_path_component` alone wouldn't catch
+        // this — the asset_name "sneak/file" is lexically clean.
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("sandbox");
+        fs::create_dir_all(&dest).unwrap();
+        // Plant a symlink inside dest that resolves outside dest:
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("sneak")).unwrap();
+
+        let err = extract("sneak/file", &b"evil"[..], &dest).unwrap_err();
+        assert!(err.contains("create"), "got: {err}");
+        assert!(
+            !outside.join("file").exists(),
+            "wrote through symlink to {}",
+            outside.join("file").display()
+        );
     }
 
     #[test]
