@@ -872,7 +872,30 @@ fn link_all_executables(
     }
 
     let bin = bin_dir();
+    let rdir = repo_dir(&spec.owner, &spec.name);
+
+    // Snapshot of unpin-managed links currently pointing anywhere into this
+    // package's repo dir. After linking the new version we use this to wipe
+    // entries the new version no longer declares — e.g. an alias `lzma` that
+    // v1 had and v2 dropped would otherwise keep pointing at v1's binary
+    // (and also keep v1's vdir alive past `prune`).
+    //
+    // On Windows alias hardlinks aren't introspectable by `read_link`; they
+    // get a separate cleanup pass below keyed on the binary's UNPIN_META.
+    let existing_managed: Vec<PathBuf> = match fs::read_dir(&bin) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let target = platform::read_link(&p)?;
+                target.starts_with(&rdir).then_some(p)
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
     let mut summary = LinkSummary::default();
+    let mut refreshed: Vec<PathBuf> = Vec::new();
     for target in &executables {
         let basename = target
             .file_name()
@@ -881,6 +904,7 @@ fn link_all_executables(
         let short = short_binary_name(basename);
         let link = bin.join(platform::link_filename(short));
         if link_binary(target, &link, assume_yes)? {
+            refreshed.push(link.clone());
             summary.primary.push(short.to_owned());
         }
 
@@ -889,6 +913,9 @@ fn link_all_executables(
         // alias-bearing primaries would just contribute both lists. The
         // catalog-only gate is enforced inside `link_aliases_for`.
         let alias_outcome = link_aliases_for(target, spec, alias_mode, assume_yes)?;
+        for a in &alias_outcome.linked {
+            refreshed.push(bin.join(platform::alias_link_filename(a)));
+        }
         // Dedup across primaries: two binaries declaring the same alias
         // name would silently overwrite each other in bin_dir (last write
         // wins), and the summary line would show "aliases: lzma lzma".
@@ -902,6 +929,59 @@ fn link_all_executables(
             summary.notes.push(note);
         }
     }
+
+    // Orphan cleanup: links that pointed into this repo's vdirs before but
+    // weren't re-issued by this run are from a previous version's manifest.
+    // Removing them keeps `prune` able to reclaim the older vdir later (an
+    // orphan alias would otherwise keep the vdir alive indefinitely).
+    let mut orphans = Vec::new();
+    for old in &existing_managed {
+        if !refreshed.iter().any(|r| r == old) && fs::remove_file(old).is_ok() {
+            orphans.push(
+                old.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+
+    // Windows-only: alias hardlinks have no introspectable target so the
+    // `existing_managed` scan above didn't see them. Derive the name set
+    // from older vdirs' UNPIN_META blocks and remove any name the new
+    // version doesn't declare. `aliases_from_vdir` swallows scan errors —
+    // a corrupted older binary is a degraded but safe outcome here.
+    #[cfg(windows)]
+    {
+        if let Ok(entries) = fs::read_dir(&rdir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let is_old_vdir =
+                    entry.file_type().map(|t| t.is_dir()).unwrap_or(false) && p != vdir;
+                if !is_old_vdir {
+                    continue;
+                }
+                for old_alias in aliases_from_vdir(&p) {
+                    if summary.aliases.iter().any(|a| a == &old_alias) {
+                        continue;
+                    }
+                    let link_p = bin.join(platform::alias_link_filename(&old_alias));
+                    if fs::remove_file(&link_p).is_ok() {
+                        orphans.push(old_alias);
+                    }
+                }
+            }
+        }
+    }
+
+    if !orphans.is_empty() {
+        summary.notes.push(format!(
+            "removed {} orphan link(s) from previous version: {}",
+            orphans.len(),
+            orphans.join(", ")
+        ));
+    }
+
     Ok(summary)
 }
 
