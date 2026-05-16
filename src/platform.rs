@@ -352,20 +352,6 @@ pub fn ensure_executable(p: &Path) -> Result<(), String> {
     }
 }
 
-/// Apply Unix file mode bits. No-op on Windows. Used by `archive` when an
-/// archive entry carries explicit mode bits.
-pub fn set_unix_mode(_p: &Path, _mode: u32) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(_p, fs::Permissions::from_mode(_mode))
-    }
-    #[cfg(windows)]
-    {
-        Ok(())
-    }
-}
-
 /// File name to use on disk for an unpin-managed link with the logical short
 /// name `name`. On Windows appends `.cmd` so the file is invocable via PATHEXT.
 pub fn link_filename(name: &str) -> String {

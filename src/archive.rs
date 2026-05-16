@@ -2,8 +2,6 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use crate::platform;
-
 pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
 
@@ -137,6 +135,10 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
 }
 
 fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    let dir = cap_std::fs::Dir::open_ambient_dir(dest, cap_std::ambient_authority())
+        .map_err(|e| format!("open {}: {e}", dest.display()))?;
+
     // When read_zipfile_from_stream encounters the central directory it has
     // already consumed some bytes from the stream — exactly how many is an
     // internal detail of the zip crate. To recover those bytes we sit a pass-
@@ -147,9 +149,9 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
     // so the consumed prefix always fits, regardless of crate internals.
     const TAIL: usize = 128;
     let mut filter = CdFilter::new(reader, TAIL);
-    // Name → on-disk path map, so we can chmod each file by the same name the
-    // CD entry uses without re-deriving safe paths.
-    let mut paths: Vec<(String, PathBuf)> = Vec::new();
+    // raw_name → relative path map, so we can chmod each file by the same
+    // name the CD entry uses. Relative paths are what cap-std works with.
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
 
     while let Some(mut entry) = zip::read::read_zipfile_from_stream(&mut filter)
         .map_err(|e| format!("read zip entry: {e}"))?
@@ -159,20 +161,23 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
             Some(p) => p,
             None => continue,
         };
-        let out_path = dest.join(rel);
         if entry.is_dir() {
-            fs::create_dir_all(&out_path)
-                .map_err(|e| format!("mkdir {}: {e}", out_path.display()))?;
-            paths.push((raw_name, out_path));
+            dir.create_dir_all(&rel)
+                .map_err(|e| format!("mkdir {}: {e}", rel.display()))?;
+            entries.push((raw_name, rel));
             continue;
         }
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        if let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            dir.create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
-        let mut out = fs::File::create(&out_path)
-            .map_err(|e| format!("create {}: {e}", out_path.display()))?;
-        io::copy(&mut entry, &mut out).map_err(|e| format!("write {}: {e}", out_path.display()))?;
-        paths.push((raw_name, out_path));
+        let mut out = dir
+            .create(&rel)
+            .map_err(|e| format!("create {}: {e}", rel.display()))?;
+        io::copy(&mut entry, &mut out).map_err(|e| format!("write {}: {e}", rel.display()))?;
+        entries.push((raw_name, rel));
     }
 
     // Drain the rest of the stream — this is the remainder of the CD + EOCD.
@@ -190,23 +195,36 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
         .position(|w| w == CD_SIG)
         .unwrap_or(cd_buf.len());
     let modes = parse_central_directory(&cd_buf[cd_start..]);
-    for (name, path) in &paths {
-        if let Some(mode) = modes.get(name) {
-            let _ = platform::set_unix_mode(path, *mode);
-        } else {
-            // Zip made on a non-Unix host doesn't encode permissions. Fall
-            // back to detecting ELF/shebang and promoting to 0o755.
-            if let Ok(mut f) = fs::File::open(path) {
-                let mut head = [0u8; 4];
-                let n = f.read(&mut head).unwrap_or(0);
-                let is_elf = n >= 4 && &head[..4] == b"\x7fELF";
-                let is_shebang = n >= 2 && &head[..2] == b"#!";
-                if is_elf || is_shebang {
-                    let _ = platform::set_unix_mode(path, 0o755);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for (name, rel) in &entries {
+            let mode = if let Some(&m) = modes.get(name) {
+                Some(m)
+            } else {
+                // Zip made on a non-Unix host doesn't encode permissions. Fall
+                // back to detecting ELF/shebang and promoting to 0o755. Reading
+                // via `dir.open` keeps the capability scope.
+                match dir.open(rel) {
+                    Ok(mut f) => {
+                        let mut head = [0u8; 4];
+                        let n = f.read(&mut head).unwrap_or(0);
+                        let is_elf = n >= 4 && &head[..4] == b"\x7fELF";
+                        let is_shebang = n >= 2 && &head[..2] == b"#!";
+                        if is_elf || is_shebang { Some(0o755) } else { None }
+                    }
+                    Err(_) => None,
                 }
+            };
+            if let Some(m) = mode {
+                let perms = cap_std::fs::Permissions::from_std(fs::Permissions::from_mode(m));
+                let _ = dir.set_permissions(rel, perms);
             }
         }
     }
+    #[cfg(not(unix))]
+    let _ = (entries, modes); // suppress unused warnings on Windows
     Ok(())
 }
 
