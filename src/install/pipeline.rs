@@ -65,13 +65,22 @@ impl InstallOptions {
 pub struct ExtractJob {
     pub spec: Spec,
     pub release: Release,
+    /// Final on-disk location after a successful extract. Reads (linking,
+    /// `run`'s exec) use this path. Set even for cached jobs.
     pub vdir: PathBuf,
+    /// Sibling staging directory (`<vdir>.part`) that holds the partial tree
+    /// while extraction is in progress. After all tasks succeed, `do_extract`
+    /// renames `extract_dir` → `vdir` atomically. If the process is killed
+    /// mid-extract (SIGKILL, OOM, power loss), only `.part` survives and the
+    /// cache check `vdir.is_dir()` correctly classifies the package as not
+    /// installed. Cached jobs leave this equal to `vdir` and never write.
+    pub extract_dir: PathBuf,
     /// `None` → already cached, worker skips the download path entirely.
     pub asset: Option<Asset>,
     pub expected_sha256: Option<String>,
     /// Data tarball companion (e.g. `<pkg>-<tag>-data.tar.zst`) bundled with the
-    /// release. Extracted into the same `vdir` after the primary. `None` for
-    /// packages without runtime data (the common case).
+    /// release. Extracted into the same `extract_dir` after the primary.
+    /// `None` for packages without runtime data (the common case).
     pub companion: Option<Asset>,
     pub companion_expected_sha256: Option<String>,
     /// Cross-process lock on the package's `repo_dir`. Held from preflight
@@ -79,6 +88,15 @@ pub struct ExtractJob {
     /// linking. `None` for cached jobs (no write happens, no lock needed).
     /// Field is private so the lock can only be released via Drop.
     _lock: Option<RepoLock>,
+}
+
+/// Append `.part` to the final component of `vdir`. The result is a sibling
+/// path inside the same parent (same NTFS volume / same Unix filesystem), so
+/// the trailing `fs::rename` to `vdir` is guaranteed to be cheap and atomic.
+fn part_dir_for(vdir: &Path) -> PathBuf {
+    let mut name = vdir.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    vdir.with_file_name(name)
 }
 
 /// Serial preflight: pick asset, resolve checksum, decide if download is needed.
@@ -111,6 +129,7 @@ pub fn preflight_extract(
         return Ok(ExtractJob {
             spec,
             release,
+            extract_dir: vdir.clone(),
             vdir,
             asset: None,
             expected_sha256: None,
@@ -125,9 +144,18 @@ pub fn preflight_extract(
     // prompt would force a parallel install on the same package to error
     // out while the user is at coffee.
     let lock = RepoLock::acquire(&repo_dir(&spec.owner, &spec.name))?;
+    let extract_dir = part_dir_for(&vdir);
     // --pick (or incomplete cache) on a cached version: wipe before re-extracting.
+    // Also wipe a leftover `.part` from a previous run that got SIGKILL'd between
+    // extract and rename — without this the second attempt would start from a
+    // half-populated tree and `archive::extract` would error on the first entry
+    // that collides.
     if vdir.is_dir() {
         fs::remove_dir_all(&vdir).map_err(|e| format!("remove {}: {e}", vdir.display()))?;
+    }
+    if extract_dir.is_dir() {
+        fs::remove_dir_all(&extract_dir)
+            .map_err(|e| format!("remove {}: {e}", extract_dir.display()))?;
     }
     let expected_sha256 = match find_checksum_url(&release.assets, &asset.name) {
         Some(url) => Some(fetch_expected_sha256(ctx, &url)?),
@@ -176,6 +204,7 @@ pub fn preflight_extract(
         spec,
         release,
         vdir,
+        extract_dir,
         asset: Some(asset),
         expected_sha256,
         companion,
@@ -196,12 +225,15 @@ struct ProgressContext<'a> {
 
 /// Orchestrate one ExtractJob: download+extract primary, and (if present)
 /// data companion **concurrently** via `thread::scope`. They write disjoint
-/// subtrees of the same vdir (e.g. `bin/` vs `share/`), so there's no
-/// contention. Bars must be pre-added to `multi` on the main thread — see
-/// the comment in `parallel_extract` for why.
+/// subtrees of the same `.part` staging tree (e.g. `bin/` vs `share/`), so
+/// there's no contention. Bars must be pre-added to `multi` on the main
+/// thread — see the comment in `parallel_extract` for why.
 ///
-/// Per-job cleanup (sigint hook + CleanupGuard) is armed here and only
-/// disarmed when *all* tasks succeed; any failure rolls back the vdir.
+/// Per-job cleanup (sigint hook + CleanupGuard) is armed against the
+/// `.part` directory and only disarmed once `fs::rename(.part → vdir)`
+/// succeeds. A failed extract — or a process-wide ctrl-c — leaves only
+/// `.part` on disk, so the next `vdir.is_dir()` cache check correctly
+/// classifies the package as not installed.
 pub fn do_extract(
     ctx: &Ctx,
     job: &ExtractJob,
@@ -214,8 +246,8 @@ pub fn do_extract(
     };
     let rdir = repo_dir(&job.spec.owner, &job.spec.name);
     fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
-    crate::sigint::push_cleanup(&job.vdir);
-    let mut guard = CleanupGuard::arm(job.vdir.clone());
+    crate::sigint::push_cleanup(&job.extract_dir);
+    let mut guard = CleanupGuard::arm(job.extract_dir.clone());
 
     let repo = job.spec.repo();
     let primary_ui = ProgressContext {
@@ -235,7 +267,7 @@ pub fn do_extract(
         // finalization (clear on Ok, red+abandon on Err) inside
         // `download_extract_verify`, so the UI doesn't wait on the slowest leg
         // before showing failures. The join below propagates the first error;
-        // CleanupGuard then wipes the vdir for a clean retry.
+        // CleanupGuard then wipes the .part dir for a clean retry.
         let (r_prim, r_comp) = thread::scope(|s| {
             let h_prim = s.spawn(|| {
                 download_extract_verify(
@@ -243,7 +275,7 @@ pub fn do_extract(
                     &primary_ui,
                     primary_asset,
                     job.expected_sha256.as_deref(),
-                    &job.vdir,
+                    &job.extract_dir,
                 )
             });
             let h_comp = s.spawn(|| {
@@ -252,7 +284,7 @@ pub fn do_extract(
                     &companion_ui,
                     companion,
                     job.companion_expected_sha256.as_deref(),
-                    &job.vdir,
+                    &job.extract_dir,
                 )
             });
             (h_prim.join().unwrap(), h_comp.join().unwrap())
@@ -264,12 +296,25 @@ pub fn do_extract(
             &primary_ui,
             primary_asset,
             job.expected_sha256.as_deref(),
-            &job.vdir,
+            &job.extract_dir,
         )
     };
 
+    let result = result.and_then(|()| {
+        // Atomic publish step. The two paths are siblings under the same
+        // parent dir (same filesystem on every supported OS), so rename is
+        // a metadata-only operation — no half-rename window. After this
+        // succeeds the package looks installed; before, it doesn't.
+        fs::rename(&job.extract_dir, &job.vdir).map_err(|e| {
+            format!(
+                "rename {} -> {}: {e}",
+                job.extract_dir.display(),
+                job.vdir.display()
+            )
+        })
+    });
     if result.is_ok() {
-        crate::sigint::pop_cleanup(&job.vdir);
+        crate::sigint::pop_cleanup(&job.extract_dir);
         guard.disarm();
     }
     result
@@ -663,5 +708,24 @@ mod tests {
     fn pick_jobs_never_returns_zero() {
         assert_eq!(pick_jobs(0, 0), 1);
         assert_eq!(pick_jobs(4, 0), 1);
+    }
+
+    #[test]
+    fn part_dir_is_sibling_of_vdir() {
+        // Rename's atomicity guarantee depends on this — the `.part` must
+        // live under the same parent dir (same filesystem on every supported
+        // platform) so `fs::rename` is metadata-only and uninterruptible.
+        let v = PathBuf::from("/data/owner/repo/v1.2.3");
+        let p = part_dir_for(&v);
+        assert_eq!(p, PathBuf::from("/data/owner/repo/v1.2.3.part"));
+        assert_eq!(p.parent(), v.parent());
+    }
+
+    #[test]
+    fn part_dir_handles_dot_in_tag() {
+        // The tag has dots (typical for semver). part_dir_for should append
+        // `.part` to the whole file_name, not to the stem.
+        let v = PathBuf::from("/data/o/r/14.1.0");
+        assert_eq!(part_dir_for(&v).file_name().unwrap(), "14.1.0.part");
     }
 }
