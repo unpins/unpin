@@ -11,7 +11,6 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 pub fn data_dir() -> PathBuf {
     #[cfg(unix)]
@@ -456,11 +455,20 @@ pub fn create_alias_link(target: &Path, link_path: &Path) -> io::Result<()> {
     }
 }
 
-/// RAII guard around a sentinel lock file. The file is removed on drop — the
-/// normal happy path releases the lock automatically. Ctrl-C is the caller's
-/// problem (register the path with `sigint::push_cleanup` to cover it).
+/// RAII guard around a kernel-level advisory file lock. The open `File`
+/// inside is what holds the lock — dropping it releases the flock at the
+/// OS level whether `Drop` runs cleanly (normal exit) or not (SIGKILL,
+/// OOM, power loss, `panic = "abort"`). That replaces the old mtime-based
+/// "stale lock" heuristic, which had a TOCTOU race during takeover and
+/// would spuriously steal locks from slow real installs.
+///
+/// The sentinel file at `path` stays on disk after Drop just to make the
+/// failure mode visible to a user investigating "why is unpin stuck"; the
+/// file's presence is *not* what gates the lock, so a leftover is harmless.
+/// We still remove it cosmetically when releasing cleanly.
 #[derive(Debug)]
 pub struct InstallLock {
+    file: fs::File,
     path: PathBuf,
 }
 
@@ -472,56 +480,60 @@ impl InstallLock {
 
 impl Drop for InstallLock {
     fn drop(&mut self) {
+        // unlock() can fail (e.g. fd already invalidated); ignore — the
+        // upcoming File::drop closes the fd, which releases the kernel
+        // lock regardless. The remove_file is cosmetic; it can fail when
+        // rdir was wiped underneath us (e.g. by `remove_one`).
+        let _ = self.file.unlock();
         let _ = fs::remove_file(&self.path);
     }
 }
 
-/// Acquire an advisory lock at `<repo_dir>/.unpin.lock`. Two `unpin` processes
-/// touching the same package serialize on this lock; different packages run
-/// fully in parallel. Lock files older than `stale_after` are taken over —
-/// this covers SIGKILL / power-loss scenarios where the previous holder
-/// couldn't run its `Drop`. Ctrl-C is handled separately via the sigint
-/// cleanup hook.
+/// Acquire an exclusive advisory lock on `<repo_dir>/.unpin.lock`. Two `unpin`
+/// processes touching the same package serialize here; different packages run
+/// fully in parallel.
 ///
-/// Implementation is a portable `O_CREAT | O_EXCL` (`create_new` in std). No
-/// `flock`/`LockFileEx` dependency.
-pub fn acquire_install_lock(repo_dir: &Path, stale_after: Duration) -> Result<InstallLock, String> {
+/// Uses `File::try_lock` (stable since Rust 1.89) which maps to `flock` on
+/// Unix and `LockFileEx` on Windows. The kernel releases the lock when the
+/// file descriptor closes for *any* reason, so crashes don't leave stale
+/// locks — no timeout heuristic needed.
+pub fn acquire_install_lock(repo_dir: &Path) -> Result<InstallLock, String> {
     fs::create_dir_all(repo_dir).map_err(|e| format!("create {}: {e}", repo_dir.display()))?;
     let lock_path = repo_dir.join(".unpin.lock");
-    loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut f) => {
-                // PID + creation time inside the file are diagnostic only —
-                // a user looking at a stuck lock can grep `ps` for the PID.
-                use std::io::Write;
-                let _ = writeln!(f, "pid={}", std::process::id());
-                return Ok(InstallLock { path: lock_path });
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&lock_path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|mt| mt.elapsed().ok())
-                    .map(|age| age > stale_after)
-                    .unwrap_or(false);
-                if stale {
-                    let _ = fs::remove_file(&lock_path);
-                    continue;
-                }
-                return Err(format!(
-                    "another `unpin install`/`update` is in progress for this package\n  \
-                     lock: {}\n  \
-                     remove the file manually if you're sure no other unpin is running",
-                    lock_path.display()
-                ));
-            }
-            Err(e) => return Err(format!("create lock {}: {e}", lock_path.display())),
+    // `truncate(false)` — we don't blow away the diagnostic PID line another
+    // unpin may have written. `write(true) + create(true)` is enough for our
+    // needs; the file body is informational only.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("open lock {}: {e}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            return Err(format!(
+                "another `unpin install`/`update` is in progress for this package\n  \
+                 lock: {}",
+                lock_path.display()
+            ));
+        }
+        Err(fs::TryLockError::Error(e)) => {
+            return Err(format!("lock {}: {e}", lock_path.display()));
         }
     }
+    // Best-effort diagnostic — a user who finds a stuck `unpin` can grep the
+    // pid to see which process is sitting on the lock. truncate-then-write
+    // because the open didn't truncate.
+    use std::io::{Seek, SeekFrom, Write};
+    let _ = file.set_len(0);
+    let mut f = &file;
+    let _ = f.seek(SeekFrom::Start(0));
+    let _ = writeln!(f, "pid={}", std::process::id());
+    Ok(InstallLock {
+        file,
+        path: lock_path,
+    })
 }
 
 /// Read the target path from an unpin-managed link, or `None` if `p` isn't one.
@@ -671,7 +683,7 @@ mod tests {
     fn install_lock_acquire_creates_file_and_drop_removes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
-        let lock = acquire_install_lock(&repo, Duration::from_secs(3600)).unwrap();
+        let lock = acquire_install_lock(&repo).unwrap();
         let lock_path = repo.join(".unpin.lock");
         assert!(lock_path.exists());
         drop(lock);
@@ -682,22 +694,38 @@ mod tests {
     fn install_lock_second_acquire_fails_while_first_held() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
-        let _lock = acquire_install_lock(&repo, Duration::from_secs(3600)).unwrap();
-        let err = acquire_install_lock(&repo, Duration::from_secs(3600)).unwrap_err();
+        let _lock = acquire_install_lock(&repo).unwrap();
+        let err = acquire_install_lock(&repo).unwrap_err();
         assert!(err.contains("in progress"), "got: {err}");
     }
 
     #[test]
-    fn install_lock_stale_lock_is_taken_over() {
-        // Simulate a lock from a process that died without running Drop:
-        // create the file, then ask for it with a stale_after of 0 so it's
-        // immediately considered abandoned.
+    fn install_lock_released_when_first_holder_drops() {
+        // Crash recovery is implicit in flock semantics: when a process dies
+        // (SIGKILL, panic-abort, power-loss) the kernel drops the lock as
+        // soon as the fd closes. We can't kill ourselves mid-test, but
+        // dropping the lock exercises the same code path — fd close → lock
+        // released → second acquire succeeds.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("owner/name");
+        let first = acquire_install_lock(&repo).unwrap();
+        drop(first);
+        let second = acquire_install_lock(&repo).unwrap();
+        assert_eq!(second.path(), repo.join(".unpin.lock"));
+    }
+
+    #[test]
+    fn install_lock_takes_over_orphan_file_from_dead_holder() {
+        // Sentinel file from a previous run that died without unlocking:
+        // the file is on disk but no process holds the kernel flock. A
+        // fresh acquire must succeed (no mtime-based staleness check
+        // needed — the kernel knows nobody owns it).
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
         fs::create_dir_all(&repo).unwrap();
         let lock_path = repo.join(".unpin.lock");
-        fs::write(&lock_path, "pid=99999").unwrap();
-        let lock = acquire_install_lock(&repo, Duration::from_secs(0)).unwrap();
+        fs::write(&lock_path, "pid=99999\n").unwrap();
+        let lock = acquire_install_lock(&repo).unwrap();
         assert_eq!(lock.path(), lock_path);
     }
 

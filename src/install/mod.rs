@@ -2,7 +2,6 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
@@ -128,26 +127,26 @@ pub(super) fn prompt_yes_no(question: &str) -> bool {
 /// Cross-process advisory lock at `<repo_dir>/.unpin.lock`. Wraps
 /// [`platform::InstallLock`] to integrate with the sigint cleanup hook —
 /// holding this guard guarantees the lock file is removed on normal Drop,
-/// process panic, *and* SIGINT (ctrl-c) without leaking a stale lock.
+/// process panic, *and* SIGINT (ctrl-c).
 ///
 /// Hold this for the smallest window that fully covers the destructive
 /// operation: pipeline.rs holds one from preflight through linking; prune
 /// and remove_one each grab one for the duration of their `remove_dir_all`
 /// pass. Reads (info, list) deliberately skip the lock — they tolerate the
 /// occasional racy result instead of paying for serialization.
+///
+/// The underlying primitive is `File::try_lock` (stable since Rust 1.89),
+/// not a sentinel-file dance: the kernel owns the lock state and releases
+/// it on fd close, including SIGKILL/panic-abort/power-loss. The sentinel
+/// file path is still cosmetic so a user finding `.unpin.lock` knows what
+/// it is.
 pub(super) struct RepoLock {
     inner: platform::InstallLock,
 }
 
 impl RepoLock {
-    /// 1-hour stale window: long enough that a slow install on a thin
-    /// network doesn't get its lock stolen, short enough that a genuinely
-    /// abandoned lock (SIGKILL, power loss) recovers automatically without
-    /// requiring the user to find and `rm` the file.
-    pub(super) const STALE_AFTER: Duration = Duration::from_secs(3600);
-
     pub(super) fn acquire(repo_dir: &Path) -> Result<Self, String> {
-        let inner = platform::acquire_install_lock(repo_dir, Self::STALE_AFTER)?;
+        let inner = platform::acquire_install_lock(repo_dir)?;
         crate::sigint::push_cleanup(inner.path());
         Ok(Self { inner })
     }
