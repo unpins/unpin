@@ -42,6 +42,14 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
         platform::set_unix_mode(&path, 0o755)
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
         Ok(())
+    } else if let Some(suffix) = unsupported_compression_suffix(&lower) {
+        // Catch known compression formats we don't implement before the bare-
+        // binary fallthrough would silently write the compressed bytes to
+        // disk under the asset's name. The user would see "Installed" and
+        // then a binary that's actually a tarball.
+        Err(format!(
+            "unsupported compression `{suffix}` for asset `{asset_name}`"
+        ))
     } else {
         // Bare binary: stream directly to a file with the asset's name. On
         // Unix the file is chmod'd +x; on Windows we rely on the `.exe`
@@ -55,6 +63,34 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
         Ok(())
     }
+}
+
+/// Return a known compression suffix if `lower_name` ends with one we don't
+/// handle. The `auxiliary_keys()` picker filter already drops most of these
+/// upstream (`.deb`, `.rpm`, etc.), but a few — like `.gz` alone, or
+/// `.tar.bz2` — can slip through if the release names a primary asset that
+/// way. Reaching `extract` with such a name means the picker accepted it; we
+/// fail loudly here rather than write the compressed bytes as a "binary".
+///
+/// Longer suffixes are listed first so `.tar.bz2` returns `.tar.bz2`, not
+/// `.bz2`.
+fn unsupported_compression_suffix(lower_name: &str) -> Option<&'static str> {
+    const SUFFIXES: &[&str] = &[
+        ".tar.bz2",
+        ".tar.lz4",
+        ".tar.lzma",
+        ".tar.lz",
+        ".tar.lzo",
+        ".tar.br",
+        ".bz2",
+        ".lz4",
+        ".lzma",
+        ".lzo",
+        ".br",
+        ".gz",
+        ".xz",
+    ];
+    SUFFIXES.iter().copied().find(|s| lower_name.ends_with(s))
 }
 
 fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
@@ -372,6 +408,28 @@ mod tests {
         let p = tmp.path().join("downloaded-binary");
         assert_eq!(read_file(&p), bytes);
         assert_eq!(mode_of(&p), 0o755);
+    }
+
+    #[test]
+    fn extract_rejects_unsupported_compression() {
+        // .gz alone (not .tar.gz) and .tar.bz2 used to fall through to the
+        // bare-binary path, leaving compressed bytes on disk under a name the
+        // user thought was the binary. Both should now error explicitly.
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract("tool.gz", &b"junk"[..], tmp.path()).unwrap_err();
+        assert!(err.contains("unsupported"), "got: {err}");
+        let err = extract("tool.tar.bz2", &b"junk"[..], tmp.path()).unwrap_err();
+        assert!(err.contains(".tar.bz2"), "got: {err}");
+    }
+
+    #[test]
+    fn unsupported_suffix_table_prefers_longer_match() {
+        // `.tar.bz2` and `.bz2` both match — the longer one (which conveys
+        // "we don't do bzip2-compressed tars") should win.
+        assert_eq!(
+            unsupported_compression_suffix("tool.tar.bz2"),
+            Some(".tar.bz2")
+        );
     }
 
     #[test]
