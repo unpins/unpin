@@ -51,12 +51,21 @@ pub fn classify_excluded(name_lower: &str) -> Option<&'static str> {
     None
 }
 
-pub fn pick_asset<'a>(
+/// Filter+narrow the release's assets down to those that match the current
+/// platform. Pure compute — never prompts and never touches stdin/stdout.
+/// `pick_asset` wraps this with the interactive prompt when narrowing
+/// leaves more than one candidate (or `--pick` forces a prompt).
+///
+/// Returns the final candidate list (always non-empty). When the list has
+/// exactly one element and `!force_pick`, the caller can use it directly;
+/// otherwise the caller must prompt. Errors only when no asset matches
+/// the platform at all.
+pub fn narrow_assets<'a>(
     assets: &'a [Asset],
     repo_name: &str,
     force_pick: bool,
     verbose: bool,
-) -> Result<&'a Asset, String> {
+) -> Result<Vec<&'a Asset>, String> {
     let arch_keys = platform::current_arch_keys();
 
     let mut selectable: Vec<&Asset> = Vec::new();
@@ -131,13 +140,23 @@ pub fn pick_asset<'a>(
                 .join("\n")
         ));
     }
+    Ok(candidates)
+}
+
+pub fn pick_asset<'a>(
+    assets: &'a [Asset],
+    repo_name: &str,
+    force_pick: bool,
+    verbose: bool,
+) -> Result<&'a Asset, String> {
+    let candidates = narrow_assets(assets, repo_name, force_pick, verbose)?;
     if !force_pick && candidates.len() == 1 {
         return Ok(candidates[0]);
     }
     prompt_pick(&candidates)
 }
 
-fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, String> {
+pub(super) fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, String> {
     let header = if candidates.len() == 1 {
         "Available asset:"
     } else {

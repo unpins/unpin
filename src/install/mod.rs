@@ -10,16 +10,20 @@ use crate::github::{self, Release};
 use crate::platform;
 
 mod asset;
+mod job;
 mod linker;
 mod pipeline;
+mod prompt;
 mod spec;
 
 use asset::pick_asset;
+use job::{PipelineMode, PipelineRequest};
 #[cfg(windows)]
 use linker::aliases_from_vdir;
-use linker::{ensure_executable, is_executable, sweep_dangling_links, walk_files};
+use linker::{ensure_executable, is_executable, sweep_dangling_links, walk_binary_candidates};
 pub use pipeline::InstallOptions;
-use pipeline::{do_extract, preflight_extract, run_pipeline};
+use pipeline::{do_extract, finalize_primary_bar, preflight_extract, run_pipeline_v2};
+use prompt::{PromptResult, prompt_pick_with_skip};
 use spec::validate_path_component;
 pub use spec::{Spec, parse_spec};
 
@@ -37,6 +41,36 @@ pub(super) fn repo_dir(owner: &str, name: &str) -> PathBuf {
 
 pub(super) fn version_dir(owner: &str, name: &str, tag: &str) -> PathBuf {
     repo_dir(owner, name).join(tag)
+}
+
+/// Sibling-staging dirs created by the extract pipeline (`<tag>.part`)
+/// live alongside real version dirs in `repo_dir/`. Reads that enumerate
+/// installed versions for the user (list/info/prune/remove) need to skip
+/// them — otherwise a half-finished extract or a SIGKILL'd run shows up
+/// as a phantom version named e.g. `v0.1.0.part`. The string check has
+/// to match what `pipeline::part_dir_for` produces (just appends `.part`).
+fn is_part_dir_name(name: &str) -> bool {
+    name.ends_with(".part")
+}
+
+/// Keep the first occurrence of each `same`-class in `items`, preserving
+/// input order. Shared by every multi-arg subcommand (install/update/info/
+/// remove) so they handle `cmd foo foo` (or `cmd tree unpins/tree`)
+/// uniformly: the pipeline runs once per unique target instead of racing
+/// on the same vdir or printing the same info block twice.
+///
+/// Linear `O(N²)` scan: argv lengths stay in the single digits in
+/// practice, and avoiding a `Hash`/`Eq` bound lets callers compare by
+/// whatever projection is natural (parsed `Spec`, resolved
+/// `(owner, repo)`, raw string).
+fn dedup_keep_first<T>(items: Vec<T>, mut same: impl FnMut(&T, &T) -> bool) -> Vec<T> {
+    let mut out: Vec<T> = Vec::with_capacity(items.len());
+    for it in items {
+        if !out.iter().any(|prev| same(prev, &it)) {
+            out.push(it);
+        }
+    }
+    out
 }
 
 /// Search the data dir for a repo matching `name`. Accepts "owner/repo" or a
@@ -92,9 +126,9 @@ fn resolve_installed(name: &str) -> Result<Option<(String, String)>, String> {
 /// ordering trips on common tags (`v1.10.0` < `v1.9.0`), giving wrong answers
 /// in `info` ("Active: v1.9.0" when nothing is linked) and `update` (wrong
 /// "from" in the `from -> to` line). Returning `None` is honest and the
-/// pipeline handles it fine: `preflight_extract` sees the cached vdir and
+/// pipeline handles it fine: `preflight_resolve` sees the cached vdir and
 /// skips the download, so `update` just re-links without re-downloading.
-fn active_version(owner: &str, name: &str) -> Option<String> {
+pub(super) fn active_version(owner: &str, name: &str) -> Option<String> {
     let rdir = repo_dir(owner, name);
     let bins = fs::read_dir(bin_dir()).ok()?;
     for entry in bins.flatten() {
@@ -177,17 +211,97 @@ pub fn install_many(ctx: &Ctx, opts: &InstallOptions, inputs: &[String]) -> Resu
         .iter()
         .map(|s| parse_spec(s).map(|sp| (s.clone(), sp)))
         .collect::<Result<_, _>>()?;
-    // Dedup, preserving first-seen order: two identical args (or two args
-    // that normalize to the same spec, e.g. "ripgrep" and "unpins/ripgrep")
-    // would otherwise race on the same vdir in the parallel phase. Linear
-    // scan is fine — N is the CLI arg count.
-    let mut specs: Vec<(String, Spec)> = Vec::with_capacity(parsed.len());
-    for (label, spec) in parsed {
-        if !specs.iter().any(|(_, s)| s == &spec) {
-            specs.push((label, spec));
+    // Dedup by parsed Spec so `install tree unpins/tree` collapses — both
+    // normalize to the same target and a parallel run would otherwise race
+    // on the same vdir.
+    let specs = dedup_keep_first(parsed, |a, b| a.1 == b.1);
+    // Same `(owner, name)` with different `version` survives the Spec
+    // equality dedup but can't all install — bin/ symlinks point to a
+    // single version. Resolve to one entry per repo (prompt or `--yes`
+    // takes the last). Done before any pipeline work so no bar UX has
+    // to deal with the conflict.
+    let specs = resolve_argv_version_collisions(specs, opts.assume_yes)?;
+    let requests: Vec<PipelineRequest> = specs
+        .into_iter()
+        .map(|(label, spec)| PipelineRequest { label, spec })
+        .collect();
+    run_pipeline_v2(ctx, opts, PipelineMode::Install, requests, Vec::new())
+}
+
+/// When argv specifies the same `owner/repo` multiple times with different
+/// `@version` tags, the bin-dir symlink layout can only point to one of
+/// them. Group by `(owner, name)`; for each group of 2+ entries, either
+/// prompt the user to pick one (TTY) or — under `--yes` — keep the last
+/// entry in input order, matching the user contract "instala o último".
+///
+/// Honors the same "prompt nunca falha" contract as the rest of the
+/// pipeline: invalid input retries, `s` (or EOF / non-TTY) skips the whole
+/// colliding group as non-fatal. A hidden `MultiProgress` is passed only to
+/// reuse the shared prompt helper — no bars are active at this point so the
+/// `suspend()` wrap is a no-op.
+fn resolve_argv_version_collisions(
+    parsed: Vec<(String, Spec)>,
+    assume_yes: bool,
+) -> Result<Vec<(String, Spec)>, String> {
+    // Group indices by (owner, name). Small N — linear scan is fine.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, (_, spec)) in parsed.iter().enumerate() {
+        let pos = groups.iter().position(|g| {
+            let head = &parsed[g[0]].1;
+            head.owner == spec.owner && head.name == spec.name
+        });
+        match pos {
+            Some(p) => groups[p].push(i),
+            None => groups.push(vec![i]),
         }
     }
-    run_pipeline(ctx, opts, specs, Vec::new())
+    let has_conflict = groups.iter().any(|g| g.len() > 1);
+    // Lazily build a hidden MultiProgress only when needed — `prompt_pick_with_skip`
+    // requires a reference even though `suspend()` on a hidden target is a no-op.
+    let hidden_multi = if has_conflict && !assume_yes {
+        Some(MultiProgress::with_draw_target(ProgressDrawTarget::hidden()))
+    } else {
+        None
+    };
+    let mut keep = vec![true; parsed.len()];
+    for group in &groups {
+        if group.len() < 2 {
+            continue;
+        }
+        let head = &parsed[group[0]].1;
+        let owner = &head.owner;
+        let name = &head.name;
+        let winner: Option<usize> = if assume_yes {
+            let chosen = *group.last().unwrap();
+            eprintln!(
+                "warning: {owner}/{name} specified with {} different versions; installing {} (last specified)",
+                group.len(),
+                parsed[chosen].0
+            );
+            Some(chosen)
+        } else {
+            let header =
+                format!("{owner}/{name} specified with {} different versions:", group.len());
+            let items: Vec<String> = group.iter().map(|&i| parsed[i].0.clone()).collect();
+            // Safe to unwrap: has_conflict is true here, so hidden_multi was built.
+            match prompt_pick_with_skip(hidden_multi.as_ref().unwrap(), &header, &items) {
+                PromptResult::Got(n) => Some(group[n]),
+                // Skip drops the entire conflicting group from the run.
+                // Non-fatal: other packages in the argv list keep going.
+                PromptResult::Skip => None,
+            }
+        };
+        for &i in group {
+            if Some(i) != winner {
+                keep[i] = false;
+            }
+        }
+    }
+    Ok(parsed
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, x)| keep[i].then_some(x))
+        .collect())
 }
 
 pub fn list() -> Result<(), String> {
@@ -223,6 +337,9 @@ pub fn list() -> Result<(), String> {
                     continue;
                 }
                 let v = ver_entry.file_name().to_string_lossy().into_owned();
+                if is_part_dir_name(&v) {
+                    continue;
+                }
                 rows.push((owner.clone(), repo.clone(), v));
             }
         }
@@ -277,7 +394,10 @@ pub fn remove_many(names: &[String], assume_yes: bool) -> Result<(), String> {
         }
         all.into_iter().map(|(o, r)| format!("{o}/{r}")).collect()
     } else {
-        names.to_vec()
+        // Raw-string dedup so `remove tree tree` doesn't try to remove the
+        // package twice (second call would error "not installed" since the
+        // first already wiped it — non-fatal but ugly output).
+        dedup_keep_first(names.to_vec(), |a, b| a == b)
     };
 
     let mut failures = 0usize;
@@ -312,6 +432,7 @@ fn remove_one(name: &str) -> Result<(), String> {
             it.flatten()
                 .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| !is_part_dir_name(n))
                 .collect()
         })
         .unwrap_or_default();
@@ -367,16 +488,14 @@ pub fn update(ctx: &Ctx, opts: &InstallOptions, names: &[String]) -> Result<(), 
     let targets: Vec<(String, String)> = if names.is_empty() {
         installed_repos()
     } else {
-        // Dedup, preserving first-seen order: `update foo foo` (or
-        // `update foo unpins/foo`) would otherwise race on the same vdir.
-        let mut out: Vec<(String, String)> = Vec::with_capacity(names.len());
-        for n in names {
-            let r = resolve_installed(n)?.ok_or_else(|| format!("not installed: {n}"))?;
-            if !out.contains(&r) {
-                out.push(r);
-            }
-        }
-        out
+        // Resolve each name to (owner, repo) first, then dedup so
+        // `update foo foo` (or `update foo unpins/foo`) collapses to a
+        // single pipeline entry instead of racing on the same vdir.
+        let resolved: Vec<(String, String)> = names
+            .iter()
+            .map(|n| resolve_installed(n)?.ok_or_else(|| format!("not installed: {n}")))
+            .collect::<Result<_, _>>()?;
+        dedup_keep_first(resolved, |a, b| a == b)
     };
 
     if targets.is_empty() {
@@ -384,35 +503,22 @@ pub fn update(ctx: &Ctx, opts: &InstallOptions, names: &[String]) -> Result<(), 
         return Ok(());
     }
 
-    // Resolve which packages actually need an update before kicking off the
-    // pipeline — so users see "up to date" lines and `-j` doesn't waste workers
-    // on no-ops. Up-to-date / failed resolutions never reach the pipeline.
-    let mut errors: Vec<String> = Vec::new();
-    let mut specs: Vec<(String, Spec)> = Vec::new();
-    for (owner, repo) in &targets {
-        let spec = Spec {
-            owner: owner.clone(),
-            name: repo.clone(),
-            version: None,
-        };
-        let release = match github::fetch_latest(ctx, &spec.repo()) {
-            Ok(r) => r,
-            Err(e) => {
-                errors.push(format!("unpin: {owner}/{repo}: {e}"));
-                continue;
-            }
-        };
-        let current = active_version(owner, repo);
-        if current.as_deref() == Some(release.tag_name.as_str()) {
-            println!("{owner}/{repo}: up to date ({})", release.tag_name);
-            continue;
-        }
-        let from = current.as_deref().unwrap_or("(none)");
-        println!("{owner}/{repo}: {} -> {}", from, release.tag_name);
-        specs.push((format!("{owner}/{repo}"), spec));
-    }
-
-    run_pipeline(ctx, opts, specs, errors)
+    // The dispatcher decides "up to date" via PipelineMode::Update — no
+    // separate pre-fetch loop here. Every target becomes a request; the
+    // per-package bar lifecycle in run_pipeline_v2 emits the "Up to date"
+    // / "v1 -> v2" announcement in-place on the bar.
+    let requests: Vec<PipelineRequest> = targets
+        .into_iter()
+        .map(|(owner, repo)| PipelineRequest {
+            label: format!("{owner}/{repo}"),
+            spec: Spec {
+                owner,
+                name: repo,
+                version: None,
+            },
+        })
+        .collect();
+    run_pipeline_v2(ctx, opts, PipelineMode::Update, requests, Vec::new())
 }
 
 fn installed_repos() -> Vec<(String, String)> {
@@ -445,6 +551,11 @@ fn installed_repos() -> Vec<(String, String)> {
 }
 
 pub fn info_many(ctx: &Ctx, inputs: &[String]) -> Result<(), String> {
+    // Raw-string dedup so `info tree tree` doesn't print the block twice.
+    // We don't normalize ("tree" vs "unpins/tree") here — info() handles
+    // both inputs internally and the cost of normalizing just to dedup
+    // would be a filesystem read per arg for no real user benefit.
+    let inputs = dedup_keep_first(inputs.to_vec(), |a, b| a == b);
     let mut failures = 0usize;
     for (i, input) in inputs.iter().enumerate() {
         if i > 0 {
@@ -470,6 +581,7 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
             .flatten()
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !is_part_dir_name(n))
             .collect();
         versions.sort();
         let active = active_version(&owner, &repo);
@@ -571,6 +683,20 @@ pub fn prune() -> Result<(), String> {
                 continue;
             }
             let vpath = ver_entry.path();
+            let v = ver_entry.file_name().to_string_lossy().into_owned();
+            // Stale `.part` from a crashed install (SIGKILL'd between
+            // extract and rename). The RepoLock above guarantees no
+            // install is currently writing this dir, so the cleanup
+            // is safe. We don't gate on `linked_targets` because `.part`
+            // dirs are never linked.
+            if is_part_dir_name(&v) {
+                if fs::remove_dir_all(&vpath).is_ok() {
+                    let tag = v.strip_suffix(".part").unwrap_or(&v);
+                    println!("Removed stale extraction {owner}/{repo}@{tag}");
+                    removed += 1;
+                }
+                continue;
+            }
             if linked_targets.iter().any(|t| t.starts_with(&vpath)) {
                 continue;
             }
@@ -587,7 +713,6 @@ pub fn prune() -> Result<(), String> {
                     removed += 1;
                 }
             }
-            let v = ver_entry.file_name().to_string_lossy().into_owned();
             if fs::remove_dir_all(&vpath).is_ok() {
                 println!("Removed orphan {owner}/{repo}@{v}");
                 removed += 1;
@@ -652,8 +777,8 @@ pub fn run(
         } else {
             MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
         };
-        // multi.add before set_style/set_prefix — see comment in parallel_extract
-        // about ghost rows from stderr-direct ticks on freshly-constructed bars.
+        // multi.add before set_style/set_prefix — a tick before `multi.add`
+        // writes a ghost row to stderr that lingers in scrollback.
         let bar = multi.add(ProgressBar::new(0));
         bar.set_style(github::download_progress_style());
         bar.set_prefix(format!("{} {}", spec.name, release.tag_name));
@@ -671,7 +796,9 @@ pub fn run(
             }
             cb
         });
-        do_extract(ctx, &job, &bar, cbar.as_ref(), &multi)?;
+        let result = do_extract(ctx, &job, &bar, cbar.as_ref(), &multi);
+        finalize_primary_bar(&bar, &result);
+        result?;
     } else {
         let has_links = fs::read_dir(bin_dir())
             .map(|it| {
@@ -694,7 +821,8 @@ pub fn run(
     drop(job);
 
     let mut files = Vec::new();
-    walk_files(&vdir, &mut files).map_err(|e| format!("walk {}: {e}", vdir.display()))?;
+    walk_binary_candidates(&vdir, &mut files)
+        .map_err(|e| format!("walk {}: {e}", vdir.display()))?;
     let executables: Vec<PathBuf> = files.iter().filter(|p| is_executable(p)).cloned().collect();
     let bin = match executables.len() {
         0 => {
@@ -739,5 +867,100 @@ pub fn run(
                 Ok(1)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_keep_first_preserves_order_and_removes_later_dups() {
+        let v = vec!["a", "b", "a", "c", "b", "d"];
+        let out = dedup_keep_first(v, |x, y| x == y);
+        assert_eq!(out, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn dedup_keep_first_handles_empty_and_singletons() {
+        let empty: Vec<i32> = dedup_keep_first(Vec::new(), |a, b| a == b);
+        assert!(empty.is_empty());
+        let single = dedup_keep_first(vec![42], |a, b| a == b);
+        assert_eq!(single, vec![42]);
+    }
+
+    #[test]
+    fn dedup_keep_first_compares_via_projection() {
+        // Same use case as install_many: dedup by the second tuple field
+        // while keeping the first ("label") of the winner intact.
+        let v = vec![("first", 1), ("second", 1), ("third", 2)];
+        let out = dedup_keep_first(v, |a, b| a.1 == b.1);
+        assert_eq!(out, vec![("first", 1), ("third", 2)]);
+    }
+
+    #[test]
+    fn is_part_dir_name_matches_only_dot_part_suffix() {
+        assert!(is_part_dir_name("v1.0.0.part"));
+        assert!(is_part_dir_name(".part"));
+        assert!(!is_part_dir_name("v1.0.0"));
+        assert!(!is_part_dir_name("part"));
+        assert!(!is_part_dir_name("partial"));
+    }
+
+    fn mk(label: &str, owner: &str, name: &str, version: Option<&str>) -> (String, Spec) {
+        (
+            label.into(),
+            Spec {
+                owner: owner.into(),
+                name: name.into(),
+                version: version.map(|v| v.into()),
+            },
+        )
+    }
+
+    #[test]
+    fn argv_collision_no_conflict_returns_unchanged() {
+        let input = vec![
+            mk("htop", "unpins", "htop", None),
+            mk("tree@v2", "unpins", "tree", Some("v2")),
+        ];
+        let out = resolve_argv_version_collisions(input, true).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "htop");
+        assert_eq!(out[1].0, "tree@v2");
+    }
+
+    #[test]
+    fn argv_collision_assume_yes_keeps_last_per_repo() {
+        // foo/bar specified with v1 and v2; assume_yes keeps the last.
+        // Order of unrelated entries is preserved.
+        let input = vec![
+            mk("alpha", "u", "alpha", None),
+            mk("foo/bar@v1", "foo", "bar", Some("v1")),
+            mk("zeta", "u", "zeta", None),
+            mk("foo/bar@v2", "foo", "bar", Some("v2")),
+        ];
+        let out = resolve_argv_version_collisions(input, true).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0, "alpha");
+        assert_eq!(out[1].0, "zeta");
+        assert_eq!(out[2].0, "foo/bar@v2");
+    }
+
+    #[test]
+    fn argv_collision_non_tty_without_yes_skips_group() {
+        // cargo test runs with a piped stdin (non-TTY), so the collision
+        // prompt auto-skips per the shared `prompt_pick_with_skip` contract.
+        // The whole conflicting group is dropped non-fatally; unrelated
+        // entries pass through.
+        let input = vec![
+            mk("alpha", "u", "alpha", None),
+            mk("foo/bar@v1", "foo", "bar", Some("v1")),
+            mk("foo/bar@v2", "foo", "bar", Some("v2")),
+            mk("zeta", "u", "zeta", None),
+        ];
+        let out = resolve_argv_version_collisions(input, false).unwrap();
+        let labels: Vec<&str> = out.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(labels, vec!["alpha", "zeta"]);
     }
 }

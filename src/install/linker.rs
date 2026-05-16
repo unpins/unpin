@@ -13,11 +13,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use indicatif::MultiProgress;
+
 use crate::aliases::{self, AliasMode};
 use crate::platform;
 
+use super::prompt::{PromptResult, prompt_yes_no_with_skip};
 use super::spec::{CATALOG_OWNER, Spec};
-use super::{bin_dir, data_dir, prompt_yes_no, repo_dir};
+use super::{bin_dir, data_dir, repo_dir};
 
 pub fn walk_files(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(root)? {
@@ -29,6 +32,29 @@ pub fn walk_files(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
         } else if ft.is_file() {
             out.push(path);
         }
+    }
+    Ok(())
+}
+
+/// Walk a vdir for files that might become PATH entries: top-level files
+/// (a single-binary release that puts the binary at the root) and anything
+/// inside `bin/` (the canonical location for catalog packages). Skips
+/// `share/`, `lib/`, `etc/`, `libexec/` and any other subtree shipped by a
+/// runtime-data tarball — those are full of scripts (`.pl`, `.awk`, `.sh`)
+/// with +x set that we have no business promoting into the user's PATH.
+/// vim's `share/vim/runtime/tools/*.pl` is the concrete case that motivated
+/// this restriction.
+pub fn walk_binary_candidates(vdir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    if let Ok(entries) = fs::read_dir(vdir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                out.push(entry.path());
+            }
+        }
+    }
+    let bin = vdir.join("bin");
+    if bin.is_dir() {
+        walk_files(&bin, out)?;
     }
     Ok(())
 }
@@ -65,7 +91,12 @@ fn short_binary_name(name: &str) -> &str {
     }
 }
 
-fn link_binary(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, String> {
+fn link_binary(
+    multi: &MultiProgress,
+    target: &Path,
+    link: &Path,
+    assume_yes: bool,
+) -> Result<bool, String> {
     let parent = link.parent().ok_or("link has no parent")?;
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
 
@@ -78,11 +109,15 @@ fn link_binary(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, Str
                 "{} already exists and was not installed by unpin. Overwrite?",
                 link.display()
             );
-            if !prompt_yes_no(&q) {
-                eprintln!(
+            let overwrite = match prompt_yes_no_with_skip(multi, &q) {
+                PromptResult::Got(true) => true,
+                PromptResult::Got(false) | PromptResult::Skip => false,
+            };
+            if !overwrite {
+                let _ = multi.println(format!(
                     "Skipped {}",
                     link.file_name().unwrap_or_default().to_string_lossy()
-                );
+                ));
                 return Ok(false);
             }
         }
@@ -105,13 +140,15 @@ pub struct LinkSummary {
 }
 
 pub fn link_all_executables(
+    multi: &MultiProgress,
     spec: &Spec,
     vdir: &Path,
     assume_yes: bool,
     alias_mode: AliasMode,
 ) -> Result<LinkSummary, String> {
     let mut files = Vec::new();
-    walk_files(vdir, &mut files).map_err(|e| format!("walk {}: {e}", vdir.display()))?;
+    walk_binary_candidates(vdir, &mut files)
+        .map_err(|e| format!("walk {}: {e}", vdir.display()))?;
 
     let mut executables: Vec<PathBuf> =
         files.iter().filter(|p| is_executable(p)).cloned().collect();
@@ -158,7 +195,7 @@ pub fn link_all_executables(
             .ok_or("non-utf8 binary name")?;
         let short = short_binary_name(basename);
         let link = bin.join(platform::link_filename(short));
-        if link_binary(target, &link, assume_yes)? {
+        if link_binary(multi, target, &link, assume_yes)? {
             refreshed.push(link.clone());
             summary.primary.push(short.to_owned());
         }
@@ -167,7 +204,7 @@ pub fn link_all_executables(
         // most packages have one, but a multi-binary release with two
         // alias-bearing primaries would just contribute both lists. The
         // catalog-only gate is enforced inside `link_aliases_for`.
-        let alias_outcome = link_aliases_for(target, spec, alias_mode, assume_yes)?;
+        let alias_outcome = link_aliases_for(multi, target, spec, alias_mode, assume_yes)?;
         for a in &alias_outcome.linked {
             refreshed.push(bin.join(platform::alias_link_filename(a)));
         }
@@ -249,6 +286,7 @@ struct AliasOutcome {
 }
 
 fn link_aliases_for(
+    multi: &MultiProgress,
     primary: &Path,
     spec: &Spec,
     alias_mode: AliasMode,
@@ -296,7 +334,10 @@ fn link_aliases_for(
                 spec.repo(),
                 meta.aliases.join(", ")
             );
-            prompt_yes_no(&q)
+            match prompt_yes_no_with_skip(multi, &q) {
+                PromptResult::Got(true) => true,
+                PromptResult::Got(false) | PromptResult::Skip => false,
+            }
         }
     };
     if !install {
@@ -327,7 +368,7 @@ fn link_aliases_for(
     let mut skipped: Vec<String> = Vec::new();
     for name in &meta.aliases {
         let link_path = bin.join(platform::alias_link_filename(name));
-        if link_alias(primary, &link_path, assume_yes)? {
+        if link_alias(multi, primary, &link_path, assume_yes)? {
             linked.push(name.clone());
         } else {
             // `link_alias` returned Ok(false): user declined an overwrite
@@ -356,7 +397,12 @@ fn link_aliases_for(
 /// Create an alias link at `link`, prompting on collision the same way
 /// `link_binary` does. The actual filesystem op (`platform::create_alias_link`)
 /// is symlink on Unix and NTFS hardlink on Windows.
-fn link_alias(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, String> {
+fn link_alias(
+    multi: &MultiProgress,
+    target: &Path,
+    link: &Path,
+    assume_yes: bool,
+) -> Result<bool, String> {
     let parent = link.parent().ok_or("alias link has no parent")?;
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
 
@@ -374,11 +420,15 @@ fn link_alias(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, Stri
                 "{} already exists and was not installed by unpin. Overwrite (alias)?",
                 link.display()
             );
-            if !prompt_yes_no(&q) {
-                eprintln!(
+            let overwrite = match prompt_yes_no_with_skip(multi, &q) {
+                PromptResult::Got(true) => true,
+                PromptResult::Got(false) | PromptResult::Skip => false,
+            };
+            if !overwrite {
+                let _ = multi.println(format!(
                     "Skipped alias {}",
                     link.file_name().unwrap_or_default().to_string_lossy()
-                );
+                ));
                 return Ok(false);
             }
         }
@@ -482,5 +532,44 @@ mod tests {
     #[test]
     fn short_name_first_marker_wins() {
         assert_eq!(short_binary_name("rg-linux-amd64"), "rg");
+    }
+
+    #[test]
+    fn walk_binary_candidates_skips_share_subtree() {
+        // Regression test for the linker.rs scope fix. vim's data tarball
+        // ships scripts under `share/vim/runtime/tools/*.pl` with +x set —
+        // those used to be promoted into PATH because the linker walked the
+        // whole vdir recursively. The candidate walk now stops at top-level
+        // files and the `bin/` subtree.
+        let tmp = tempfile::tempdir().unwrap();
+        let v = tmp.path();
+        fs::create_dir_all(v.join("bin")).unwrap();
+        fs::create_dir_all(v.join("share/vim/runtime/tools")).unwrap();
+        fs::create_dir_all(v.join("lib")).unwrap();
+        fs::write(v.join("top-binary"), b"x").unwrap();
+        fs::write(v.join("bin/inner"), b"x").unwrap();
+        fs::write(
+            v.join("share/vim/runtime/tools/efm_filter.pl"),
+            b"#!/usr/bin/perl\n",
+        )
+        .unwrap();
+        fs::write(v.join("lib/libfoo.so"), b"x").unwrap();
+
+        let mut out = Vec::new();
+        walk_binary_candidates(v, &mut out).unwrap();
+        let names: Vec<String> = out
+            .iter()
+            .map(|p| p.strip_prefix(v).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"top-binary".to_string()), "got: {names:?}");
+        assert!(names.contains(&"bin/inner".to_string()), "got: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains("share/")),
+            "share/ leaked into candidates: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("lib/")),
+            "lib/ leaked into candidates: {names:?}"
+        );
     }
 }

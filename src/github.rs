@@ -204,3 +204,30 @@ pub fn download_error_style() -> ProgressStyle {
         .unwrap()
         .progress_chars("▰▰▱")
 }
+
+/// Spinner-mode style for a per-package bar between phases (Queued/Resolving/
+/// Linking). The prefix is the owner/repo label; `wide_msg` carries the
+/// current state. Uses a steady-tick spinner so the bar visibly "lives" while
+/// the worker is doing network I/O.
+pub fn idle_style() -> ProgressStyle {
+    ProgressStyle::with_template("  {prefix:.cyan}  {spinner:.green}  {wide_msg}").unwrap()
+}
+
+/// Final style for a package that installed/updated successfully. Green
+/// prefix with check mark and a message (typically "Installed v1.2.3
+/// (binaries)"). Drawn once via `finish_with_message` and stays on screen.
+pub fn done_ok_style() -> ProgressStyle {
+    ProgressStyle::with_template("  {prefix:.green}  ✓  {wide_msg:.green}").unwrap()
+}
+
+/// Final style for a package the user opted to skip (typed `s` at a prompt,
+/// or non-TTY auto-skipped). Yellow, non-fatal.
+pub fn done_skip_style() -> ProgressStyle {
+    ProgressStyle::with_template("  {prefix:.yellow}  ⊘  {wide_msg:.yellow}").unwrap()
+}
+
+/// Final style for a package that failed (network, checksum, lock contention,
+/// link conflict). Red — distinguishes a hard failure from a user skip.
+pub fn done_fail_style() -> ProgressStyle {
+    ProgressStyle::with_template("  {prefix:.red}  ✗  {wide_msg:.red}").unwrap()
+}
