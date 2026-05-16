@@ -8,6 +8,11 @@ pub fn install() {
     let _ = ctrlc::set_handler(|| {
         if let Ok(mut g) = CLEANUP.lock() {
             for p in g.drain(..) {
+                // Cleanup list mixes vdirs (directories) and lock files
+                // (regular files). Try both — one errors silently, the
+                // other succeeds, depending on which kind `p` is. Cheaper
+                // than tracking the kind alongside each entry.
+                let _ = std::fs::remove_file(&p);
                 let _ = std::fs::remove_dir_all(&p);
             }
         }

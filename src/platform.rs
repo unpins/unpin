@@ -11,6 +11,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub fn data_dir() -> PathBuf {
     #[cfg(unix)]
@@ -455,6 +456,74 @@ pub fn create_alias_link(target: &Path, link_path: &Path) -> io::Result<()> {
     }
 }
 
+/// RAII guard around a sentinel lock file. The file is removed on drop — the
+/// normal happy path releases the lock automatically. Ctrl-C is the caller's
+/// problem (register the path with `sigint::push_cleanup` to cover it).
+#[derive(Debug)]
+pub struct InstallLock {
+    path: PathBuf,
+}
+
+impl InstallLock {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Acquire an advisory lock at `<repo_dir>/.unpin.lock`. Two `unpin` processes
+/// touching the same package serialize on this lock; different packages run
+/// fully in parallel. Lock files older than `stale_after` are taken over —
+/// this covers SIGKILL / power-loss scenarios where the previous holder
+/// couldn't run its `Drop`. Ctrl-C is handled separately via the sigint
+/// cleanup hook.
+///
+/// Implementation is a portable `O_CREAT | O_EXCL` (`create_new` in std). No
+/// `flock`/`LockFileEx` dependency.
+pub fn acquire_install_lock(repo_dir: &Path, stale_after: Duration) -> Result<InstallLock, String> {
+    fs::create_dir_all(repo_dir).map_err(|e| format!("create {}: {e}", repo_dir.display()))?;
+    let lock_path = repo_dir.join(".unpin.lock");
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                // PID + creation time inside the file are diagnostic only —
+                // a user looking at a stuck lock can grep `ps` for the PID.
+                use std::io::Write;
+                let _ = writeln!(f, "pid={}", std::process::id());
+                return Ok(InstallLock { path: lock_path });
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|mt| mt.elapsed().ok())
+                    .map(|age| age > stale_after)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+                return Err(format!(
+                    "another `unpin install`/`update` is in progress for this package\n  \
+                     lock: {}\n  \
+                     remove the file manually if you're sure no other unpin is running",
+                    lock_path.display()
+                ));
+            }
+            Err(e) => return Err(format!("create lock {}: {e}", lock_path.display())),
+        }
+    }
+}
+
 /// Read the target path from an unpin-managed link, or `None` if `p` isn't one.
 /// On Unix this is `fs::read_link`. On Windows the wrapper must start with the
 /// `WINDOWS_WRAPPER_MARKER` line — any other `.cmd` (user-written batch script,
@@ -594,6 +663,42 @@ mod tests {
         assert_eq!(f, "rg");
         #[cfg(windows)]
         assert_eq!(f, "rg.cmd");
+    }
+
+    // ---- InstallLock ----
+
+    #[test]
+    fn install_lock_acquire_creates_file_and_drop_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("owner/name");
+        let lock = acquire_install_lock(&repo, Duration::from_secs(3600)).unwrap();
+        let lock_path = repo.join(".unpin.lock");
+        assert!(lock_path.exists());
+        drop(lock);
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn install_lock_second_acquire_fails_while_first_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("owner/name");
+        let _lock = acquire_install_lock(&repo, Duration::from_secs(3600)).unwrap();
+        let err = acquire_install_lock(&repo, Duration::from_secs(3600)).unwrap_err();
+        assert!(err.contains("in progress"), "got: {err}");
+    }
+
+    #[test]
+    fn install_lock_stale_lock_is_taken_over() {
+        // Simulate a lock from a process that died without running Drop:
+        // create the file, then ask for it with a stale_after of 0 so it's
+        // immediately considered abandoned.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("owner/name");
+        fs::create_dir_all(&repo).unwrap();
+        let lock_path = repo.join(".unpin.lock");
+        fs::write(&lock_path, "pid=99999").unwrap();
+        let lock = acquire_install_lock(&repo, Duration::from_secs(0)).unwrap();
+        assert_eq!(lock.path(), lock_path);
     }
 
     #[test]
