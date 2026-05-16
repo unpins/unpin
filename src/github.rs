@@ -74,18 +74,35 @@ fn github_error_message(body: &[u8]) -> Option<String> {
         .map(|e: ErrorBody| e.message)
 }
 
+/// Hard cap on bodies read by [`download`]. Used for checksum files (tens of
+/// bytes in practice). A malicious or misbehaving server could otherwise send
+/// gigabytes and exhaust memory before the body even reaches the parser.
+const DOWNLOAD_CAP_BYTES: u64 = 64 * 1024;
+
 /// Convenience download into memory. Used for small payloads (checksum files).
 /// Renders no progress. Called only from the serial preflight phase, so a raw
 /// `eprintln!` for the verbose URL log is safe (no `MultiProgress` rendering
 /// to race against).
+///
+/// Bodies are capped at [`DOWNLOAD_CAP_BYTES`] — if a server returns more, the
+/// call fails rather than buffering an unbounded response. Callers fetching
+/// large payloads (release assets) should go through [`download_stream_into`].
 pub fn download(ctx: &Ctx, url: &str) -> Result<Vec<u8>, String> {
     if ctx.verbose {
         eprintln!("  GET {url}");
     }
     let bar = ProgressBar::hidden();
     let mut buf = Vec::new();
-    let mut reader = download_stream_into(ctx, url, &bar)?;
-    std::io::copy(&mut reader, &mut buf).map_err(|e| format!("read {url}: {e}"))?;
+    let reader = download_stream_into(ctx, url, &bar)?;
+    // take(N+1) so we can detect the "exceeded the cap" case: if the cap fits
+    // exactly, take(N) would also succeed and we'd miss the overflow.
+    let mut capped = reader.take(DOWNLOAD_CAP_BYTES + 1);
+    std::io::copy(&mut capped, &mut buf).map_err(|e| format!("read {url}: {e}"))?;
+    if buf.len() as u64 > DOWNLOAD_CAP_BYTES {
+        return Err(format!(
+            "response exceeded {DOWNLOAD_CAP_BYTES}-byte cap for {url}"
+        ));
+    }
     Ok(buf)
 }
 

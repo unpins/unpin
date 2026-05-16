@@ -72,10 +72,15 @@ pub fn parse_spec(input: &str) -> Result<Spec, String> {
         Some((b, v)) => (b, Some(v.to_owned())),
         None => (input, None),
     };
+    if let Some(ref v) = version {
+        validate_path_component(v, "version")?;
+    }
     if let Some((owner, name)) = base.split_once('/') {
         if owner.is_empty() || name.is_empty() || name.contains('/') {
             return Err(format!("invalid package spec: `{input}`"));
         }
+        validate_path_component(owner, "owner")?;
+        validate_path_component(name, "name")?;
         return Ok(Spec {
             owner: owner.to_owned(),
             name: name.to_owned(),
@@ -85,11 +90,35 @@ pub fn parse_spec(input: &str) -> Result<Spec, String> {
     if base.is_empty() {
         return Err("empty package name".into());
     }
+    validate_path_component(base, "name")?;
     Ok(Spec {
         owner: CATALOG_OWNER.to_owned(),
         name: base.to_owned(),
         version,
     })
+}
+
+/// Reject strings that aren't safe to use as a single filesystem-path
+/// component. Catches empty/dot/dotdot, leading `-` (option-flag confusion),
+/// path separators, and control bytes. Applied to user-supplied owner/name/
+/// version AND to `tag_name` returned by the GitHub API — a malicious release
+/// could otherwise smuggle traversal into `version_dir(...)`.
+fn validate_path_component(s: &str, what: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err(format!("empty {what}"));
+    }
+    if s == "." || s == ".." {
+        return Err(format!("invalid {what}: `{s}`"));
+    }
+    if s.starts_with('-') {
+        return Err(format!("invalid {what} (starts with `-`): `{s}`"));
+    }
+    for b in s.bytes() {
+        if b < 0x20 || b == 0x7f || b == b'/' || b == b'\\' || b == b':' {
+            return Err(format!("invalid {what} (forbidden byte): `{s}`"));
+        }
+    }
+    Ok(())
 }
 
 fn data_dir() -> PathBuf {
@@ -420,10 +449,15 @@ fn link_binary(target: &Path, link: &Path, assume_yes: bool) -> Result<bool, Str
 
 fn fetch_release(ctx: &Ctx, spec: &Spec) -> Result<Release, String> {
     let repo = spec.repo();
-    match &spec.version {
-        Some(tag) => github::fetch_tag(ctx, &repo, tag),
-        None => github::fetch_latest(ctx, &repo),
-    }
+    let release = match &spec.version {
+        Some(tag) => github::fetch_tag(ctx, &repo, tag)?,
+        None => github::fetch_latest(ctx, &repo)?,
+    };
+    // tag_name is published by the upstream repo and goes straight into a
+    // filesystem path via `version_dir`. A malicious release with a tag like
+    // `../../tmp/x` would otherwise let the upstream escape `data_dir/`.
+    validate_path_component(&release.tag_name, "tag from upstream release")?;
+    Ok(release)
 }
 
 /// Result of the serial preflight: enough to extract+verify in a worker without
@@ -1847,6 +1881,52 @@ mod tests {
         // split_once splits on the FIRST '/', so "a/b/c" leaves "b/c" as repo —
         // rejected because repo contains '/'.
         assert!(parse_spec("a/b/c").is_err());
+    }
+
+    #[test]
+    fn parse_spec_rejects_path_traversal_in_owner_or_name() {
+        // The downstream `version_dir(owner, name, tag)` joins these into a
+        // filesystem path. Refuse `.`/`..`/leading-dash/control bytes so user
+        // typos or sloppy scripts don't accidentally escape `data_dir`.
+        for input in [
+            "../foo",
+            "foo/..",
+            "./foo",
+            "foo/.",
+            "-bad/repo",
+            "owner/-bad",
+            "foo\\bar/x",
+            "owner/foo:bar",
+        ] {
+            assert!(parse_spec(input).is_err(), "{input} should fail");
+        }
+    }
+
+    #[test]
+    fn parse_spec_rejects_bad_version() {
+        // `@version` is forwarded to a URL path component and (when the API
+        // echoes it back as tag_name) to a filesystem path.
+        assert!(parse_spec("foo/bar@..").is_err());
+        assert!(parse_spec("foo/bar@-v1").is_err());
+        assert!(parse_spec("foo/bar@v1/2").is_err());
+    }
+
+    // ---- validate_path_component ----
+
+    #[test]
+    fn validate_path_component_accepts_typical_names() {
+        for s in ["foo", "BurntSushi", "ripgrep", "v1.2.3", "release_v1"] {
+            assert!(validate_path_component(s, "x").is_ok(), "{s}");
+        }
+    }
+
+    #[test]
+    fn validate_path_component_rejects_traversal_and_control() {
+        for s in [
+            "", ".", "..", "-leading", "foo/bar", "foo\\bar", "foo:bar", "foo\0bar", "foo\nbar",
+        ] {
+            assert!(validate_path_component(s, "x").is_err(), "{s:?}");
+        }
     }
 
     // ---- classify_excluded ----
