@@ -97,6 +97,19 @@ fn write_untrusted_name<R: Read>(dir: &Path, name: &str, mut reader: R) -> Resul
     Ok(())
 }
 
+/// Best-effort clear of whatever's at `path` so a fresh entry of a different
+/// kind can take its place. `dir.create()` doesn't replace dirs and
+/// `dir.symlink()` doesn't replace regular files, so without this helper
+/// a tarball that intentionally rewrites a path (file → dir, dir → symlink)
+/// errors out mid-extract. cap-std refuses traversal so neither call can
+/// touch anything outside the cap dir; both errors are silently ignored
+/// because exactly one of the two will succeed (or both fail with ENOENT
+/// for fresh extracts, which is fine).
+fn remove_existing(dir: &cap_std::fs::Dir, path: &Path) {
+    let _ = dir.remove_file(path);
+    let _ = dir.remove_dir_all(path);
+}
+
 /// Return a known compression suffix if `lower_name` ends with one we don't
 /// handle. The `auxiliary_keys()` picker filter already drops most of these
 /// upstream (`.deb`, `.rpm`, etc.), but a few — like `.gz` alone, or
@@ -189,10 +202,10 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                 }
                 // set_overwrite(true) equivalent: drop a stale entry first
                 // so the create() that follows doesn't trip over an
-                // already-symlinked path (mostly a no-op since we extract
-                // into a freshly-wiped .part, but cheap insurance for
-                // tarballs that intentionally duplicate paths).
-                let _ = dir.remove_file(&path);
+                // already-symlinked or already-directory path. Tarballs
+                // sometimes rewrite a path between kinds across entries;
+                // remove_file alone leaks a dir → file replacement.
+                remove_existing(&dir, &path);
                 let mut out = dir
                     .create(&path)
                     .map_err(|e| format!("create {}: {e}", path.display()))?;
@@ -217,7 +230,7 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                     .link_name()
                     .map_err(|e| format!("symlink target for {}: {e}", path.display()))?
                     .ok_or_else(|| format!("symlink {} has empty target", path.display()))?;
-                let _ = dir.remove_file(&path);
+                remove_existing(&dir, &path);
                 // cap-std refuses creating a symlink that would itself
                 // escape, AND refuses following symlinks that point
                 // outside on subsequent opens (RESOLVE_BENEATH). So even
@@ -248,7 +261,7 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                     .link_name()
                     .map_err(|e| format!("hardlink src for {}: {e}", path.display()))?
                     .ok_or_else(|| format!("hardlink {} has empty src", path.display()))?;
-                let _ = dir.remove_file(&path);
+                remove_existing(&dir, &path);
                 dir.hard_link(&*src, &dir, &path)
                     .map_err(|e| format!("hardlink {}: {e}", path.display()))?;
             }
@@ -294,9 +307,12 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
     // so the consumed prefix always fits, regardless of crate internals.
     const TAIL: usize = 128;
     let mut filter = CdFilter::new(reader, TAIL);
-    // raw_name → relative path map, so we can chmod each file by the same
-    // name the CD entry uses. Relative paths are what cap-std works with.
-    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    // raw_name → relative path, kept separately for files vs directories so
+    // we can chmod files inline and defer dir chmods to the end (same
+    // reason as in unpack_tar: locking a parent to 0o555 inline blocks
+    // mkdir of its descendants).
+    let mut file_entries: Vec<(String, PathBuf)> = Vec::new();
+    let mut dir_entries: Vec<(String, PathBuf)> = Vec::new();
 
     while let Some(mut entry) = zip::read::read_zipfile_from_stream(&mut filter)
         .map_err(|e| format!("read zip entry: {e}"))?
@@ -309,7 +325,7 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
         if entry.is_dir() {
             dir.create_dir_all(&rel)
                 .map_err(|e| format!("mkdir {}: {e}", rel.display()))?;
-            entries.push((raw_name, rel));
+            dir_entries.push((raw_name, rel));
             continue;
         }
         if let Some(parent) = rel.parent()
@@ -318,11 +334,12 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
             dir.create_dir_all(parent)
                 .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
+        remove_existing(&dir, &rel);
         let mut out = dir
             .create(&rel)
             .map_err(|e| format!("create {}: {e}", rel.display()))?;
         io::copy(&mut entry, &mut out).map_err(|e| format!("write {}: {e}", rel.display()))?;
-        entries.push((raw_name, rel));
+        file_entries.push((raw_name, rel));
     }
 
     // Drain the rest of the stream — this is the remainder of the CD + EOCD.
@@ -344,7 +361,9 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for (name, rel) in &entries {
+        // Files first — they're leaves, so chmod-ing them can't block
+        // anything else. ELF/shebang fallback only applies to files.
+        for (name, rel) in &file_entries {
             let mode = if let Some(&m) = modes.get(name) {
                 Some(m)
             } else {
@@ -371,9 +390,24 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                 let _ = dir.set_permissions(rel, perms);
             }
         }
+        // Then dirs, deepest-first. Same rationale as in unpack_tar: a zip
+        // declaring a 0o555 dir would otherwise lock us out before we
+        // chmod-ed its children, if we did this inline during the loop.
+        // We sort after the loop so the order in the CD doesn't matter.
+        dir_entries.sort_by(|a, b| {
+            b.1.as_os_str()
+                .as_encoded_bytes()
+                .cmp(a.1.as_os_str().as_encoded_bytes())
+        });
+        for (name, rel) in &dir_entries {
+            if let Some(&m) = modes.get(name) {
+                let perms = cap_std::fs::Permissions::from_std(fs::Permissions::from_mode(m));
+                let _ = dir.set_permissions(rel, perms);
+            }
+        }
     }
     #[cfg(not(unix))]
-    let _ = (entries, modes); // suppress unused warnings on Windows
+    let _ = (file_entries, dir_entries, modes); // suppress unused warnings on Windows
     Ok(())
 }
 
@@ -755,6 +789,72 @@ mod tests {
             "wrote through symlink to {}",
             outside.join("file").display()
         );
+    }
+
+    #[test]
+    fn extract_tar_with_readonly_dir_then_descendant_does_not_lock_out() {
+        // Regression test for the deferred-dir-perms fix. A tar that emits a
+        // read-only Directory entry (mode 0o555) BEFORE its contents would,
+        // with inline chmod, lock out the subsequent `dir.create("share/x")`
+        // with EACCES — that's the bug we hit installing unpins/tree on top
+        // of a Nix-built tarball. The fix defers dir chmods to the end of
+        // unpacking and applies them deepest-first.
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_path("share/").unwrap();
+        h.set_size(0);
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mode(0o555);
+        h.set_cksum();
+        builder.append(&h, std::io::empty()).unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_path("share/inside").unwrap();
+        let body = b"docs body";
+        h.set_size(body.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        builder.append(&h, &body[..]).unwrap();
+        let bytes = builder.into_inner().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.tar", &bytes[..], tmp.path()).unwrap();
+        let p = tmp.path().join("share/inside");
+        assert_eq!(read_file(&p), body);
+        assert_eq!(mode_of(&p), 0o644);
+        // The dir itself should end up with the declared read-only mode —
+        // proving the deferred chmod did fire, not just got silently skipped.
+        assert_eq!(mode_of(&tmp.path().join("share")), 0o555);
+
+        // Chmod back so tempdir teardown can recurse-delete.
+        fs::set_permissions(tmp.path().join("share"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn extract_zip_with_readonly_dir_does_not_lock_out() {
+        // Mirror of the tar regression test, exercising the zip codepath
+        // post-fix #1 (zip dir perms now deferred to end of unpacking).
+        // Without the defer, the dir-entry's 0o555 chmod fires before
+        // "share/inside" is written, breaking extraction.
+        let mut zw = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let dir_opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o555);
+        zw.add_directory("share", dir_opts).unwrap();
+        let file_opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o644);
+        zw.start_file("share/inside", file_opts).unwrap();
+        zw.write_all(b"docs body").unwrap();
+        let bytes = zw.finish().unwrap().into_inner();
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.zip", &bytes[..], tmp.path()).unwrap();
+        let p = tmp.path().join("share/inside");
+        assert_eq!(read_file(&p), b"docs body");
+        assert_eq!(mode_of(&p), 0o644);
+        assert_eq!(mode_of(&tmp.path().join("share")), 0o555);
+
+        fs::set_permissions(tmp.path().join("share"), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
