@@ -245,7 +245,6 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                 {
                     // Windows distinguishes file vs dir symlinks at creation;
                     // tarballs we extract here are file-targeting in practice.
-                    use cap_std::fs::DirExt;
                     dir.symlink_file(&*target, &path)
                         .map_err(|e| format!("symlink {}: {e}", path.display()))?;
                 }
