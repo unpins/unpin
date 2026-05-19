@@ -357,6 +357,7 @@ fn resolve_alias_override(yes: bool, no: bool, ask: bool) -> Option<aliases::Ali
 
 fn main() -> ExitCode {
     panic::install();
+    panic::restore_sigpipe_default();
     sigint::install();
     // Look for --version / --help only in args BEFORE `--` so that
     // `unpin run pkg -- --version` forwards the flag to the child instead of
