@@ -469,10 +469,11 @@ impl<R: Read> Read for CdFilter<R> {
 ///
 /// Bounds are self-contained against arbitrary/malicious input: the loop guard
 /// `pos + 46 <= buf.len()` covers every fixed-field read (max index `pos+41`),
-/// the `name_end > buf.len()` break covers the name slice, and `next <= pos`
-/// breaks on an overflow wraparound. So a truncated header, an oversized
-/// `name_len`, or trailing garbage all terminate the scan rather than read out
-/// of bounds.
+/// the `name_end > buf.len()` break covers the name slice, and the next
+/// position is computed with `checked_add` so an overflow stops the scan
+/// instead of wrapping (the `> pos` guard also rejects a non-advancing step).
+/// So a truncated header, an oversized `name_len`, or trailing garbage all
+/// terminate the scan rather than read out of bounds.
 fn parse_central_directory(buf: &[u8]) -> std::collections::HashMap<String, u32> {
     const CD_SIG: u32 = 0x0201_4b50;
     let mut out = std::collections::HashMap::new();
@@ -508,10 +509,15 @@ fn parse_central_directory(buf: &[u8]) -> std::collections::HashMap<String, u32>
                 out.insert(name.to_owned(), mode);
             }
         }
-        let next = name_end + extra_len + comment_len;
-        if next <= pos {
-            break;
-        }
+        let next = match name_end
+            .checked_add(extra_len)
+            .and_then(|n| n.checked_add(comment_len))
+        {
+            Some(n) if n > pos => n,
+            // checked_add overflow, or a non-advancing position — either way
+            // there's no valid next header, so stop rather than wrap/loop.
+            _ => break,
+        };
         pos = next;
     }
     out
