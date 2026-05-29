@@ -55,6 +55,11 @@ pub fn walk_binary_candidates(vdir: &Path, out: &mut Vec<PathBuf>) -> io::Result
     if bin.is_dir() {
         walk_files(&bin, out)?;
     }
+    // `read_dir` yields filesystem order, which varies across machines, file
+    // systems and extraction runs. Sort by full path so the candidate list —
+    // and therefore both the intra-package first-seen link winner and `run`'s
+    // executable selection — is deterministic and reproducible.
+    out.sort();
     Ok(())
 }
 
@@ -740,5 +745,28 @@ mod tests {
             !names.iter().any(|n| n.contains("lib/")),
             "lib/ leaked into candidates: {names:?}"
         );
+    }
+
+    #[test]
+    fn walk_binary_candidates_returns_sorted_paths() {
+        // The candidate list feeds both the intra-package first-seen link
+        // winner and `run`'s executable pick — it must not depend on the
+        // filesystem's read_dir order. Create files in non-sorted name order
+        // and assert the output comes back sorted by full path.
+        let tmp = tempfile::tempdir().unwrap();
+        let v = tmp.path();
+        fs::create_dir_all(v.join("bin")).unwrap();
+        for name in ["zebra", "alpha", "mike"] {
+            fs::write(v.join(name), b"x").unwrap();
+        }
+        for name in ["yak", "bravo"] {
+            fs::write(v.join("bin").join(name), b"x").unwrap();
+        }
+
+        let mut out = Vec::new();
+        walk_binary_candidates(v, &mut out).unwrap();
+        let mut expected = out.clone();
+        expected.sort();
+        assert_eq!(out, expected, "candidate list is not sorted: {out:?}");
     }
 }

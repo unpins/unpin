@@ -844,12 +844,60 @@ pub fn run(
         }
         1 => executables.into_iter().next().unwrap(),
         _ => {
-            // Multiple executables: prefer one matching spec.name.
-            executables
+            // Multiple executables. Prefer one matching spec.name (the list is
+            // sorted, so the first match is deterministic). When none matches,
+            // we can't guess which the user wants — show them all and ask.
+            match executables
                 .iter()
                 .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(&spec.name))
-                .cloned()
-                .unwrap_or_else(|| executables.into_iter().next().unwrap())
+            {
+                Some(m) => m.clone(),
+                None if assume_yes => {
+                    // `-y` is non-interactive; we can't ask, and won't pick a
+                    // binary the user never chose.
+                    return Err(format!(
+                        "{} ships {} executables and none is named '{}'; \
+                         re-run interactively (without -y) to pick one",
+                        spec.repo(),
+                        executables.len(),
+                        spec.name
+                    ));
+                }
+                None => {
+                    let header = format!(
+                        "{} ships {} executables, none named '{}':",
+                        spec.repo(),
+                        executables.len(),
+                        spec.name
+                    );
+                    let items: Vec<String> = executables
+                        .iter()
+                        .map(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?")
+                                .to_string()
+                        })
+                        .collect();
+                    // Hidden target: suspend() is a no-op, the prompt still
+                    // reads/writes stderr. Non-TTY (or `-y`) auto-skips, which
+                    // we turn into a hard error — `run` won't execute a binary
+                    // the user never picked.
+                    let hidden = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+                    match prompt_pick_with_skip(&hidden, &header, &items) {
+                        PromptResult::Got(n) => executables[n].clone(),
+                        PromptResult::Skip => {
+                            return Err(format!(
+                                "{} ships {} executables and none is named '{}'; \
+                                 re-run interactively to pick one",
+                                spec.repo(),
+                                executables.len(),
+                                spec.name
+                            ));
+                        }
+                    }
+                }
+            }
         }
     };
 
