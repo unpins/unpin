@@ -391,6 +391,10 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                 match dir.open(rel) {
                     Ok(mut f) => {
                         let mut head = [0u8; 4];
+                        // A read error here (rare — file just opened) folds
+                        // into n=0 and falls through to the non-executable
+                        // default, which is the safe direction: never promote
+                        // to 0o755 on a header we couldn't actually read.
                         let n = f.read(&mut head).unwrap_or(0);
                         let is_elf = n >= 4 && &head[..4] == b"\x7fELF";
                         let is_shebang = n >= 2 && &head[..2] == b"#!";
