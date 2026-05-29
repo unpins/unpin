@@ -204,8 +204,16 @@ pub fn install_many(ctx: &Ctx, opts: &InstallOptions, inputs: &[String]) -> Resu
         .collect::<Result<_, _>>()?;
     // Dedup by parsed Spec so `install tree unpins/tree` collapses — both
     // normalize to the same target and a parallel run would otherwise race
-    // on the same vdir.
-    let specs = dedup_keep_first(parsed, |a, b| a.1 == b.1);
+    // on the same vdir. Note each dropped duplicate so the collapse isn't
+    // silent: the user passed two args and deserves to know one was folded in.
+    let mut specs: Vec<(String, Spec)> = Vec::with_capacity(parsed.len());
+    for (label, spec) in parsed {
+        if let Some((kept, _)) = specs.iter().find(|(_, s)| *s == spec) {
+            eprintln!("note: ignoring duplicate '{label}' (same package as '{kept}')");
+        } else {
+            specs.push((label, spec));
+        }
+    }
     // Same `(owner, name)` with different `version` survives the Spec
     // equality dedup but can't all install — bin/ symlinks point to a
     // single version. Resolve to one entry per repo (prompt or `--yes`
@@ -754,7 +762,9 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
             skipped.join(", ")
         );
     }
-    if removed == 0 && skipped.is_empty() {
+    if removed > 0 {
+        println!("Pruned {removed} item(s)");
+    } else if skipped.is_empty() {
         println!("Nothing to prune");
     }
     Ok(())
