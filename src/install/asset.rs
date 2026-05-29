@@ -15,6 +15,37 @@ use crate::ctx::Ctx;
 use crate::github::{self, Asset};
 use crate::platform;
 
+/// True if `key` occurs in `haystack` as a delimited token — not embedded in a
+/// longer alphanumeric run. Every standard release-naming convention writes the
+/// architecture as a delimited field (Rust target triples `-x86_64-`, Debian/Go
+/// `-amd64.`, `armv7-…`), so a short key like `x64`/`arm64` should match those
+/// but never a coincidental substring inside an unrelated word (`x64` within
+/// `vbox64`). A boundary is the string edge or any non-`[a-z0-9]` byte
+/// (`-`, `_`, `.`). A key may carry its own internal separator (`x86_64`) —
+/// only the bytes surrounding the match are checked, never the interior.
+/// Both arguments are expected lowercase ASCII (asset names are lowercased by
+/// the callers; the key tables are ASCII literals).
+fn contains_arch_token(haystack: &str, key: &str) -> bool {
+    let (hb, kb) = (haystack.as_bytes(), key.as_bytes());
+    if kb.is_empty() || kb.len() > hb.len() {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric();
+    let mut i = 0;
+    while i + kb.len() <= hb.len() {
+        if &hb[i..i + kb.len()] == kb {
+            let before_ok = i == 0 || !is_word(hb[i - 1]);
+            let end = i + kb.len();
+            let after_ok = end == hb.len() || !is_word(hb[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Classify an asset that should be excluded from the picker. Returns a short
 /// human reason, or `None` if the asset is potentially installable.
 pub fn classify_excluded(name_lower: &str) -> Option<&'static str> {
@@ -24,9 +55,14 @@ pub fn classify_excluded(name_lower: &str) -> Option<&'static str> {
     {
         return Some("other platform");
     }
+    // Arch tokens match on a delimiter boundary (unlike the OS/auxiliary keys
+    // above and below, which are distinctive words or `.ext` patterns). This
+    // stops a short arch token from a wrong-arch exclusion firing on a glued
+    // substring — and keeps the include side (Tier-1 in `narrow_assets`)
+    // symmetric with this exclude side.
     if platform::other_arch_keys()
         .iter()
-        .any(|k| name_lower.contains(k))
+        .any(|k| contains_arch_token(name_lower, k))
     {
         return Some("other arch");
     }
@@ -87,7 +123,7 @@ pub fn narrow_assets<'a>(
         .copied()
         .filter(|a| {
             let l = a.name.to_ascii_lowercase();
-            arch_keys.iter().any(|k| l.contains(k))
+            arch_keys.iter().any(|k| contains_arch_token(&l, k))
         })
         .collect();
     let mut candidates = if with_arch.is_empty() {
@@ -341,6 +377,78 @@ mod tests {
         assert_eq!(classify_excluded("rg-14.1.0-x86_64-linux.tar.gz"), None);
         #[cfg(target_os = "macos")]
         assert_eq!(classify_excluded("rg-14.1.0-x86_64-darwin.tar.gz"), None);
+    }
+
+    #[test]
+    fn arch_token_matches_standard_conventions_not_glued_substrings() {
+        // Delimited arch fields from real conventions match.
+        assert!(contains_arch_token(
+            "ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz",
+            "x86_64"
+        ));
+        assert!(contains_arch_token(
+            "pandoc-3.9.0.2-linux-amd64.tar.gz",
+            "amd64"
+        ));
+        assert!(contains_arch_token(
+            "ripgrep-15.1.0-armv7-unknown-linux-gnueabihf.tar.gz",
+            "armv7"
+        ));
+        assert!(contains_arch_token("tool-x64-linux.zip", "x64"));
+        assert!(contains_arch_token("tool_amd64.deb", "amd64")); // `_`/`.` are boundaries
+        assert!(contains_arch_token("rg-x86_64", "x86_64")); // end-of-string boundary
+
+        // A short key glued inside a longer word must NOT match (the bug).
+        assert!(!contains_arch_token("tool-linux-vbox64.tar.gz", "x64"));
+        assert!(!contains_arch_token("max64.bin", "x64"));
+        // Internal separator in the key is fine, but a trailing word char isn't.
+        assert!(!contains_arch_token("tool-x86_64bit.zip", "x86_64"));
+    }
+
+    // The dev box and most CI runners are linux/x86_64; gate the end-to-end
+    // resolution check on it so the expected pick is unambiguous.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn narrow_assets_picks_the_right_real_world_asset() {
+        let mk = |names: &[&str]| -> Vec<Asset> {
+            names
+                .iter()
+                .map(|n| Asset {
+                    name: (*n).into(),
+                    browser_download_url: "u".into(),
+                    size: 0,
+                })
+                .collect()
+        };
+
+        // ripgrep 15.1.0 (Rust target-triple naming), incl. the s390x asset
+        // whose arch isn't in our tables — Tier-1 must still narrow to musl.
+        let rg = mk(&[
+            "ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz",
+            "ripgrep-15.1.0-armv7-unknown-linux-gnueabihf.tar.gz",
+            "ripgrep-15.1.0-i686-unknown-linux-gnu.tar.gz",
+            "ripgrep-15.1.0-s390x-unknown-linux-gnu.tar.gz",
+            "ripgrep-15.1.0-x86_64-apple-darwin.tar.gz",
+            "ripgrep-15.1.0-x86_64-pc-windows-msvc.zip",
+            "ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz",
+            "ripgrep_15.1.0-1_amd64.deb",
+        ]);
+        let got = narrow_assets(&rg, "ripgrep", false, false).unwrap();
+        assert_eq!(got.len(), 1, "candidates: {:?}", got.iter().map(|a| &a.name).collect::<Vec<_>>());
+        assert_eq!(got[0].name, "ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz");
+
+        // pandoc 3.9.0.2 (os-amd64 / Debian-style naming).
+        let pd = mk(&[
+            "pandoc-3.9.0.2-1-amd64.deb",
+            "pandoc-3.9.0.2-arm64-macOS.zip",
+            "pandoc-3.9.0.2-linux-amd64.tar.gz",
+            "pandoc-3.9.0.2-linux-arm64.tar.gz",
+            "pandoc-3.9.0.2-windows-x86_64.zip",
+            "pandoc.wasm.zip",
+        ]);
+        let got = narrow_assets(&pd, "pandoc", false, false).unwrap();
+        assert_eq!(got.len(), 1, "candidates: {:?}", got.iter().map(|a| &a.name).collect::<Vec<_>>());
+        assert_eq!(got[0].name, "pandoc-3.9.0.2-linux-amd64.tar.gz");
     }
 
     #[test]
