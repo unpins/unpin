@@ -112,6 +112,13 @@ fn resolve_installed(paths: &Paths, name: &str) -> Result<Option<(String, String
 /// "from" in the `from -> to` line). Returning `None` is honest and the
 /// pipeline handles it fine: `preflight_resolve` sees the cached vdir and
 /// skips the download, so `update` just re-links without re-downloading.
+///
+/// This returns the version of the *first* matching bin/ link in `read_dir`
+/// order, which is only well-defined because all of a package's links always
+/// point at a single version: `link_all_executables` sweeps the old link set
+/// before creating the new one, so even an interrupted update leaves a subset
+/// of one version, never a mix. Don't reintroduce in-place repointing without
+/// also making this resolve a dominant version.
 pub(super) fn active_version(paths: &Paths, owner: &str, name: &str) -> Option<String> {
     let rdir = paths.repo_dir(owner, name);
     let bins = fs::read_dir(&paths.bin).ok()?;

@@ -266,10 +266,12 @@ pub fn link_all_executables(
     let rdir = paths.repo_dir(&spec.owner, &spec.name);
 
     // Snapshot of unpin-managed links currently pointing anywhere into this
-    // package's repo dir. After linking the new version we use this to wipe
-    // entries the new version no longer declares — e.g. an alias `lzma` that
-    // v1 had and v2 dropped would otherwise keep pointing at v1's binary
-    // (and also keep v1's vdir alive past `prune`).
+    // package's repo dir — the old version's link set. We remove all of them
+    // up front (below), then create the new set, so an interrupted update can
+    // never leave a *mix* of old- and new-version links. That matters because
+    // `active_version` reports the version of whichever bin/ entry `read_dir`
+    // yields first: a half-repointed package would make it non-deterministic.
+    // Anything that survives a crash here is now a subset of one version.
     //
     // On Windows alias hardlinks aren't introspectable by `read_link`; they
     // get a separate cleanup pass below keyed on the binary's UNPIN_META.
@@ -284,6 +286,16 @@ pub fn link_all_executables(
             .collect(),
         Err(_) => Vec::new(),
     };
+
+    // Sweep the old link set before creating the new one (see above). On a
+    // clean run this is equivalent to repointing each link in place — the
+    // create loop re-issues every name the new version still declares, so the
+    // end state is identical; only the crash-time intermediate state differs.
+    // Best-effort: a removal failure (e.g. a racing manual `rm`) is harmless,
+    // the create loop overwrites whatever remains.
+    for old in &existing_managed {
+        let _ = fs::remove_file(old);
+    }
 
     let mut summary = LinkSummary::default();
     let mut refreshed: Vec<PathBuf> = Vec::new();
@@ -320,13 +332,14 @@ pub fn link_all_executables(
         summary.notes.extend(alias_outcome.notes);
     }
 
-    // Orphan cleanup: links that pointed into this repo's vdirs before but
-    // weren't re-issued by this run are from a previous version's manifest.
-    // Removing them keeps `prune` able to reclaim the older vdir later (an
-    // orphan alias would otherwise keep the vdir alive indefinitely).
+    // Orphan report: links from the old version that the new one didn't
+    // re-issue (e.g. an alias `lzma` that v1 had and v2 dropped). They were
+    // already physically removed by the pre-link sweep above — this is just
+    // the name diff so the user sees the dropped entry in the summary. Their
+    // removal is also what lets `prune` reclaim the older vdir later.
     let mut orphans = Vec::new();
     for old in &existing_managed {
-        if !refreshed.iter().any(|r| r == old) && fs::remove_file(old).is_ok() {
+        if !refreshed.iter().any(|r| r == old) {
             orphans.push(
                 old.file_name()
                     .unwrap_or_default()
@@ -673,6 +686,60 @@ mod tests {
             classify_slot(&paths, &multi, &rdir, &[], &link, true),
             SlotDecision::Write(None)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_sweeps_old_links_and_repoints_to_new_version() {
+        // End-to-end update via link_all_executables: install v1 (two binaries
+        // foo+bar), then v2 which drops bar. After the v2 run every surviving
+        // link must point at v2 (no v1 leftover → active_version stays
+        // deterministic), and the dropped `bar` must be gone.
+        use indicatif::ProgressDrawTarget;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let paths = Paths {
+            data: data.clone(),
+            bin: bin.clone(),
+            config: tmp.path().join("config"),
+        };
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let spec = Spec {
+            owner: "me".into(),
+            name: "tool".into(),
+            version: None,
+        };
+
+        // Lay down a version dir with the given executable basenames under
+        // <data>/me/tool/<tag>/bin and return the vdir path.
+        let mk_vdir = |tag: &str, names: &[&str]| -> PathBuf {
+            let vdir = paths.version_dir("me", "tool", tag);
+            let vbin = vdir.join("bin");
+            fs::create_dir_all(&vbin).unwrap();
+            for n in names {
+                let p = vbin.join(n);
+                fs::write(&p, b"#!/bin/sh\n").unwrap();
+                ensure_executable(&p).unwrap();
+            }
+            vdir
+        };
+
+        let v1 = mk_vdir("v1", &["foo", "bar"]);
+        link_all_executables(&paths, &multi, &spec, &v1, true, AliasMode::No).unwrap();
+        assert!(bin.join("foo").exists() && bin.join("bar").exists());
+        assert!(platform::read_link(&bin.join("foo")).unwrap().starts_with(&v1));
+
+        let v2 = mk_vdir("v2", &["foo"]);
+        let summary = link_all_executables(&paths, &multi, &spec, &v2, true, AliasMode::No).unwrap();
+
+        // foo repointed to v2, no v1 link survives, bar (dropped) removed.
+        let foo_target = platform::read_link(&bin.join("foo")).unwrap();
+        assert!(foo_target.starts_with(&v2), "foo still points at: {foo_target:?}");
+        assert!(!bin.join("bar").exists(), "dropped bar should be gone");
+        assert!(summary.primary.contains(&"foo".to_string()));
     }
 
     #[test]
