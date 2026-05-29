@@ -427,9 +427,24 @@ pub fn alias_link_filename(name: &str) -> String {
 #[cfg(any(windows, test))]
 const WINDOWS_WRAPPER_MARKER: &str = "@rem unpin-managed";
 
+/// Build the body of an unpin-managed `.cmd` wrapper pointing at `target`.
+/// Shared by `create_link` (the writer) and the parser tests so the
+/// write → [`parse_cmd_wrapper`] round-trip is guaranteed to hold for any path.
+#[cfg(any(windows, test))]
+fn cmd_wrapper_body(target: &str) -> String {
+    format!("{WINDOWS_WRAPPER_MARKER}\r\n@\"{target}\" %*\r\n")
+}
+
 /// Pure parser for the `.cmd` wrapper body. Cross-platform so we can test it
-/// from Unix. Returns the target path inside the second-line `@"…"` only when
-/// the first line matches `WINDOWS_WRAPPER_MARKER`.
+/// from Unix. Returns the target path inside the second-line `@"…" %*` only
+/// when the first line matches `WINDOWS_WRAPPER_MARKER`.
+///
+/// The path is delimited by the structural `@"` prefix and the trailing
+/// `" %*` suffix — *not* by the first inner quote. Anchoring on the suffix
+/// means a `target` containing a `"` round-trips intact instead of being
+/// truncated at the embedded quote (Windows forbids `"` in real paths, but a
+/// hostile `%LOCALAPPDATA%` could still smuggle one in, and the invariant
+/// should hold regardless).
 #[cfg(any(windows, test))]
 fn parse_cmd_wrapper(body: &str) -> Option<&str> {
     let mut lines = body.lines();
@@ -437,9 +452,10 @@ fn parse_cmd_wrapper(body: &str) -> Option<&str> {
         return None;
     }
     let target_line = lines.next()?;
-    let after_quote = target_line.trim_start_matches('@').strip_prefix('"')?;
-    let end = after_quote.find('"')?;
-    Some(&after_quote[..end])
+    target_line
+        .strip_prefix("@\"")?
+        .strip_suffix(" %*")?
+        .strip_suffix('"')
 }
 
 /// Create an unpin-managed link at `link_path` pointing at `target`.
@@ -453,10 +469,7 @@ pub fn create_link(target: &Path, link_path: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let body = format!(
-            "{WINDOWS_WRAPPER_MARKER}\r\n@\"{}\" %*\r\n",
-            target.display()
-        );
+        let body = cmd_wrapper_body(&target.display().to_string());
         fs::write(link_path, body)
     }
 }
@@ -653,6 +666,26 @@ mod tests {
         // Trailing content shouldn't trip the parser (we only consume two lines).
         let body = format!("{WINDOWS_WRAPPER_MARKER}\r\n@\"C:\\x.exe\" %*\r\nrem extra\r\n");
         assert_eq!(parse_cmd_wrapper(&body), Some("C:\\x.exe"));
+    }
+
+    #[test]
+    fn cmd_wrapper_round_trips_via_writer() {
+        // Feed the actual writer (`cmd_wrapper_body`) into the parser so the
+        // create_link → read_link invariant is exercised, not just a
+        // hand-written body. Includes a path with an embedded quote: NTFS
+        // forbids it, but a hostile %LOCALAPPDATA% could inject one, and the
+        // old `find('"')` parser truncated such paths at the first quote.
+        for target in [
+            "C:\\Users\\me\\AppData\\Local\\unpin\\packages\\foo\\rg.exe",
+            "C:\\weird\"dir\\tool.exe",
+            "C:\\trailing\".exe",
+        ] {
+            assert_eq!(
+                parse_cmd_wrapper(&cmd_wrapper_body(target)),
+                Some(target),
+                "round-trip failed for {target:?}"
+            );
+        }
     }
 
     // ---- OS / arch key tables ----
