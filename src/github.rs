@@ -63,7 +63,21 @@ fn api_get(ctx: &Ctx, url: &str) -> Result<String, String> {
             return Err("not found (check package name or version)".into());
         }
         let msg = github_error_message(&resp.body).unwrap_or_else(|| "request failed".to_string());
-        return Err(format!("HTTP {}: {msg}", resp.status));
+        let mut out = format!("HTTP {}: {msg}", resp.status);
+        // A 403/429 on an unauthenticated request is almost always the 60/hour
+        // anonymous API rate limit. GitHub's own message ("API rate limit
+        // exceeded…") never mentions that unpin reads a token, so the user has
+        // no actionable next step — point them at the env var that lifts the
+        // cap. When auth IS present a 403 means something else (bad/insufficient
+        // token), and GitHub's message already explains it, so skip the hint.
+        if matches!(resp.status, 403 | 429) && ctx.auth.is_none() {
+            out.push_str(
+                "\nhint: anonymous GitHub API requests are limited to 60/hour. \
+                 Set GITHUB_TOKEN (or GH_TOKEN), or use_gh_auth = true in config, \
+                 to raise the limit to 5000/hour.",
+            );
+        }
+        return Err(out);
     }
     String::from_utf8(resp.body).map_err(|e| format!("decode body for {url}: {e}"))
 }
@@ -230,4 +244,79 @@ pub fn done_skip_style() -> ProgressStyle {
 /// link conflict). Red — distinguishes a hard failure from a user skip.
 pub fn done_fail_style() -> ProgressStyle {
     ProgressStyle::with_template("  {prefix:.red}  ✗  {wide_msg:.red}").unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::http::{Headers, HttpClient, HttpResponse, HttpStream};
+    use crate::platform::Paths;
+    use std::path::PathBuf;
+
+    /// Canned-response client: every `get` returns the same status + body.
+    struct FakeClient {
+        status: u16,
+        body: Vec<u8>,
+    }
+    impl HttpClient for FakeClient {
+        fn get(&self, _url: &str, _headers: Headers) -> Result<HttpResponse, String> {
+            Ok(HttpResponse {
+                status: self.status,
+                body: self.body.clone(),
+            })
+        }
+        fn get_streaming(
+            &self,
+            _url: &str,
+            _headers: Headers,
+        ) -> Result<Box<dyn HttpStream + Send>, String> {
+            unimplemented!("api_get never streams")
+        }
+    }
+
+    fn ctx_with(status: u16, body: &str, auth: Option<String>) -> Ctx {
+        Ctx {
+            cfg: Config::default(),
+            http: Box::new(FakeClient {
+                status,
+                body: body.as_bytes().to_vec(),
+            }),
+            auth,
+            verbose: false,
+            paths: Paths {
+                data: PathBuf::from("/tmp/d"),
+                bin: PathBuf::from("/tmp/b"),
+                config: PathBuf::from("/tmp/c"),
+            },
+        }
+    }
+
+    const RATE_LIMIT: &str = r#"{"message":"API rate limit exceeded for 1.2.3.4"}"#;
+
+    #[test]
+    fn rate_limit_403_unauthenticated_suggests_a_token() {
+        let ctx = ctx_with(403, RATE_LIMIT, None);
+        let err = api_get(&ctx, "https://api.github.com/x").unwrap_err();
+        assert!(err.contains("403"), "got: {err}");
+        assert!(err.contains("GITHUB_TOKEN"), "missing token hint: {err}");
+        assert!(err.contains("rate limit exceeded"), "lost GitHub message: {err}");
+    }
+
+    #[test]
+    fn rate_limit_403_authenticated_omits_the_hint() {
+        // A logged-in user hitting 403 has a different problem (bad/insufficient
+        // token); the GITHUB_TOKEN hint would be misleading.
+        let ctx = ctx_with(403, RATE_LIMIT, Some("Bearer x".into()));
+        let err = api_get(&ctx, "https://api.github.com/x").unwrap_err();
+        assert!(!err.contains("GITHUB_TOKEN"), "unexpected token hint: {err}");
+    }
+
+    #[test]
+    fn not_found_404_stays_a_plain_message() {
+        let ctx = ctx_with(404, r#"{"message":"Not Found"}"#, None);
+        let err = api_get(&ctx, "https://api.github.com/x").unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+        assert!(!err.contains("GITHUB_TOKEN"), "404 shouldn't hint a token: {err}");
+    }
 }
