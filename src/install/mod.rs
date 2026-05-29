@@ -47,10 +47,29 @@ fn is_part_dir_name(name: &str) -> bool {
 /// practice, and avoiding a `Hash`/`Eq` bound lets callers compare by
 /// whatever projection is natural (parsed `Spec`, resolved
 /// `(owner, repo)`, raw string).
-fn dedup_keep_first<T>(items: Vec<T>, mut same: impl FnMut(&T, &T) -> bool) -> Vec<T> {
+/// Dedup a list, keeping the first occurrence and preserving order, emitting a
+/// stderr note for each dropped duplicate — so a user who named the same target
+/// twice, or two ways (e.g. `tree` and `unpins/tree`), isn't left wondering why
+/// one arg vanished. `same` decides equality; `label` renders an item for the
+/// message. All the argv-consuming commands (install/remove/update/info) route
+/// their dedup through here so the collapse is never silent.
+fn dedup_keep_first_noting<T>(
+    items: Vec<T>,
+    mut same: impl FnMut(&T, &T) -> bool,
+    label: impl Fn(&T) -> String,
+) -> Vec<T> {
     let mut out: Vec<T> = Vec::with_capacity(items.len());
     for it in items {
-        if !out.iter().any(|prev| same(prev, &it)) {
+        if let Some(kept) = out.iter().find(|prev| same(prev, &it)) {
+            let (dup, kept) = (label(&it), label(kept));
+            // When both render identically (exact-string dup) the "same as"
+            // clause would be noise; only show it when the two args differ.
+            if dup == kept {
+                eprintln!("note: ignoring duplicate '{dup}'");
+            } else {
+                eprintln!("note: ignoring duplicate '{dup}' (same as '{kept}')");
+            }
+        } else {
             out.push(it);
         }
     }
@@ -204,16 +223,9 @@ pub fn install_many(ctx: &Ctx, opts: &InstallOptions, inputs: &[String]) -> Resu
         .collect::<Result<_, _>>()?;
     // Dedup by parsed Spec so `install tree unpins/tree` collapses — both
     // normalize to the same target and a parallel run would otherwise race
-    // on the same vdir. Note each dropped duplicate so the collapse isn't
-    // silent: the user passed two args and deserves to know one was folded in.
-    let mut specs: Vec<(String, Spec)> = Vec::with_capacity(parsed.len());
-    for (label, spec) in parsed {
-        if let Some((kept, _)) = specs.iter().find(|(_, s)| *s == spec) {
-            eprintln!("note: ignoring duplicate '{label}' (same package as '{kept}')");
-        } else {
-            specs.push((label, spec));
-        }
-    }
+    // on the same vdir. The noting variant tells the user when an arg was
+    // folded in, so the collapse isn't silent.
+    let specs = dedup_keep_first_noting(parsed, |a, b| a.1 == b.1, |(label, _)| label.clone());
     // Same `(owner, name)` with different `version` survives the Spec
     // equality dedup but can't all install — bin/ symlinks point to a
     // single version. Resolve to one entry per repo (prompt or `--yes`
@@ -395,8 +407,9 @@ pub fn remove_many(paths: &Paths, names: &[String], assume_yes: bool) -> Result<
     } else {
         // Raw-string dedup so `remove tree tree` doesn't try to remove the
         // package twice (second call would error "not installed" since the
-        // first already wiped it — non-fatal but ugly output).
-        dedup_keep_first(names.to_vec(), |a, b| a == b)
+        // first already wiped it — non-fatal but ugly output). Note the
+        // dropped dup so the user knows one of their args was folded in.
+        dedup_keep_first_noting(names.to_vec(), |a, b| a == b, |s| s.clone())
     };
 
     let mut failures = 0usize;
@@ -497,12 +510,21 @@ pub fn update(ctx: &Ctx, opts: &InstallOptions, names: &[String]) -> Result<(), 
     } else {
         // Resolve each name to (owner, repo) first, then dedup so
         // `update foo foo` (or `update foo unpins/foo`) collapses to a
-        // single pipeline entry instead of racing on the same vdir.
-        let resolved: Vec<(String, String)> = names
+        // single pipeline entry instead of racing on the same vdir. Carry the
+        // original input arg alongside the resolved target so the dropped-dup
+        // note can name what the user actually typed.
+        let resolved: Vec<(String, (String, String))> = names
             .iter()
-            .map(|n| resolve_installed(&ctx.paths, n)?.ok_or_else(|| format!("not installed: {n}")))
+            .map(|n| {
+                resolve_installed(&ctx.paths, n)?
+                    .ok_or_else(|| format!("not installed: {n}"))
+                    .map(|target| (n.clone(), target))
+            })
             .collect::<Result<_, _>>()?;
-        dedup_keep_first(resolved, |a, b| a == b)
+        dedup_keep_first_noting(resolved, |a, b| a.1 == b.1, |(input, _)| input.clone())
+            .into_iter()
+            .map(|(_, target)| target)
+            .collect()
     };
 
     if targets.is_empty() {
@@ -561,8 +583,9 @@ pub fn info_many(ctx: &Ctx, inputs: &[String]) -> Result<(), String> {
     // Raw-string dedup so `info tree tree` doesn't print the block twice.
     // We don't normalize ("tree" vs "unpins/tree") here — info() handles
     // both inputs internally and the cost of normalizing just to dedup
-    // would be a filesystem read per arg for no real user benefit.
-    let inputs = dedup_keep_first(inputs.to_vec(), |a, b| a == b);
+    // would be a filesystem read per arg for no real user benefit. Note the
+    // dropped dup for consistency with install/remove/update.
+    let inputs = dedup_keep_first_noting(inputs.to_vec(), |a, b| a == b, |s| s.clone());
     let mut failures = 0usize;
     for (i, input) in inputs.iter().enumerate() {
         if i > 0 {
@@ -950,15 +973,15 @@ mod tests {
     #[test]
     fn dedup_keep_first_preserves_order_and_removes_later_dups() {
         let v = vec!["a", "b", "a", "c", "b", "d"];
-        let out = dedup_keep_first(v, |x, y| x == y);
+        let out = dedup_keep_first_noting(v, |x, y| x == y, |x| x.to_string());
         assert_eq!(out, vec!["a", "b", "c", "d"]);
     }
 
     #[test]
     fn dedup_keep_first_handles_empty_and_singletons() {
-        let empty: Vec<i32> = dedup_keep_first(Vec::new(), |a, b| a == b);
+        let empty: Vec<i32> = dedup_keep_first_noting(Vec::new(), |a, b| a == b, |x| x.to_string());
         assert!(empty.is_empty());
-        let single = dedup_keep_first(vec![42], |a, b| a == b);
+        let single = dedup_keep_first_noting(vec![42], |a, b| a == b, |x| x.to_string());
         assert_eq!(single, vec![42]);
     }
 
@@ -967,7 +990,7 @@ mod tests {
         // Same use case as install_many: dedup by the second tuple field
         // while keeping the first ("label") of the winner intact.
         let v = vec![("first", 1), ("second", 1), ("third", 2)];
-        let out = dedup_keep_first(v, |a, b| a.1 == b.1);
+        let out = dedup_keep_first_noting(v, |a, b| a.1 == b.1, |x| format!("{x:?}"));
         assert_eq!(out, vec![("first", 1), ("third", 2)]);
     }
 
