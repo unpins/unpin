@@ -58,10 +58,10 @@ impl Ctx {
 /// by IP) to 5000/hour (per user).
 fn resolve_auth_header(cfg: &Config) -> Option<String> {
     for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Ok(t) = env::var(var)
-            && !t.is_empty()
+        if let Ok(token) = env::var(var)
+            && !token.is_empty()
         {
-            return Some(format!("Bearer {t}"));
+            return Some(format!("Bearer {token}"));
         }
     }
     if !cfg.use_gh_auth() {
