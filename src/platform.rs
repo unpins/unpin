@@ -574,6 +574,65 @@ pub fn acquire_install_lock(repo_dir: &Path) -> Result<InstallLock, String> {
     })
 }
 
+/// Process-wide exclusive lock guarding mutations of the shared `bin_dir`
+/// (link/wrapper create + orphan cleanup). The per-package [`InstallLock`]
+/// only covers a repo's own `repo_dir`; `bin_dir` is shared across every
+/// package, so without this two `unpin` processes installing *different*
+/// packages could interleave their link writes (lost links, an orphan sweep
+/// deleting the other's fresh link).
+///
+/// Unlike [`InstallLock`], the lock file is **never removed** on drop: this
+/// lock is acquired *blocking*, so a waiter holds an open fd to the file. If
+/// the holder unlinked it on release, a third process could create a fresh
+/// file at the same path and lock a *different* inode — two processes would
+/// then both "hold" the lock. Leaving the file in place keeps every process
+/// contending on one inode. The kernel still releases the advisory lock when
+/// the fd closes (clean drop, panic, SIGKILL, power loss), so a leftover file
+/// is harmless and never goes stale.
+#[derive(Debug)]
+pub struct LinksLock {
+    // The open fd is the lock; `Drop` closing it releases the flock. No
+    // explicit unlock or file removal (see type docs).
+    _file: fs::File,
+}
+
+/// Acquire the shared `bin_dir` links lock, blocking until it's free. Pass the
+/// path of any unpin-owned directory that all processes agree on (the data
+/// dir); the lock file lives there rather than in `bin_dir` so it doesn't
+/// clutter the user's PATH folder.
+///
+/// `on_wait` fires once iff the lock is currently held by another process —
+/// the caller uses it to print a "waiting…" notice through whatever rendering
+/// context it owns (a `MultiProgress`, plain stderr, …) before this blocks.
+/// There is deliberately no timeout: the kernel guarantees a non-stale lock,
+/// so a `WouldBlock` always means a live holder that will release when its
+/// (short) link phase — or its interactive prompt — completes.
+pub fn acquire_links_lock(
+    data_dir: &Path,
+    on_wait: impl FnOnce(),
+) -> Result<LinksLock, String> {
+    fs::create_dir_all(data_dir).map_err(|e| format!("create {}: {e}", data_dir.display()))?;
+    let lock_path = data_dir.join(".unpin-links.lock");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("open lock {}: {e}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            on_wait();
+            file.lock()
+                .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
+        }
+        Err(fs::TryLockError::Error(e)) => {
+            return Err(format!("lock {}: {e}", lock_path.display()));
+        }
+    }
+    Ok(LinksLock { _file: file })
+}
+
 /// Read the target path from an unpin-managed link, or `None` if `p` isn't one.
 /// On Unix this is `fs::read_link`. On Windows the wrapper must start with the
 /// `WINDOWS_WRAPPER_MARKER` line — any other `.cmd` (user-written batch script,
@@ -785,6 +844,37 @@ mod tests {
         fs::write(&lock_path, "pid=99999\n").unwrap();
         let lock = acquire_install_lock(&repo).unwrap();
         assert_eq!(lock.path(), lock_path);
+    }
+
+    #[test]
+    fn links_lock_excludes_while_held_and_keeps_file_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let mut waited = false;
+        let lock = acquire_links_lock(data, || waited = true).unwrap();
+        assert!(!waited, "on_wait must not fire when the lock is free");
+        let lock_path = data.join(".unpin-links.lock");
+        assert!(lock_path.exists());
+
+        // A second, independent fd must see the lock as held — proving mutual
+        // exclusion — without us blocking on it.
+        let other = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        assert!(matches!(other.try_lock(), Err(fs::TryLockError::WouldBlock)));
+        drop(other);
+
+        // Unlike InstallLock, the file is NOT removed on drop: a blocking
+        // waiter holds an open fd, and unlinking would let a third process
+        // create a fresh inode and lock it in parallel.
+        drop(lock);
+        assert!(
+            lock_path.exists(),
+            "links lock file must persist across drop"
+        );
+
+        // Released cleanly, so it can be re-acquired with no wait.
+        let mut waited2 = false;
+        let _lock2 = acquire_links_lock(data, || waited2 = true).unwrap();
+        assert!(!waited2);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::aliases::AliasMode;
 use crate::archive;
 use crate::ctx::Ctx;
 use crate::github::{self, Asset, Release};
-use crate::platform::Paths;
+use crate::platform::{self, Paths};
 
 use super::asset::{
     fetch_expected_sha256, find_checksum_url, find_companion, narrow_assets, pick_asset,
@@ -774,6 +774,21 @@ fn link_on_main(
     pb.set_style(github::idle_style());
     pb.set_prefix(request.label.clone());
     pb.set_message("Linking...");
+    // Serialize all bin_dir writes across processes. The per-repo lock in
+    // job._lock only covers this package's repo_dir; bin_dir is shared, so
+    // another `unpin` linking a *different* package would otherwise race here.
+    // Acquired after the repo lock (held since preflight) — order is always
+    // repo → links — so it can't deadlock against another process.
+    let _links = match platform::acquire_links_lock(&paths.data, || {
+        let _ = multi.println("Waiting for another unpin process to finish updating links...");
+    }) {
+        Ok(l) => l,
+        Err(e) => {
+            mark_failed(pb, &e);
+            errors.push(format!("unpin: {}: {e}", request.label));
+            return;
+        }
+    };
     // Capture the currently-linked version BEFORE linking overwrites
     // bin/ symlinks — that's what makes the summary line read
     // "Updated v1 → v2" instead of just "Installed v2" on an upgrade.

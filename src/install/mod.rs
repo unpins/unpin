@@ -422,6 +422,14 @@ fn remove_one(paths: &Paths, name: &str) -> Result<(), String> {
         .unwrap_or_default();
     versions.sort();
 
+    // Serialize bin_dir mutations against a concurrent install of a *different*
+    // package. The repo lock above only covers this package's repo_dir; the
+    // link removals below touch the shared bin_dir. Acquired after the repo
+    // lock (repo → links order) so it can't deadlock against an install.
+    let _links = platform::acquire_links_lock(&paths.data, || {
+        eprintln!("Waiting for another unpin process to finish updating links...");
+    })?;
+
     // Windows-only alias cleanup: hardlinks can't be reverse-mapped from
     // `bin_dir`, so we re-derive the alias names by scanning the binary's
     // UNPIN_META block and unlinking each. On Unix the read_link sweep
@@ -627,10 +635,17 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
     // phase 2 — otherwise phase 2's "live links" calculation would treat
     // those dangling pointers as anchors and refuse to remove their vdirs.
     //
-    // No lock here: phase 1 only removes links whose target is *already*
-    // missing on disk. A concurrent install creating fresh links into a
-    // valid target can't trigger a remove because metadata(target) succeeds.
-    removed += sweep_dangling_links(bin, root);
+    // Hold the shared links lock only for the sweep, then release it before
+    // the per-repo loop (which takes repo locks): the global order is
+    // repo → links, so we must never still hold links when acquiring a repo
+    // lock. The lock keeps a concurrent install's fresh link from being seen
+    // mid-write by the sweep.
+    {
+        let _links = platform::acquire_links_lock(root, || {
+            eprintln!("Waiting for another unpin process to finish updating links...");
+        })?;
+        removed += sweep_dangling_links(bin, root);
+    }
 
     // Orphan version dirs: no live link in bin_dir points into them.
     let linked_targets: Vec<PathBuf> = fs::read_dir(bin)
@@ -688,13 +703,19 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
             // (no target to dangle), so removing this vdir leaves them
             // behind unless we re-derive the names here. On Unix the
             // post-loop dangling sweep catches alias symlinks naturally
-            // once their targets vanish.
+            // once their targets vanish. We hold the repo lock here, so
+            // taking the links lock keeps the repo → links order intact.
             #[cfg(windows)]
-            for n in aliases_from_vdir(&vpath) {
-                let p = bin.join(platform::alias_link_filename(&n));
-                if fs::remove_file(&p).is_ok() {
-                    println!("Removed alias {}", p.display());
-                    removed += 1;
+            {
+                let _links = platform::acquire_links_lock(root, || {
+                    eprintln!("Waiting for another unpin process to finish updating links...");
+                })?;
+                for n in aliases_from_vdir(&vpath) {
+                    let p = bin.join(platform::alias_link_filename(&n));
+                    if fs::remove_file(&p).is_ok() {
+                        println!("Removed alias {}", p.display());
+                        removed += 1;
+                    }
                 }
             }
             if fs::remove_dir_all(&vpath).is_ok() {
@@ -713,6 +734,9 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
     // run. On Windows the per-vdir rescan handles this inline.
     #[cfg(not(windows))]
     {
+        let _links = platform::acquire_links_lock(root, || {
+            eprintln!("Waiting for another unpin process to finish updating links...");
+        })?;
         removed += sweep_dangling_links(bin, root);
     }
 
