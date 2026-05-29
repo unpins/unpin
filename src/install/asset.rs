@@ -6,8 +6,11 @@
 //! tarball when the release ships one. `parse_sha256` + helpers consume the
 //! checksum file the release publishes alongside the asset.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 
+use indicatif::{MultiProgress, ProgressDrawTarget};
+
+use super::prompt::{PromptResult, prompt_pick_with_skip};
 use crate::ctx::Ctx;
 use crate::github::{self, Asset};
 use crate::platform;
@@ -156,10 +159,24 @@ pub fn pick_asset<'a>(
     prompt_pick(&candidates)
 }
 
+/// One menu line for an asset: name, plus the GitHub-reported size when known.
+/// Size `0` means the API elided it (older responses do), so the column is
+/// suppressed rather than printing a misleading "0 B".
+fn asset_label(a: &Asset) -> String {
+    if a.size > 0 {
+        format!("{}  ({})", a.name, indicatif::HumanBytes(a.size))
+    } else {
+        a.name.clone()
+    }
+}
+
+/// Single-package adapter over the shared `prompt_pick_with_skip`. `run` and
+/// `info` resolve exactly one asset, so a skip (Esc/q, or non-interactive
+/// stdin) becomes a clean error rather than dropping silently.
 pub(super) fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, String> {
-    // No terminal to read a choice from (piped stdin, CI). Fail with a clear
-    // message instead of looping or returning a misleading "invalid choice"
-    // when the first read hits EOF.
+    // Keep an explicit non-TTY message here: the shared picker just returns
+    // Skip, but for a single-package caller "stdin is not a terminal" is far
+    // more actionable than a generic "no asset selected".
     if !io::stdin().is_terminal() {
         return Err(
             "multiple assets match and stdin is not a terminal; \
@@ -167,47 +184,16 @@ pub(super) fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, Str
                 .into(),
         );
     }
-
     let header = if candidates.len() == 1 {
-        "Available asset:"
+        "Available asset"
     } else {
-        "Available assets:"
+        "Available assets"
     };
-    println!("{header}");
-    let name_w = candidates.iter().map(|a| a.name.len()).max().unwrap_or(0);
-    for (i, a) in candidates.iter().enumerate() {
-        // GitHub-reported size on the right; some older API responses elide
-        // it (size == 0), so suppress the column for those entries rather
-        // than print a misleading "0 B".
-        if a.size > 0 {
-            println!(
-                "  [{}] {:<name_w$}  ({})",
-                i + 1,
-                a.name,
-                indicatif::HumanBytes(a.size),
-            );
-        } else {
-            println!("  [{}] {}", i + 1, a.name);
-        }
-    }
-    loop {
-        print!("Pick [1-{}]: ", candidates.len());
-        io::stdout().flush().ok();
-        let mut line = String::new();
-        let n = io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| format!("stdin: {e}"))?;
-        if n == 0 {
-            // EOF (Ctrl-D) — a deliberate cancel, not an invalid number.
-            return Err("no asset selected".into());
-        }
-        match line.trim().parse::<usize>() {
-            Ok(idx) if (1..=candidates.len()).contains(&idx) => return Ok(candidates[idx - 1]),
-            _ => {
-                eprintln!("invalid choice; enter a number 1-{}", candidates.len());
-                continue;
-            }
-        }
+    let items: Vec<String> = candidates.iter().map(|a| asset_label(a)).collect();
+    let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+    match prompt_pick_with_skip(&multi, header, &items) {
+        PromptResult::Got(i) => Ok(candidates[i]),
+        PromptResult::Skip => Err("no asset selected".into()),
     }
 }
 

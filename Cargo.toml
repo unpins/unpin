@@ -25,6 +25,7 @@ sha2 = { version = "0.10", default-features = false }
 ctrlc = { version = "3", default-features = false }
 indicatif = { version = "0.18", default-features = false }
 console = { version = "0.16", default-features = false }
+dialoguer = { version = "0.12", default-features = false }
 cap-std = { version = "4.0.2", default-features = false }
 
 [dev-dependencies]
