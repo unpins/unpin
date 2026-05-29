@@ -270,8 +270,18 @@ pub fn fetch_expected_sha256(ctx: &Ctx, url: &str) -> Result<String, String> {
 /// Extract a SHA-256 digest from a per-asset checksum file. Some projects ship
 /// `<hex>  <filename>` (sha256sum format); others wrap the digest in prose
 /// (e.g. ripgrep's "SHA256 hash of ...zip:\n<hex>\n"). We look for the first
-/// run of >= 64 consecutive ASCII-hex chars — short hex-looking words ("SHA",
-/// "of") are what tripped a naive scanner.
+/// run of *exactly* 64 consecutive ASCII-hex chars — short hex-looking words
+/// ("SHA", "of") are what tripped a naive scanner, and an over-long run is not
+/// a SHA-256 (a SHA-512 digest is 128 chars). Truncating a longer run to 64
+/// would yield a bogus digest that then fails the comparison with a misleading
+/// "checksum mismatch" instead of an honest "no sha256 here", so we skip runs
+/// whose length isn't exactly 64 and keep scanning.
+//
+// TODO: we only consume `.sha256`/`.sha256sum` sidecars and only hash with
+// sha2::Sha256 (see find_checksum_url + pipeline's Hashing). If we ever accept
+// other algorithms (e.g. a `.sha512` sidecar), this scanner must match the
+// digest length implied by the sidecar suffix (64 OR 128, …) rather than a
+// fixed 64 — the "exact length" rule generalizes, the literal `64` does not.
 fn parse_sha256(text: &str) -> Result<String, String> {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -284,7 +294,9 @@ fn parse_sha256(text: &str) -> Result<String, String> {
         while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
             i += 1;
         }
-        if i - start >= 64 {
+        // `start` and `start + 64` both land on ASCII-hex bytes (start..i are
+        // all < 0x80), so this byte-index slice can never split a UTF-8 char.
+        if i - start == 64 {
             return Ok(text[start..start + 64].to_ascii_lowercase());
         }
     }
@@ -588,5 +600,36 @@ mod tests {
             parse_sha256(body).unwrap(),
             "1111111111111111111111111111111111111111111111111111111111111111"
         );
+    }
+
+    #[test]
+    fn parse_sha256_skips_overlong_run_and_finds_exact_64() {
+        // A combined sidecar listing SHA-512 (128 hex) before SHA-256 (64 hex).
+        // The old `>= 64` matched the first 64 chars of the 512 digest — a
+        // bogus value. We must skip the over-long run and return the real 64.
+        let sha512 = "a".repeat(128);
+        let sha256 = "b".repeat(64);
+        let body = format!("SHA512: {sha512}\nSHA256: {sha256}\n");
+        assert_eq!(parse_sha256(&body).unwrap(), sha256);
+    }
+
+    #[test]
+    fn parse_sha256_rejects_lone_overlong_run() {
+        // Only a SHA-512 in the file: we can't derive a SHA-256 from it, so
+        // fail honestly rather than truncate to a wrong digest.
+        let body = "c".repeat(128);
+        assert!(parse_sha256(&body).is_err());
+    }
+
+    #[test]
+    fn parse_sha256_handles_non_ascii_without_panicking() {
+        // The byte-index slice must never split a multi-byte UTF-8 char. Wrap a
+        // valid digest in non-ASCII prose; the hex run is pure ASCII, so the
+        // slice stays on char boundaries.
+        let digest = "d".repeat(64);
+        let body = format!("checksum café ☕ → {digest} ✓ naïve\n");
+        assert_eq!(parse_sha256(&body).unwrap(), digest);
+        // Non-ASCII only, no hex run of 64 → clean error, no panic.
+        assert!(parse_sha256("résumé café ☕ ☃ 日本語").is_err());
     }
 }
