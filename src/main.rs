@@ -162,14 +162,19 @@ struct CompletionCmd {
 
 impl CompletionCmd {
     fn run(self) -> Result<(), String> {
+        use std::io::Write;
         let mut cmd = Cli::command();
-        clap_complete::generate(
-            self.shell.generator(),
-            &mut cmd,
-            "unpin",
-            &mut std::io::stdout(),
-        );
-        Ok(())
+        // Generate into memory first: `Vec<u8>` writes never fail, so
+        // clap_complete's internal `.expect()` on write errors can't fire and
+        // turn a full disk / EIO into a panic that bypasses main()'s error
+        // handler. Then surface a real stdout write error as a String. A broken
+        // pipe is handled earlier by the default SIGPIPE disposition (see
+        // panic.rs), so it exits quietly rather than reaching here.
+        let mut buf: Vec<u8> = Vec::new();
+        clap_complete::generate(self.shell.generator(), &mut cmd, "unpin", &mut buf);
+        std::io::stdout()
+            .write_all(&buf)
+            .map_err(|e| format!("write completions: {e}"))
     }
 }
 
