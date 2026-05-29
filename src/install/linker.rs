@@ -10,7 +10,7 @@
 //! `data`, `repo_dir`) arrives as a borrowed [`crate::platform::Paths`].
 
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 use indicatif::MultiProgress;
@@ -90,42 +90,135 @@ fn short_binary_name(name: &str) -> &str {
     }
 }
 
-fn link_binary(
+/// Outcome of a single link/alias create attempt. `note`, when set, is a
+/// one-line summary message (a cross-package shadow, or a collision the run
+/// resolved) — distinct from the bar's transient "Skipped X" line.
+struct LinkResult {
+    linked: bool,
+    note: Option<String>,
+}
+
+/// What to do with the bin_dir slot at `link`.
+enum SlotDecision {
+    /// (Over)write it; `note` records a summary line when this shadows another
+    /// package's link.
+    Write(Option<String>),
+    /// Leave the existing entry; `note` explains why (a collision) or is None
+    /// (user declined a foreign-file overwrite — already surfaced on the bar).
+    Keep(Option<String>),
+}
+
+/// Derive `owner/repo` from a managed-link target under `data` (e.g.
+/// `<data>/owner/repo/<tag>/bin/x` → `owner/repo`). `None` if the target
+/// doesn't have at least the two leading components.
+fn link_owner_repo(data: &Path, target: &Path) -> Option<String> {
+    let rel = target.strip_prefix(data).ok()?;
+    let mut comps = rel.components();
+    let owner = comps.next()?.as_os_str().to_string_lossy().into_owned();
+    let repo = comps.next()?.as_os_str().to_string_lossy().into_owned();
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Classify the existing bin_dir entry at `link` for the package rooted at
+/// `rdir`, prompting where the policy calls for it. `claimed` holds links this
+/// run already created (so a second binary in the same package can't silently
+/// clobber the first). All four cases:
+///   - free slot / our own older version → silent (over)write;
+///   - already claimed this run → keep the first, note the intra-package dup;
+///   - owned by another unpin package → cross-package: `-y`/non-TTY lets the
+///     explicit install win (with a shadow note), TTY prompts;
+///   - foreign unmanaged file → the long-standing overwrite prompt.
+fn classify_slot(
     paths: &Paths,
     multi: &MultiProgress,
-    target: &Path,
+    rdir: &Path,
+    claimed: &[PathBuf],
     link: &Path,
     assume_yes: bool,
-) -> Result<bool, String> {
-    let parent = link.parent().ok_or("link has no parent")?;
-    fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+) -> SlotDecision {
+    let name = link
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
 
-    if link.exists() || fs::symlink_metadata(link).is_ok() {
-        let managed = platform::read_link(link)
-            .map(|t| t.starts_with(&paths.data))
-            .unwrap_or(false);
-        if !managed && !assume_yes {
+    // Intra-package: an earlier binary in THIS run already took this name.
+    // First-seen wins so bin/<name> matches what the summary reported.
+    if claimed.iter().any(|c| c == link) {
+        return SlotDecision::Keep(Some(format!(
+            "`{name}` is provided by more than one binary in this package; kept the first"
+        )));
+    }
+
+    if !(link.exists() || fs::symlink_metadata(link).is_ok()) {
+        return SlotDecision::Write(None);
+    }
+
+    match platform::read_link(link) {
+        // Our own previous version → normal update overwrite, silent.
+        Some(t) if t.starts_with(rdir) => SlotDecision::Write(None),
+        // Owned by a different unpin package → cross-package collision.
+        Some(t) if t.starts_with(&paths.data) => {
+            let owner = link_owner_repo(&paths.data, &t).unwrap_or_else(|| "another package".into());
+            // The user explicitly asked for THIS package, so `-y` and non-TTY
+            // let it win (with a shadow note). Interactive TTY gets to choose.
+            if assume_yes || !io::stdin().is_terminal() {
+                SlotDecision::Write(Some(format!("replaced {owner}'s `{name}`")))
+            } else {
+                let q = format!("{} is provided by {owner}. Replace it with this package?", link.display());
+                match prompt_yes_no_with_skip(multi, &q) {
+                    PromptResult::Got(true) => {
+                        SlotDecision::Write(Some(format!("replaced {owner}'s `{name}`")))
+                    }
+                    PromptResult::Got(false) | PromptResult::Skip => SlotDecision::Keep(Some(
+                        format!("`{name}` kept from {owner} (use --yes to replace)"),
+                    )),
+                }
+            }
+        }
+        // Foreign file, or a symlink pointing outside unpin.
+        _ => {
+            if assume_yes {
+                return SlotDecision::Write(None);
+            }
             let q = format!(
                 "{} already exists and was not installed by unpin. Overwrite?",
                 link.display()
             );
-            let overwrite = match prompt_yes_no_with_skip(multi, &q) {
-                PromptResult::Got(true) => true,
-                PromptResult::Got(false) | PromptResult::Skip => false,
-            };
-            if !overwrite {
-                let _ = multi.println(format!(
-                    "Skipped {}",
-                    link.file_name().unwrap_or_default().to_string_lossy()
-                ));
-                return Ok(false);
+            match prompt_yes_no_with_skip(multi, &q) {
+                PromptResult::Got(true) => SlotDecision::Write(None),
+                PromptResult::Got(false) | PromptResult::Skip => {
+                    let _ = multi.println(format!("Skipped {name}"));
+                    SlotDecision::Keep(None)
+                }
             }
         }
-        let _ = fs::remove_file(link);
     }
-    platform::create_link(target, link)
-        .map_err(|e| format!("link {} -> {}: {e}", link.display(), target.display()))?;
-    Ok(true)
+}
+
+fn link_binary(
+    paths: &Paths,
+    multi: &MultiProgress,
+    rdir: &Path,
+    claimed: &[PathBuf],
+    target: &Path,
+    link: &Path,
+    assume_yes: bool,
+) -> Result<LinkResult, String> {
+    let parent = link.parent().ok_or("link has no parent")?;
+    fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+
+    match classify_slot(paths, multi, rdir, claimed, link, assume_yes) {
+        SlotDecision::Keep(note) => Ok(LinkResult { linked: false, note }),
+        SlotDecision::Write(note) => {
+            if link.exists() || fs::symlink_metadata(link).is_ok() {
+                let _ = fs::remove_file(link);
+            }
+            platform::create_link(target, link)
+                .map_err(|e| format!("link {} -> {}: {e}", link.display(), target.display()))?;
+            Ok(LinkResult { linked: true, note })
+        }
+    }
 }
 
 /// Outcome of `link_all_executables`. Primary names go into the install
@@ -196,31 +289,30 @@ pub fn link_all_executables(
             .ok_or("non-utf8 binary name")?;
         let short = short_binary_name(basename);
         let link = bin.join(platform::link_filename(short));
-        if link_binary(paths, multi, target, &link, assume_yes)? {
+        // `refreshed` doubles as the "claimed this run" set — passing it in
+        // lets a second binary detect a name an earlier one already took.
+        let r = link_binary(paths, multi, &rdir, &refreshed, target, &link, assume_yes)?;
+        if r.linked {
             refreshed.push(link.clone());
             summary.primary.push(short.to_owned());
+        }
+        if let Some(note) = r.note {
+            summary.notes.push(note);
         }
 
         // Aliases scan + create. We attempt this on every primary executable;
         // most packages have one, but a multi-binary release with two
         // alias-bearing primaries would just contribute both lists. The
         // catalog-only gate is enforced inside `link_aliases_for`.
-        let alias_outcome = link_aliases_for(paths, multi, target, spec, alias_mode, assume_yes)?;
+        let alias_outcome =
+            link_aliases_for(paths, multi, &rdir, &refreshed, target, spec, alias_mode, assume_yes)?;
         for a in &alias_outcome.linked {
             refreshed.push(bin.join(platform::alias_link_filename(a)));
         }
-        // Dedup across primaries: two binaries declaring the same alias
-        // name would silently overwrite each other in bin_dir (last write
-        // wins), and the summary line would show "aliases: lzma lzma".
-        // First-seen wins.
-        for a in alias_outcome.linked {
-            if !summary.aliases.contains(&a) {
-                summary.aliases.push(a);
-            }
-        }
-        if let Some(note) = alias_outcome.note {
-            summary.notes.push(note);
-        }
+        // `classify_slot` already kept first-seen on disk (via `refreshed`),
+        // so a name can't appear twice here — no extra dedup needed.
+        summary.aliases.extend(alias_outcome.linked);
+        summary.notes.extend(alias_outcome.notes);
     }
 
     // Orphan cleanup: links that pointed into this repo's vdirs before but
@@ -281,14 +373,17 @@ pub fn link_all_executables(
 /// Outcome of attempting to install aliases for a single primary binary.
 struct AliasOutcome {
     linked: Vec<String>,
-    /// One-line note for the install summary when aliases were declared but
-    /// skipped (non-catalog source, `--no-aliases`, user said no at prompt).
-    note: Option<String>,
+    /// Zero or more one-line summary notes: aliases declared but skipped
+    /// (non-catalog source, `--no-aliases`, existing files) or a name that
+    /// collided with another binary/package.
+    notes: Vec<String>,
 }
 
 fn link_aliases_for(
     paths: &Paths,
     multi: &MultiProgress,
+    rdir: &Path,
+    claimed: &[PathBuf],
     primary: &Path,
     spec: &Spec,
     alias_mode: AliasMode,
@@ -298,13 +393,13 @@ fn link_aliases_for(
         None => {
             return Ok(AliasOutcome {
                 linked: vec![],
-                note: None,
+                notes: vec![],
             });
         }
         Some(m) if m.aliases.is_empty() => {
             return Ok(AliasOutcome {
                 linked: vec![],
-                note: None,
+                notes: vec![],
             });
         }
         Some(m) => m,
@@ -317,10 +412,10 @@ fn link_aliases_for(
     if spec.owner != CATALOG_OWNER {
         return Ok(AliasOutcome {
             linked: vec![],
-            note: Some(format!(
+            notes: vec![format!(
                 "{} alias(es) declared but ignored (non-catalog source)",
                 meta.aliases.len()
-            )),
+            )],
         });
     }
 
@@ -345,7 +440,7 @@ fn link_aliases_for(
     if !install {
         return Ok(AliasOutcome {
             linked: vec![],
-            note: Some(format!("{} alias(es) skipped", meta.aliases.len())),
+            notes: vec![format!("{} alias(es) skipped", meta.aliases.len())],
         });
     }
 
@@ -367,79 +462,72 @@ fn link_aliases_for(
 
     let bin = &paths.bin;
     let mut linked = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    // Foreign-file declines collapse into one summary line; collision notes
+    // (cross-package / intra-package) carry their own per-name text.
+    let mut declined: Vec<String> = Vec::new();
     for name in &meta.aliases {
         let link_path = bin.join(platform::alias_link_filename(name));
-        if link_alias(paths, multi, primary, &link_path, assume_yes)? {
+        let r = link_alias(paths, multi, rdir, claimed, primary, &link_path, assume_yes)?;
+        if r.linked {
             linked.push(name.clone());
-        } else {
-            // `link_alias` returned Ok(false): user declined an overwrite
-            // prompt. Surface this in the summary so the install line
-            // isn't a half-truth ("aliases: foo bar" while baz quietly
-            // didn't land).
-            skipped.push(name.clone());
+        } else if r.note.is_none() {
+            // Bare Ok(false): user declined a foreign-file overwrite. Surface
+            // it so the install line isn't a half-truth ("aliases: foo bar"
+            // while baz quietly didn't land).
+            declined.push(name.clone());
+        }
+        if let Some(n) = r.note {
+            notes.push(n);
         }
     }
 
     // No sidecar manifest written — the binary itself is the authoritative
     // source for which aliases this version declared. `remove`/`prune`
     // re-scan via `aliases_from_vdir` when they need the list.
-    let note = if skipped.is_empty() {
-        None
-    } else {
-        Some(format!(
+    if !declined.is_empty() {
+        notes.push(format!(
             "{} alias(es) not installed (existing files): {}",
-            skipped.len(),
-            skipped.join(", ")
-        ))
-    };
-    Ok(AliasOutcome { linked, note })
+            declined.len(),
+            declined.join(", ")
+        ));
+    }
+    Ok(AliasOutcome { linked, notes })
 }
 
-/// Create an alias link at `link`, prompting on collision the same way
-/// `link_binary` does. The actual filesystem op (`platform::create_alias_link`)
-/// is symlink on Unix and NTFS hardlink on Windows.
+/// Create an alias link at `link`, classifying an existing entry the same way
+/// `link_binary` does (intra-package dup, our own version, cross-package, or
+/// foreign file). The filesystem op (`platform::create_alias_link`) is a
+/// symlink on Unix and an NTFS hardlink on Windows.
+///
+/// Note: on Windows `read_link` can't introspect an existing alias *hardlink*
+/// (no target), so a pre-existing alias from another unpin package reads as a
+/// foreign file and takes the foreign-overwrite path rather than the
+/// cross-package one. That's the safe direction (prompt rather than silently
+/// clobber).
 fn link_alias(
     paths: &Paths,
     multi: &MultiProgress,
+    rdir: &Path,
+    claimed: &[PathBuf],
     target: &Path,
     link: &Path,
     assume_yes: bool,
-) -> Result<bool, String> {
+) -> Result<LinkResult, String> {
     let parent = link.parent().ok_or("alias link has no parent")?;
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
 
-    if link.exists() || fs::symlink_metadata(link).is_ok() {
-        // `read_link` recognizes our own symlinks (Unix) and `.cmd` wrappers
-        // (Windows primary-binary path) but NOT NTFS hardlinks — those have
-        // no introspectable target. So on Windows an existing alias hardlink
-        // looks "unmanaged" and triggers the prompt. That's the safe call:
-        // we'd rather pester than silently overwrite a pre-existing file.
-        let managed = platform::read_link(link)
-            .map(|t| t.starts_with(&paths.data))
-            .unwrap_or(false);
-        if !managed && !assume_yes {
-            let q = format!(
-                "{} already exists and was not installed by unpin. Overwrite (alias)?",
-                link.display()
-            );
-            let overwrite = match prompt_yes_no_with_skip(multi, &q) {
-                PromptResult::Got(true) => true,
-                PromptResult::Got(false) | PromptResult::Skip => false,
-            };
-            if !overwrite {
-                let _ = multi.println(format!(
-                    "Skipped alias {}",
-                    link.file_name().unwrap_or_default().to_string_lossy()
-                ));
-                return Ok(false);
+    match classify_slot(paths, multi, rdir, claimed, link, assume_yes) {
+        SlotDecision::Keep(note) => Ok(LinkResult { linked: false, note }),
+        SlotDecision::Write(note) => {
+            if link.exists() || fs::symlink_metadata(link).is_ok() {
+                let _ = fs::remove_file(link);
             }
+            platform::create_alias_link(target, link)
+                .map_err(|e| format!("alias {} -> {}: {e}", link.display(), target.display()))?;
+            Ok(LinkResult { linked: true, note })
         }
-        let _ = fs::remove_file(link);
     }
-    platform::create_alias_link(target, link)
-        .map_err(|e| format!("alias {} -> {}: {e}", link.display(), target.display()))?;
-    Ok(true)
 }
 
 /// Scan every executable in `vdir` for an embedded UNPIN_META block and
@@ -503,6 +591,84 @@ pub fn sweep_dangling_links(bin: &Path, root: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_owner_repo_extracts_two_leading_components() {
+        let data = Path::new("/d/unpin");
+        assert_eq!(
+            link_owner_repo(data, Path::new("/d/unpin/me/tool/v1/bin/x")),
+            Some("me/tool".to_string())
+        );
+        // Fewer than two components under data → None.
+        assert_eq!(link_owner_repo(data, Path::new("/d/unpin/me")), None);
+        // Target not under data → None.
+        assert_eq!(link_owner_repo(data, Path::new("/other/x/y")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_slot_covers_the_four_cases() {
+        use indicatif::ProgressDrawTarget;
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let paths = Paths {
+            data: data.clone(),
+            bin: bin.clone(),
+            config: tmp.path().join("config"),
+        };
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let rdir = paths.repo_dir("me", "tool");
+        let link = bin.join("x");
+
+        // Create a real binary under <owner>/<repo>/v1/bin and return its path.
+        let mk_target = |owner: &str, repo: &str| -> PathBuf {
+            let vbin = data.join(owner).join(repo).join("v1").join("bin");
+            fs::create_dir_all(&vbin).unwrap();
+            let t = vbin.join("x");
+            fs::write(&t, b"x").unwrap();
+            t
+        };
+
+        // 1. Free slot → write.
+        assert!(matches!(
+            classify_slot(&paths, &multi, &rdir, &[], &link, true),
+            SlotDecision::Write(None)
+        ));
+
+        // 2. Already claimed this run → keep first, with a note.
+        assert!(matches!(
+            classify_slot(&paths, &multi, &rdir, &[link.clone()], &link, true),
+            SlotDecision::Keep(Some(_))
+        ));
+
+        // 3. Our own previous version → silent overwrite.
+        symlink(mk_target("me", "tool"), &link).unwrap();
+        assert!(matches!(
+            classify_slot(&paths, &multi, &rdir, &[], &link, true),
+            SlotDecision::Write(None)
+        ));
+        fs::remove_file(&link).unwrap();
+
+        // 4. Another package owns it; -y lets the explicit install win + note.
+        symlink(mk_target("them", "other"), &link).unwrap();
+        match classify_slot(&paths, &multi, &rdir, &[], &link, true) {
+            SlotDecision::Write(Some(n)) => assert!(n.contains("them/other"), "note: {n}"),
+            d => panic!("expected cross-package Write(Some), got {:?}", matches!(d, SlotDecision::Keep(_))),
+        }
+        fs::remove_file(&link).unwrap();
+
+        // 5. Foreign file; -y overwrites without a shadow note.
+        fs::write(&link, b"foreign").unwrap();
+        assert!(matches!(
+            classify_slot(&paths, &multi, &rdir, &[], &link, true),
+            SlotDecision::Write(None)
+        ));
+    }
 
     #[test]
     fn short_name_strips_target_triple_suffix() {
