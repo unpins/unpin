@@ -97,17 +97,32 @@ fn write_untrusted_name<R: Read>(dir: &Path, name: &str, mut reader: R) -> Resul
     Ok(())
 }
 
-/// Best-effort clear of whatever's at `path` so a fresh entry of a different
-/// kind can take its place. `dir.create()` doesn't replace dirs and
-/// `dir.symlink()` doesn't replace regular files, so without this helper
-/// a tarball that intentionally rewrites a path (file → dir, dir → symlink)
-/// errors out mid-extract. cap-std refuses traversal so neither call can
-/// touch anything outside the cap dir; both errors are silently ignored
-/// because exactly one of the two will succeed (or both fail with ENOENT
-/// for fresh extracts, which is fine).
-fn remove_existing(dir: &cap_std::fs::Dir, path: &Path) {
-    let _ = dir.remove_file(path);
-    let _ = dir.remove_dir_all(path);
+/// Clear whatever's at `path` so a fresh entry of a different kind can take
+/// its place. `dir.create()` doesn't replace dirs and `dir.symlink()` doesn't
+/// replace regular files, so without this helper a tarball that intentionally
+/// rewrites a path (file → dir, dir → symlink) errors out mid-extract. cap-std
+/// refuses traversal so neither call can touch anything outside the cap dir.
+///
+/// We try `remove_file` first (covers regular files and symlinks); if that
+/// reports the path is missing, there's nothing to clear and we're done — a
+/// fresh extract takes this path. Any *other* `remove_file` failure means the
+/// path exists but isn't a plain file (typically a directory: unlink yields
+/// EISDIR/EPERM, never ENOENT), so we fall through to `remove_dir_all`. Only a
+/// genuine `remove_dir_all` failure — not "already gone" — is propagated, so
+/// the caller surfaces the root cause ("remove existing X: …") instead of a
+/// confusing downstream "create X: …" symptom.
+fn remove_existing(dir: &cap_std::fs::Dir, path: &Path) -> Result<(), String> {
+    match dir.remove_file(path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        // Not a plain file — likely a directory; let remove_dir_all handle it.
+        Err(_) => {}
+    }
+    match dir.remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove existing {}: {e}", path.display())),
+    }
 }
 
 /// Return a known compression suffix if `lower_name` ends with one we don't
@@ -205,7 +220,7 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                 // already-symlinked or already-directory path. Tarballs
                 // sometimes rewrite a path between kinds across entries;
                 // remove_file alone leaks a dir → file replacement.
-                remove_existing(&dir, &path);
+                remove_existing(&dir, &path)?;
                 let mut out = dir
                     .create(&path)
                     .map_err(|e| format!("create {}: {e}", path.display()))?;
@@ -230,7 +245,7 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                     .link_name()
                     .map_err(|e| format!("symlink target for {}: {e}", path.display()))?
                     .ok_or_else(|| format!("symlink {} has empty target", path.display()))?;
-                remove_existing(&dir, &path);
+                remove_existing(&dir, &path)?;
                 // cap-std refuses creating a symlink that would itself
                 // escape, AND refuses following symlinks that point
                 // outside on subsequent opens (RESOLVE_BENEATH). So even
@@ -260,7 +275,7 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                     .link_name()
                     .map_err(|e| format!("hardlink src for {}: {e}", path.display()))?
                     .ok_or_else(|| format!("hardlink {} has empty src", path.display()))?;
-                remove_existing(&dir, &path);
+                remove_existing(&dir, &path)?;
                 dir.hard_link(&*src, &dir, &path)
                     .map_err(|e| format!("hardlink {}: {e}", path.display()))?;
             }
@@ -333,7 +348,7 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
             dir.create_dir_all(parent)
                 .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
-        remove_existing(&dir, &rel);
+        remove_existing(&dir, &rel)?;
         let mut out = dir
             .create(&rel)
             .map_err(|e| format!("create {}: {e}", rel.display()))?;
@@ -826,6 +841,45 @@ mod tests {
 
         // Chmod back so tempdir teardown can recurse-delete.
         fs::set_permissions(tmp.path().join("share"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn extract_tar_rewrites_dir_to_file_across_entries() {
+        // A tarball that emits `slot/` (with a child, so it's a non-empty
+        // directory) and later a regular-file entry at the same path `slot`.
+        // The file entry must win: `dir.create("slot")` can't replace a dir,
+        // so remove_existing has to clear the directory first. This exercises
+        // remove_existing's remove_file→remove_dir_all fall-through, and proves
+        // the now-fallible helper still resolves the rewrite (rather than
+        // erroring) on the happy path.
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_path("slot/").unwrap();
+        h.set_size(0);
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mode(0o755);
+        h.set_cksum();
+        builder.append(&h, std::io::empty()).unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_path("slot/child").unwrap();
+        h.set_size(3);
+        h.set_mode(0o644);
+        h.set_cksum();
+        builder.append(&h, &b"old"[..]).unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_path("slot").unwrap();
+        let body = b"i am a file now";
+        h.set_size(body.len() as u64);
+        h.set_mode(0o755);
+        h.set_cksum();
+        builder.append(&h, &body[..]).unwrap();
+        let bytes = builder.into_inner().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.tar", &bytes[..], tmp.path()).unwrap();
+        let p = tmp.path().join("slot");
+        assert!(p.is_file(), "slot should be a regular file, not a dir");
+        assert_eq!(read_file(&p), body);
     }
 
     #[test]
