@@ -182,6 +182,14 @@ fn stream_scan<R: Read>(mut reader: R) -> Result<Option<Meta>, String> {
     // carries a marker (e.g. git embedding dash). Compaction here keeps
     // memory bounded — we read to EOF but never hold more than ~CHUNK +
     // overlap bytes.
+    //
+    // The read-to-EOF is load-bearing, NOT a tolerated cost: a second marker
+    // can sit anywhere, so proving there's only one requires scanning the
+    // whole remainder. Do NOT add a byte cap here — it would create a blind
+    // spot past which a crafted binary could hide a second marker and smuggle
+    // the first payload's aliases past this check. Note all three phases share
+    // one forward-only reader, so phases 1+2+3 are a single sequential pass
+    // over the file, not repeated reads.
     if find_in_chunks(&mut reader, &mut acc, MARKER_BEGIN, SCAN_CHUNK)?.is_some() {
         return Err("found multiple UNPIN_META begin markers in binary — refusing to guess".into());
     }
