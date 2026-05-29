@@ -18,6 +18,7 @@
 //! another binary (e.g. git embedding dash) could otherwise smuggle a
 //! second alias set past the first.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
@@ -284,16 +285,19 @@ fn parse_payload(payload: &[u8]) -> Result<Meta, String> {
                 // Dedup while preserving first-seen order. Duplicate names
                 // would otherwise cause double link creation (second
                 // overwrites first, harmless but wasteful) and a noisy
-                // `aliases: foo foo bar` in the install summary.
-                let mut seen: Vec<String> = Vec::new();
+                // `aliases: foo foo bar` in the install summary. A HashSet of
+                // borrowed slices does the membership check in O(1); `out`
+                // keeps the order and owns only the names we actually keep.
+                let mut seen: HashSet<&str> = HashSet::new();
+                let mut out: Vec<String> = Vec::new();
                 for s in value.split(',') {
                     let s = s.trim();
-                    if s.is_empty() || seen.iter().any(|x| x == s) {
+                    if s.is_empty() || !seen.insert(s) {
                         continue;
                     }
-                    seen.push(s.to_string());
+                    out.push(s.to_string());
                 }
-                meta.aliases = seen;
+                meta.aliases = out;
             }
             _ => {}
         }
