@@ -10,12 +10,18 @@ use std::env;
 
 use crate::config::Config;
 use crate::http::{self, HttpClient};
+use crate::platform::Paths;
 
 pub struct Ctx {
     pub cfg: Config,
     pub http: Box<dyn HttpClient>,
     pub auth: Option<String>,
     pub verbose: bool,
+    /// On-disk layout, resolved once in `main` and threaded in here so the
+    /// network commands (and the extract workers that share `&Ctx`) reach it
+    /// without a separate parameter. Local-only commands carry `&Paths`
+    /// directly instead.
+    pub paths: Paths,
 }
 
 impl Ctx {
@@ -23,8 +29,8 @@ impl Ctx {
     /// timeout. Only called for commands that hit GitHub (install, update,
     /// run, info) — local-only commands (list, remove, prune, completion)
     /// skip this so they don't pay for `gh auth token` shell-out etc.
-    pub fn new(verbose: bool) -> Self {
-        let cfg = Config::load();
+    pub fn new(verbose: bool, paths: Paths) -> Self {
+        let cfg = Config::load(&paths.config);
         let http = http::default_client(cfg.http_timeout());
         let auth = resolve_auth_header(&cfg);
         Self {
@@ -32,6 +38,7 @@ impl Ctx {
             http,
             auth,
             verbose,
+            paths,
         }
     }
 }

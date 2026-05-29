@@ -20,6 +20,7 @@ use crate::aliases::AliasMode;
 use crate::archive;
 use crate::ctx::Ctx;
 use crate::github::{self, Asset, Release};
+use crate::platform::Paths;
 
 use super::asset::{
     fetch_expected_sha256, find_checksum_url, find_companion, narrow_assets, pick_asset,
@@ -28,7 +29,7 @@ use super::job::{PipelineMode, PipelineRequest, PrepareOutcome, PromptKind, Reso
 use super::linker::{LinkSummary, link_all_executables};
 use super::prompt::{PromptResult, prompt_pick_with_skip, prompt_yes_no_with_skip};
 use super::spec::Spec;
-use super::{RepoLock, active_version, fetch_release, prompt_yes_no, repo_dir, version_dir};
+use super::{RepoLock, active_version, fetch_release, prompt_yes_no};
 
 /// Resolved per-invocation policy for one `install`/`update` call. Bundled
 /// so the pipeline functions don't carry a five-arg tail of policy flags.
@@ -159,6 +160,7 @@ fn resolve_checksum_for(
 /// previous attempt. The lock is held by the returned `RepoLock`; callers
 /// place it in `ExtractJob._lock` so it lives through extract + linking.
 fn prepare_workspace_dirs(
+    paths: &Paths,
     spec: &Spec,
     vdir: &Path,
     extract_dir: &Path,
@@ -167,7 +169,7 @@ fn prepare_workspace_dirs(
     // and *before* the first destructive write. Holding it through the
     // prompt would force a parallel install on the same package to error
     // out while the user is at coffee.
-    let lock = RepoLock::acquire(&repo_dir(&spec.owner, &spec.name))?;
+    let lock = RepoLock::acquire(&paths.repo_dir(&spec.owner, &spec.name))?;
     // --pick (or incomplete cache) on a cached version: wipe before re-extracting.
     // Also wipe a leftover `.part` from a previous run that got SIGKILL'd between
     // extract and rename — without this the second attempt would start from a
@@ -193,7 +195,7 @@ pub fn preflight_extract(
     pick: bool,
     include_data: bool,
 ) -> Result<ExtractJob, String> {
-    let vdir = version_dir(&spec.owner, &spec.name, &release.tag_name);
+    let vdir = ctx.paths.version_dir(&spec.owner, &spec.name, &release.tag_name);
     // `--no-data` (or `data = false` in config) suppresses the companion lookup
     // entirely. As a side effect the cache-complete check no longer requires
     // `share/`, so a vdir installed without data won't be re-extracted by a
@@ -224,7 +226,7 @@ pub fn preflight_extract(
     }
     let asset = pick_asset(&release.assets, &spec.name, pick, ctx.verbose)?.clone();
     let extract_dir = part_dir_for(&vdir);
-    let lock = prepare_workspace_dirs(&spec, &vdir, &extract_dir)?;
+    let lock = prepare_workspace_dirs(&ctx.paths, &spec, &vdir, &extract_dir)?;
     let expected_sha256 =
         resolve_checksum_for(ctx, &release.assets, &asset.name, ChecksumKind::Primary, assume_yes)?;
     let companion = if include_data {
@@ -296,7 +298,7 @@ pub fn do_extract(
     let Some(primary_asset) = job.asset.as_ref() else {
         return Ok(()); // cached
     };
-    let rdir = repo_dir(&job.spec.owner, &job.spec.name);
+    let rdir = ctx.paths.repo_dir(&job.spec.owner, &job.spec.name);
     fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
     crate::sigint::push_cleanup(&job.extract_dir);
     let mut guard = CleanupGuard::arm(job.extract_dir.clone());
@@ -718,7 +720,7 @@ pub fn run_pipeline_v2(
                             // No transient "Using cached" message — link_on_main
                             // immediately morphs the bar to "Linking..." and the
                             // intermediate state would just flicker.
-                            link_on_main(opts, request, pb, &multi, job, &mut errors);
+                            link_on_main(&ctx.paths, opts, request, pb, &multi, job, &mut errors);
                         }
                         Ok(Resolved::Ready(job)) => {
                             let _ = extract_tx.send((idx, job));
@@ -742,7 +744,7 @@ pub fn run_pipeline_v2(
             let request = &requests[idx];
             let pb = &bars[idx];
             match result {
-                Ok(()) => link_on_main(opts, request, pb, &multi, job, &mut errors),
+                Ok(()) => link_on_main(&ctx.paths, opts, request, pb, &multi, job, &mut errors),
                 Err(e) => {
                     pb.set_style(github::done_fail_style());
                     pb.finish_with_message(e.clone());
@@ -761,6 +763,7 @@ pub fn run_pipeline_v2(
 /// alias-ask) go through `multi.suspend` so the persistent bars don't
 /// tear when the linker reads stdin.
 fn link_on_main(
+    paths: &Paths,
     opts: &InstallOptions,
     request: &PipelineRequest,
     pb: &ProgressBar,
@@ -775,8 +778,8 @@ fn link_on_main(
     // bin/ symlinks — that's what makes the summary line read
     // "Updated v1 → v2" instead of just "Installed v2" on an upgrade.
     // A fresh install gets `None` here and falls back to "Installed".
-    let previous = active_version(&job.spec.owner, &job.spec.name);
-    match link_all_executables(multi, &job.spec, &job.vdir, opts.assume_yes, opts.alias_mode) {
+    let previous = active_version(paths, &job.spec.owner, &job.spec.name);
+    match link_all_executables(paths, multi, &job.spec, &job.vdir, opts.assume_yes, opts.alias_mode) {
         Ok(summary) => {
             pb.set_style(github::done_ok_style());
             pb.finish_with_message(install_summary_message(
@@ -808,13 +811,13 @@ fn preflight_resolve(
     // Update-mode short-circuit: nothing changed → skip the whole pipeline
     // for this request. Read of bin_dir is pure; safe to call concurrently.
     if matches!(mode, PipelineMode::Update) {
-        let current = active_version(&spec.owner, &spec.name);
+        let current = active_version(&ctx.paths, &spec.owner, &spec.name);
         if current.as_deref() == Some(release.tag_name.as_str()) {
             return Ok(PrepareOutcome::UpToDate(Box::new(release)));
         }
     }
 
-    let vdir = version_dir(&spec.owner, &spec.name, &release.tag_name);
+    let vdir = ctx.paths.version_dir(&spec.owner, &spec.name, &release.tag_name);
     let companion_peek = if opts.include_data {
         find_companion(&spec.name, &release.tag_name, &release.assets)
     } else {
@@ -903,14 +906,14 @@ fn finalize_resolution(
     match outcome {
         PrepareOutcome::UpToDate(release) => Ok(Resolved::UpToDate(release.tag_name)),
         PrepareOutcome::Cached(release) => {
-            match check_replace_active(spec, &release.tag_name, mode, opts, multi) {
+            match check_replace_active(&ctx.paths, spec, &release.tag_name, mode, opts, multi) {
                 ReplaceDecision::Proceed => {}
                 ReplaceDecision::Skip(reason) => return Ok(Resolved::Skipped(reason)),
             }
             // Cached jobs have no lock — preflight already saw a complete
             // vdir, so the extractor will short-circuit. Lock semantics
             // match the legacy preflight path.
-            let vdir = version_dir(&spec.owner, &spec.name, &release.tag_name);
+            let vdir = ctx.paths.version_dir(&spec.owner, &spec.name, &release.tag_name);
             Ok(Resolved::Cached(ExtractJob {
                 spec: spec.clone(),
                 release: *release,
@@ -924,12 +927,12 @@ fn finalize_resolution(
             }))
         }
         PrepareOutcome::Ready(data) => {
-            match check_replace_active(spec, &data.release.tag_name, mode, opts, multi) {
+            match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, multi) {
                 ReplaceDecision::Proceed => {}
                 ReplaceDecision::Skip(reason) => return Ok(Resolved::Skipped(reason)),
             }
             pb.set_message("Preparing...");
-            let job = into_extract_job(spec.clone(), *data)?;
+            let job = into_extract_job(&ctx.paths, spec.clone(), *data)?;
             Ok(Resolved::Ready(job))
         }
         PrepareOutcome::NeedsPrompt(kind, mut data) => {
@@ -1040,12 +1043,12 @@ fn finalize_resolution(
                 }
                 data.companion_checksum_missing = false;
             }
-            match check_replace_active(spec, &data.release.tag_name, mode, opts, multi) {
+            match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, multi) {
                 ReplaceDecision::Proceed => {}
                 ReplaceDecision::Skip(reason) => return Ok(Resolved::Skipped(reason)),
             }
             pb.set_message("Preparing...");
-            let job = into_extract_job(spec.clone(), *data)?;
+            let job = into_extract_job(&ctx.paths, spec.clone(), *data)?;
             Ok(Resolved::Ready(job))
         }
     }
@@ -1070,6 +1073,7 @@ enum ReplaceDecision {
 /// short of a clear "yes" is a non-fatal skip — the user explicitly chose
 /// not to clobber the existing install.
 fn check_replace_active(
+    paths: &Paths,
     spec: &Spec,
     requested_tag: &str,
     mode: PipelineMode,
@@ -1079,7 +1083,7 @@ fn check_replace_active(
     if mode != PipelineMode::Install || opts.assume_yes {
         return ReplaceDecision::Proceed;
     }
-    let current = match active_version(&spec.owner, &spec.name) {
+    let current = match active_version(paths, &spec.owner, &spec.name) {
         Some(c) => c,
         None => return ReplaceDecision::Proceed,
     };
@@ -1102,10 +1106,10 @@ fn check_replace_active(
 /// and wipes any stale `.part` / vdir. Runs on the main thread so lock
 /// acquisition is serialized — no race between parallel preflight workers
 /// trying to take the same lock.
-fn into_extract_job(spec: Spec, data: ResolutionData) -> Result<ExtractJob, String> {
-    let vdir = version_dir(&spec.owner, &spec.name, &data.release.tag_name);
+fn into_extract_job(paths: &Paths, spec: Spec, data: ResolutionData) -> Result<ExtractJob, String> {
+    let vdir = paths.version_dir(&spec.owner, &spec.name, &data.release.tag_name);
     let extract_dir = part_dir_for(&vdir);
-    let lock = prepare_workspace_dirs(&spec, &vdir, &extract_dir)?;
+    let lock = prepare_workspace_dirs(paths, &spec, &vdir, &extract_dir)?;
     Ok(ExtractJob {
         spec,
         release: data.release,

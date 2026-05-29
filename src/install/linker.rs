@@ -5,9 +5,9 @@
 //! and (since the orphan-cleanup fix) wipes leftover links from prior versions
 //! the new manifest no longer declares.
 //!
-//! Helpers (`walk_files`, `is_executable`, `ensure_executable`, etc.) and the
-//! path-building functions (`bin_dir`, `data_dir`, `repo_dir`) live in the
-//! parent module and come in via `super::`.
+//! Helpers (`walk_files`, `is_executable`, `ensure_executable`, etc.) live in
+//! the parent module and come in via `super::`; the on-disk layout (`bin`,
+//! `data`, `repo_dir`) arrives as a borrowed [`crate::platform::Paths`].
 
 use std::fs;
 use std::io;
@@ -16,11 +16,10 @@ use std::path::{Path, PathBuf};
 use indicatif::MultiProgress;
 
 use crate::aliases::{self, AliasMode};
-use crate::platform;
+use crate::platform::{self, Paths};
 
 use super::prompt::{PromptResult, prompt_yes_no_with_skip};
 use super::spec::{CATALOG_OWNER, Spec};
-use super::{bin_dir, data_dir, repo_dir};
 
 pub fn walk_files(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(root)? {
@@ -92,6 +91,7 @@ fn short_binary_name(name: &str) -> &str {
 }
 
 fn link_binary(
+    paths: &Paths,
     multi: &MultiProgress,
     target: &Path,
     link: &Path,
@@ -102,7 +102,7 @@ fn link_binary(
 
     if link.exists() || fs::symlink_metadata(link).is_ok() {
         let managed = platform::read_link(link)
-            .map(|t| t.starts_with(data_dir()))
+            .map(|t| t.starts_with(&paths.data))
             .unwrap_or(false);
         if !managed && !assume_yes {
             let q = format!(
@@ -140,6 +140,7 @@ pub struct LinkSummary {
 }
 
 pub fn link_all_executables(
+    paths: &Paths,
     multi: &MultiProgress,
     spec: &Spec,
     vdir: &Path,
@@ -163,8 +164,8 @@ pub fn link_all_executables(
         executables.push(p.clone());
     }
 
-    let bin = bin_dir();
-    let rdir = repo_dir(&spec.owner, &spec.name);
+    let bin = &paths.bin;
+    let rdir = paths.repo_dir(&spec.owner, &spec.name);
 
     // Snapshot of unpin-managed links currently pointing anywhere into this
     // package's repo dir. After linking the new version we use this to wipe
@@ -195,7 +196,7 @@ pub fn link_all_executables(
             .ok_or("non-utf8 binary name")?;
         let short = short_binary_name(basename);
         let link = bin.join(platform::link_filename(short));
-        if link_binary(multi, target, &link, assume_yes)? {
+        if link_binary(paths, multi, target, &link, assume_yes)? {
             refreshed.push(link.clone());
             summary.primary.push(short.to_owned());
         }
@@ -204,7 +205,7 @@ pub fn link_all_executables(
         // most packages have one, but a multi-binary release with two
         // alias-bearing primaries would just contribute both lists. The
         // catalog-only gate is enforced inside `link_aliases_for`.
-        let alias_outcome = link_aliases_for(multi, target, spec, alias_mode, assume_yes)?;
+        let alias_outcome = link_aliases_for(paths, multi, target, spec, alias_mode, assume_yes)?;
         for a in &alias_outcome.linked {
             refreshed.push(bin.join(platform::alias_link_filename(a)));
         }
@@ -286,6 +287,7 @@ struct AliasOutcome {
 }
 
 fn link_aliases_for(
+    paths: &Paths,
     multi: &MultiProgress,
     primary: &Path,
     spec: &Spec,
@@ -363,12 +365,12 @@ fn link_aliases_for(
         aliases::validate_alias(name)?;
     }
 
-    let bin = bin_dir();
+    let bin = &paths.bin;
     let mut linked = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     for name in &meta.aliases {
         let link_path = bin.join(platform::alias_link_filename(name));
-        if link_alias(multi, primary, &link_path, assume_yes)? {
+        if link_alias(paths, multi, primary, &link_path, assume_yes)? {
             linked.push(name.clone());
         } else {
             // `link_alias` returned Ok(false): user declined an overwrite
@@ -398,6 +400,7 @@ fn link_aliases_for(
 /// `link_binary` does. The actual filesystem op (`platform::create_alias_link`)
 /// is symlink on Unix and NTFS hardlink on Windows.
 fn link_alias(
+    paths: &Paths,
     multi: &MultiProgress,
     target: &Path,
     link: &Path,
@@ -413,7 +416,7 @@ fn link_alias(
         // looks "unmanaged" and triggers the prompt. That's the safe call:
         // we'd rather pester than silently overwrite a pre-existing file.
         let managed = platform::read_link(link)
-            .map(|t| t.starts_with(data_dir()))
+            .map(|t| t.starts_with(&paths.data))
             .unwrap_or(false);
         if !managed && !assume_yes {
             let q = format!(

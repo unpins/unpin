@@ -44,15 +44,15 @@ impl Cmd {
     /// `Ok(code)` carries the desired process exit code. Most subcommands
     /// produce 0 on success; `run` forwards the child's exit code so callers
     /// can chain unpin into shell pipelines without losing failure signals.
-    fn run(self) -> Result<i32, String> {
+    fn run(self, paths: &platform::Paths) -> Result<i32, String> {
         match self {
-            Cmd::Install(c) => c.run().map(|()| 0),
-            Cmd::Update(c) => c.run().map(|()| 0),
-            Cmd::Remove(c) => c.run().map(|()| 0),
-            Cmd::List => install::list().map(|()| 0),
-            Cmd::Info(c) => c.run().map(|()| 0),
-            Cmd::Prune => install::prune().map(|()| 0),
-            Cmd::Run(c) => c.run(),
+            Cmd::Install(c) => c.run(paths).map(|()| 0),
+            Cmd::Update(c) => c.run(paths).map(|()| 0),
+            Cmd::Remove(c) => c.run(paths).map(|()| 0),
+            Cmd::List => install::list(paths).map(|()| 0),
+            Cmd::Info(c) => c.run(paths).map(|()| 0),
+            Cmd::Prune => install::prune(paths).map(|()| 0),
+            Cmd::Run(c) => c.run(paths),
             Cmd::Completion(c) => c.run().map(|()| 0),
         }
     }
@@ -68,8 +68,8 @@ struct InstallCmd {
 }
 
 impl InstallCmd {
-    fn run(self) -> Result<(), String> {
-        let (ctx, opts) = self.flags.resolve();
+    fn run(self, paths: &platform::Paths) -> Result<(), String> {
+        let (ctx, opts) = self.flags.resolve(paths);
         install::install_many(&ctx, &opts, &self.pkgs)
     }
 }
@@ -84,8 +84,8 @@ struct UpdateCmd {
 }
 
 impl UpdateCmd {
-    fn run(self) -> Result<(), String> {
-        let (ctx, opts) = self.flags.resolve();
+    fn run(self, paths: &platform::Paths) -> Result<(), String> {
+        let (ctx, opts) = self.flags.resolve(paths);
         install::update(&ctx, &opts, &self.names)
     }
 }
@@ -101,8 +101,8 @@ struct RemoveCmd {
 }
 
 impl RemoveCmd {
-    fn run(self) -> Result<(), String> {
-        install::remove_many(&self.names, self.assume_yes)
+    fn run(self, paths: &platform::Paths) -> Result<(), String> {
+        install::remove_many(paths, &self.names, self.assume_yes)
     }
 }
 
@@ -117,8 +117,8 @@ struct InfoCmd {
 }
 
 impl InfoCmd {
-    fn run(self) -> Result<(), String> {
-        let ctx = ctx::Ctx::new(self.verbose);
+    fn run(self, paths: &platform::Paths) -> Result<(), String> {
+        let ctx = ctx::Ctx::new(self.verbose, paths.clone());
         install::info_many(&ctx, &self.pkgs)
     }
 }
@@ -147,8 +147,8 @@ struct RunCmd {
 }
 
 impl RunCmd {
-    fn run(self) -> Result<i32, String> {
-        let ctx = ctx::Ctx::new(self.verbose);
+    fn run(self, paths: &platform::Paths) -> Result<i32, String> {
+        let ctx = ctx::Ctx::new(self.verbose, paths.clone());
         install::run(&ctx, &self.pkg, &self.args, self.pick, self.assume_yes)
     }
 }
@@ -208,8 +208,8 @@ struct InstallUpdateFlags {
 }
 
 impl InstallUpdateFlags {
-    fn resolve(&self) -> (ctx::Ctx, install::InstallOptions) {
-        let ctx = ctx::Ctx::new(self.verbose);
+    fn resolve(&self, paths: &platform::Paths) -> (ctx::Ctx, install::InstallOptions) {
+        let ctx = ctx::Ctx::new(self.verbose, paths.clone());
         let alias_override =
             resolve_alias_override(self.aliases_yes, self.aliases_no, self.aliases_ask);
         let opts = install::InstallOptions::resolve(
@@ -252,13 +252,16 @@ fn print_banner() {
     println!("https://unpins.org");
 }
 
-fn print_auth_footer() {
+fn print_auth_footer(config_path: Option<&std::path::Path>) {
     println!();
     println!("Auth (optional, raises GitHub API rate limit from 60/h to 5000/h):");
     println!("  GITHUB_TOKEN | GH_TOKEN          token from env var");
     println!("  use_gh_auth = true (in config)   use `gh auth token`");
     println!();
-    println!("Config file: {}", platform::config_path().display());
+    match config_path {
+        Some(p) => println!("Config file: {}", p.display()),
+        None => println!("Config file: (unresolved: $HOME not set)"),
+    }
     println!("  Flat `key = value` with `#` comments. Recognized keys:");
     println!("    http_timeout = <seconds>   per-request HTTP timeout (default: 30)");
     println!("    use_gh_auth  = true|false  shell out to `gh auth token` (default: false)");
@@ -379,18 +382,31 @@ fn main() -> ExitCode {
         println!();
     }
 
+    // Resolve the install paths once, up front. Held as a `Result` so that
+    // help/usage output still renders when `$HOME` is unset (the footer just
+    // shows the config path as unresolved) — only an actual command treats a
+    // missing base dir as a hard error.
+    let paths = platform::Paths::resolve();
+
     let cli = match parse_args(&raw) {
         Ok(c) => c,
         Err(err) => {
             let code = err.exit_code() as u8;
             err.print().ok();
             if matches!(help_kind, HelpKind::TopLevel) {
-                print_auth_footer();
+                print_auth_footer(paths.as_ref().ok().map(|p| p.config.as_path()));
             }
             return ExitCode::from(code);
         }
     };
-    match cli.command.run() {
+    let paths = match paths {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("unpin: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match cli.command.run(&paths) {
         Ok(0) => ExitCode::SUCCESS,
         // Child exit codes are 8-bit on Unix (waitpid masks the low byte); on
         // Windows they fit a DWORD but ExitCode caps at u8 anyway. Truncating

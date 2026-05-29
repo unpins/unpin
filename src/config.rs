@@ -14,9 +14,9 @@
 //! to the key's default (so a typo in `http_timeout` doesn't crash unpin).
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::aliases::AliasMode;
-use crate::platform;
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -25,8 +25,10 @@ pub struct Config {
 
 impl Config {
     /// Read and parse the user's config file. Missing file → empty `Config`.
-    pub fn load() -> Self {
-        let text = std::fs::read_to_string(platform::config_path()).unwrap_or_default();
+    /// The path comes from the pre-resolved [`crate::platform::Paths`] so the
+    /// env-var resolution (and its fail-loud check) happens once at startup.
+    pub fn load(config_path: &Path) -> Self {
+        let text = std::fs::read_to_string(config_path).unwrap_or_default();
         Self::parse(&text)
     }
 

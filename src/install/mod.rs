@@ -7,7 +7,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 
 use crate::ctx::Ctx;
 use crate::github::{self, Release};
-use crate::platform;
+use crate::platform::{self, Paths};
 
 mod asset;
 mod job;
@@ -26,22 +26,6 @@ use pipeline::{do_extract, finalize_primary_bar, preflight_extract, run_pipeline
 use prompt::{PromptResult, prompt_pick_with_skip};
 use spec::validate_path_component;
 pub use spec::{Spec, parse_spec};
-
-pub(super) fn data_dir() -> PathBuf {
-    platform::data_dir()
-}
-
-pub(super) fn bin_dir() -> PathBuf {
-    platform::bin_dir()
-}
-
-pub(super) fn repo_dir(owner: &str, name: &str) -> PathBuf {
-    data_dir().join(owner).join(name)
-}
-
-pub(super) fn version_dir(owner: &str, name: &str, tag: &str) -> PathBuf {
-    repo_dir(owner, name).join(tag)
-}
 
 /// Sibling-staging dirs created by the extract pipeline (`<tag>.part`)
 /// live alongside real version dirs in `repo_dir/`. Reads that enumerate
@@ -75,10 +59,10 @@ fn dedup_keep_first<T>(items: Vec<T>, mut same: impl FnMut(&T, &T) -> bool) -> V
 
 /// Search the data dir for a repo matching `name`. Accepts "owner/repo" or a
 /// bare repo name (searches all owners; ambiguous match is an error).
-fn resolve_installed(name: &str) -> Result<Option<(String, String)>, String> {
+fn resolve_installed(paths: &Paths, name: &str) -> Result<Option<(String, String)>, String> {
     if let Some((owner, repo)) = name.split_once('/') {
         if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
-            return Ok(if repo_dir(owner, repo).is_dir() {
+            return Ok(if paths.repo_dir(owner, repo).is_dir() {
                 Some((owner.to_owned(), repo.to_owned()))
             } else {
                 None
@@ -86,8 +70,8 @@ fn resolve_installed(name: &str) -> Result<Option<(String, String)>, String> {
         }
         return Err(format!("invalid name: `{name}`"));
     }
-    let root = data_dir();
-    let entries = match fs::read_dir(&root) {
+    let root = &paths.data;
+    let entries = match fs::read_dir(root) {
         Ok(e) => e,
         Err(_) => return Ok(None),
     };
@@ -128,16 +112,16 @@ fn resolve_installed(name: &str) -> Result<Option<(String, String)>, String> {
 /// "from" in the `from -> to` line). Returning `None` is honest and the
 /// pipeline handles it fine: `preflight_resolve` sees the cached vdir and
 /// skips the download, so `update` just re-links without re-downloading.
-pub(super) fn active_version(owner: &str, name: &str) -> Option<String> {
-    let rdir = repo_dir(owner, name);
-    let bins = fs::read_dir(bin_dir()).ok()?;
+pub(super) fn active_version(paths: &Paths, owner: &str, name: &str) -> Option<String> {
+    let rdir = paths.repo_dir(owner, name);
+    let bins = fs::read_dir(&paths.bin).ok()?;
     for entry in bins.flatten() {
         if let Some(target) = platform::read_link(&entry.path())
             && let Ok(rel) = target.strip_prefix(&rdir)
             && let Some(first) = rel.components().next()
         {
             let v = first.as_os_str().to_string_lossy().into_owned();
-            if version_dir(owner, name, &v).is_dir() {
+            if paths.version_dir(owner, name, &v).is_dir() {
                 return Some(v);
             }
         }
@@ -304,9 +288,9 @@ fn resolve_argv_version_collisions(
         .collect())
 }
 
-pub fn list() -> Result<(), String> {
-    let root = data_dir();
-    let entries = match fs::read_dir(&root) {
+pub fn list(paths: &Paths) -> Result<(), String> {
+    let root = &paths.data;
+    let entries = match fs::read_dir(root) {
         Ok(e) => e,
         Err(_) => {
             println!("No packages installed");
@@ -350,7 +334,7 @@ pub fn list() -> Result<(), String> {
     }
     rows.sort();
 
-    let linked_targets: Vec<PathBuf> = fs::read_dir(bin_dir())
+    let linked_targets: Vec<PathBuf> = fs::read_dir(&paths.bin)
         .map(|it| {
             it.flatten()
                 .filter_map(|e| platform::read_link(&e.path()))
@@ -366,7 +350,7 @@ pub fn list() -> Result<(), String> {
     let ver_w = rows.iter().map(|(_, _, v)| v.len()).max().unwrap_or(0);
     for (owner, repo, v) in &rows {
         let full = format!("{owner}/{repo}");
-        let vdir = version_dir(owner, repo, v);
+        let vdir = paths.version_dir(owner, repo, v);
         let cached = !linked_targets.iter().any(|t| t.starts_with(&vdir));
         let suffix = if cached { "  (cached)" } else { "" };
         println!(
@@ -378,9 +362,9 @@ pub fn list() -> Result<(), String> {
     Ok(())
 }
 
-pub fn remove_many(names: &[String], assume_yes: bool) -> Result<(), String> {
+pub fn remove_many(paths: &Paths, names: &[String], assume_yes: bool) -> Result<(), String> {
     let targets: Vec<String> = if names.is_empty() {
-        let all = installed_repos();
+        let all = installed_repos(paths);
         if all.is_empty() {
             println!("No packages installed");
             return Ok(());
@@ -402,7 +386,7 @@ pub fn remove_many(names: &[String], assume_yes: bool) -> Result<(), String> {
 
     let mut failures = 0usize;
     for name in &targets {
-        if let Err(e) = remove_one(name) {
+        if let Err(e) = remove_one(paths, name) {
             eprintln!("unpin: {name}: {e}");
             failures += 1;
         }
@@ -414,9 +398,9 @@ pub fn remove_many(names: &[String], assume_yes: bool) -> Result<(), String> {
     }
 }
 
-fn remove_one(name: &str) -> Result<(), String> {
-    let (owner, repo) = resolve_installed(name)?.ok_or("not installed")?;
-    let rdir = repo_dir(&owner, &repo);
+fn remove_one(paths: &Paths, name: &str) -> Result<(), String> {
+    let (owner, repo) = resolve_installed(paths, name)?.ok_or("not installed")?;
+    let rdir = paths.repo_dir(&owner, &repo);
 
     // Same lock the install pipeline takes. Without it a concurrent
     // `unpin install` extracting into rdir would race against this
@@ -442,12 +426,12 @@ fn remove_one(name: &str) -> Result<(), String> {
     // `bin_dir`, so we re-derive the alias names by scanning the binary's
     // UNPIN_META block and unlinking each. On Unix the read_link sweep
     // below catches alias symlinks naturally — no extra I/O needed.
-    let bin = bin_dir();
+    let bin = &paths.bin;
     #[cfg(windows)]
     {
         let mut alias_names: Vec<String> = Vec::new();
         for v in &versions {
-            for n in aliases_from_vdir(&version_dir(&owner, &repo, v)) {
+            for n in aliases_from_vdir(&paths.version_dir(&owner, &repo, v)) {
                 if !alias_names.contains(&n) {
                     alias_names.push(n);
                 }
@@ -459,7 +443,7 @@ fn remove_one(name: &str) -> Result<(), String> {
         }
     }
 
-    if let Ok(entries) = fs::read_dir(&bin) {
+    if let Ok(entries) = fs::read_dir(bin) {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(target) = platform::read_link(&path)
@@ -472,7 +456,7 @@ fn remove_one(name: &str) -> Result<(), String> {
     if rdir.exists() {
         fs::remove_dir_all(&rdir).map_err(|e| format!("remove {}: {e}", rdir.display()))?;
     }
-    let _ = fs::remove_dir(data_dir().join(&owner));
+    let _ = fs::remove_dir(paths.data.join(&owner));
 
     if versions.is_empty() {
         println!("Removed {owner}/{repo}");
@@ -486,14 +470,14 @@ fn remove_one(name: &str) -> Result<(), String> {
 
 pub fn update(ctx: &Ctx, opts: &InstallOptions, names: &[String]) -> Result<(), String> {
     let targets: Vec<(String, String)> = if names.is_empty() {
-        installed_repos()
+        installed_repos(&ctx.paths)
     } else {
         // Resolve each name to (owner, repo) first, then dedup so
         // `update foo foo` (or `update foo unpins/foo`) collapses to a
         // single pipeline entry instead of racing on the same vdir.
         let resolved: Vec<(String, String)> = names
             .iter()
-            .map(|n| resolve_installed(n)?.ok_or_else(|| format!("not installed: {n}")))
+            .map(|n| resolve_installed(&ctx.paths, n)?.ok_or_else(|| format!("not installed: {n}")))
             .collect::<Result<_, _>>()?;
         dedup_keep_first(resolved, |a, b| a == b)
     };
@@ -521,10 +505,10 @@ pub fn update(ctx: &Ctx, opts: &InstallOptions, names: &[String]) -> Result<(), 
     run_pipeline_v2(ctx, opts, PipelineMode::Update, requests, Vec::new())
 }
 
-fn installed_repos() -> Vec<(String, String)> {
-    let root = data_dir();
+fn installed_repos(paths: &Paths) -> Vec<(String, String)> {
+    let root = &paths.data;
     let mut out = Vec::new();
-    let entries = match fs::read_dir(&root) {
+    let entries = match fs::read_dir(root) {
         Ok(e) => e,
         Err(_) => return out,
     };
@@ -574,8 +558,8 @@ pub fn info_many(ctx: &Ctx, inputs: &[String]) -> Result<(), String> {
 }
 
 fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
-    if let Some((owner, repo)) = resolve_installed(input)? {
-        let rdir = repo_dir(&owner, &repo);
+    if let Some((owner, repo)) = resolve_installed(&ctx.paths, input)? {
+        let rdir = ctx.paths.repo_dir(&owner, &repo);
         let mut versions: Vec<String> = fs::read_dir(&rdir)
             .map_err(|e| format!("read {}: {e}", rdir.display()))?
             .flatten()
@@ -584,18 +568,18 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
             .filter(|n| !is_part_dir_name(n))
             .collect();
         versions.sort();
-        let active = active_version(&owner, &repo);
+        let active = active_version(&ctx.paths, &owner, &repo);
 
         println!("Repo:     {owner}/{repo}");
         if let Some(v) = &active {
             println!("Active:   {v}");
-            println!("Path:     {}", version_dir(&owner, &repo, v).display());
+            println!("Path:     {}", ctx.paths.version_dir(&owner, &repo, v).display());
         }
         if versions.len() > 1 || active.is_none() {
             println!("Versions: {}", versions.join(", "));
         }
         println!("Links:");
-        let bin = bin_dir();
+        let bin = &ctx.paths.bin;
         let mut any = false;
         if let Ok(entries) = fs::read_dir(&bin) {
             for entry in entries.flatten() {
@@ -632,12 +616,12 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn prune() -> Result<(), String> {
+pub fn prune(paths: &Paths) -> Result<(), String> {
     let mut removed = 0usize;
     let mut skipped: Vec<String> = Vec::new();
 
-    let bin = bin_dir();
-    let root = data_dir();
+    let bin = &paths.bin;
+    let root = &paths.data;
     // Phase 1: catch dangling symlinks/wrappers that already existed before
     // this prune run (e.g. user deleted a binary by hand). Must run BEFORE
     // phase 2 — otherwise phase 2's "live links" calculation would treat
@@ -646,10 +630,10 @@ pub fn prune() -> Result<(), String> {
     // No lock here: phase 1 only removes links whose target is *already*
     // missing on disk. A concurrent install creating fresh links into a
     // valid target can't trigger a remove because metadata(target) succeeds.
-    removed += sweep_dangling_links(&bin, &root);
+    removed += sweep_dangling_links(bin, root);
 
     // Orphan version dirs: no live link in bin_dir points into them.
-    let linked_targets: Vec<PathBuf> = fs::read_dir(&bin)
+    let linked_targets: Vec<PathBuf> = fs::read_dir(bin)
         .map(|it| {
             it.flatten()
                 .filter_map(|e| platform::read_link(&e.path()))
@@ -657,8 +641,8 @@ pub fn prune() -> Result<(), String> {
         })
         .unwrap_or_default();
 
-    for (owner, repo) in installed_repos() {
-        let rdir = repo_dir(&owner, &repo);
+    for (owner, repo) in installed_repos(paths) {
+        let rdir = paths.repo_dir(&owner, &repo);
         // Take the lock for this repo before scanning + removing version
         // dirs. Without this prune races with a concurrent `install`/`update`
         // in Phase B: the in-flight vdir exists on disk but has no link in
@@ -720,7 +704,7 @@ pub fn prune() -> Result<(), String> {
         }
         // Clean up now-empty repo and owner dirs.
         let _ = fs::remove_dir(&rdir);
-        let _ = fs::remove_dir(data_dir().join(&owner));
+        let _ = fs::remove_dir(paths.data.join(&owner));
     }
 
     // Phase 3 (Unix-only): orphan-vdir removal above just broke any alias
@@ -729,7 +713,7 @@ pub fn prune() -> Result<(), String> {
     // run. On Windows the per-vdir rescan handles this inline.
     #[cfg(not(windows))]
     {
-        removed += sweep_dangling_links(&bin, &root);
+        removed += sweep_dangling_links(bin, root);
     }
 
     if !skipped.is_empty() {
@@ -800,7 +784,7 @@ pub fn run(
         finalize_primary_bar(&bar, &result);
         result?;
     } else {
-        let has_links = fs::read_dir(bin_dir())
+        let has_links = fs::read_dir(&ctx.paths.bin)
             .map(|it| {
                 it.flatten().any(|e| {
                     platform::read_link(&e.path())

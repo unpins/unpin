@@ -12,54 +12,93 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub fn data_dir() -> PathBuf {
-    #[cfg(unix)]
-    {
-        if let Ok(x) = env::var("XDG_DATA_HOME")
-            && !x.is_empty()
+/// The three on-disk locations unpin works out of, resolved once at startup
+/// from the environment. Bundling them behind a single fallible
+/// [`Paths::resolve`] keeps the env-var lookups in one place and — critically
+/// — turns an unset/empty `HOME` (or `LOCALAPPDATA`/`APPDATA`) into a loud
+/// error instead of a relative path silently rooted at the cwd. Cheap to
+/// `clone` (three `PathBuf`s); the network layer stashes a copy in `Ctx` while
+/// local commands borrow it directly.
+#[derive(Clone, Debug)]
+pub struct Paths {
+    /// Per-package extracted trees (`<data>/<owner>/<repo>/<tag>/...`).
+    pub data: PathBuf,
+    /// The PATH entry: symlinks/wrappers to each package's executables.
+    pub bin: PathBuf,
+    /// Flat `key = value` config file.
+    pub config: PathBuf,
+}
+
+impl Paths {
+    /// Resolve all three paths from the environment. The **only** fallible
+    /// step in the path layer: an unset or empty base variable is a hard
+    /// error rather than a relative path joined onto nothing (which used to
+    /// install into the current working directory — common breakage in CI
+    /// and containers where `HOME` is unset).
+    pub fn resolve() -> io::Result<Paths> {
+        #[cfg(unix)]
         {
-            return PathBuf::from(x).join("unpin");
+            let data = match nonempty_env("XDG_DATA_HOME") {
+                Some(x) => PathBuf::from(x).join("unpin"),
+                None => home()?.join(".local/share/unpin"),
+            };
+            let bin = home()?.join(".local/bin");
+            let config = match nonempty_env("XDG_CONFIG_HOME") {
+                Some(x) => PathBuf::from(x).join("unpin").join("config"),
+                None => home()?.join(".config/unpin/config"),
+            };
+            Ok(Paths { data, bin, config })
         }
-        PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/share/unpin")
+        #[cfg(windows)]
+        {
+            // `bin` is the same folder that holds `unpin.exe` itself — the one
+            // the user adds to PATH. `.cmd` wrappers live next to it; per-
+            // package data goes under the `packages\` subdirectory.
+            let local = nonempty_env("LOCALAPPDATA").ok_or_else(|| missing("LOCALAPPDATA"))?;
+            let appdata = nonempty_env("APPDATA").ok_or_else(|| missing("APPDATA"))?;
+            Ok(Paths {
+                data: PathBuf::from(&local).join("unpin").join("packages"),
+                bin: PathBuf::from(local).join("unpin"),
+                config: PathBuf::from(appdata).join("unpin").join("config"),
+            })
+        }
     }
-    #[cfg(windows)]
-    {
-        PathBuf::from(env::var("LOCALAPPDATA").unwrap_or_default())
-            .join("unpin")
-            .join("packages")
+
+    pub fn repo_dir(&self, owner: &str, name: &str) -> PathBuf {
+        self.data.join(owner).join(name)
+    }
+
+    pub fn version_dir(&self, owner: &str, name: &str, tag: &str) -> PathBuf {
+        self.repo_dir(owner, name).join(tag)
     }
 }
 
-pub fn bin_dir() -> PathBuf {
-    #[cfg(unix)]
-    {
-        PathBuf::from(env::var("HOME").unwrap_or_default()).join(".local/bin")
-    }
-    #[cfg(windows)]
-    {
-        // Same folder that holds `unpin.exe` itself — the one the user adds to
-        // PATH. `.cmd` wrappers live next to it; per-package data goes under
-        // the `packages\` subdirectory (see `data_dir`).
-        PathBuf::from(env::var("LOCALAPPDATA").unwrap_or_default()).join("unpin")
+/// An environment variable's value, but only if set and non-empty. An empty
+/// value is treated as absent — joining onto `""` yields a relative path,
+/// which is exactly the silent failure `Paths::resolve` exists to prevent.
+fn nonempty_env(key: &str) -> Option<String> {
+    match env::var(key) {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => None,
     }
 }
 
-pub fn config_path() -> PathBuf {
-    #[cfg(unix)]
-    {
-        if let Ok(x) = env::var("XDG_CONFIG_HOME")
-            && !x.is_empty()
-        {
-            return PathBuf::from(x).join("unpin").join("config");
-        }
-        PathBuf::from(env::var("HOME").unwrap_or_default()).join(".config/unpin/config")
-    }
-    #[cfg(windows)]
-    {
-        PathBuf::from(env::var("APPDATA").unwrap_or_default())
-            .join("unpin")
-            .join("config")
-    }
+#[cfg(windows)]
+fn missing(var: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("%{var}% is not set; cannot determine where to install (set %{var}% to a directory)"),
+    )
+}
+
+#[cfg(unix)]
+fn home() -> io::Result<PathBuf> {
+    nonempty_env("HOME").map(PathBuf::from).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "$HOME is not set; set HOME (or XDG_DATA_HOME and XDG_CONFIG_HOME) so unpin can locate ~/.local",
+        )
+    })
 }
 
 /// Substrings that, when present in an asset name (case-insensitive), positively
