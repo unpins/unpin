@@ -196,7 +196,11 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
             continue;
         }
         let entry_type = entry.header().entry_type();
-        let mode = entry.header().mode().ok();
+        // Strip the special bits (setuid/setgid/sticky, 0o7000): a downloaded
+        // CLI binary never legitimately needs them, and honoring them from an
+        // untrusted archive is needless attack surface. Keep only the rwx
+        // permission bits.
+        let mode = entry.header().mode().ok().map(|m| m & 0o777);
 
         match entry_type {
             tar::EntryType::Directory => {
@@ -462,6 +466,13 @@ impl<R: Read> Read for CdFilter<R> {
 /// Parse the central directory bytes and return a `name → unix_mode` map for
 /// entries written by Unix-mode zip tools. Returns empty on any structural
 /// issue — caller falls back to leaving permissions alone.
+///
+/// Bounds are self-contained against arbitrary/malicious input: the loop guard
+/// `pos + 46 <= buf.len()` covers every fixed-field read (max index `pos+41`),
+/// the `name_end > buf.len()` break covers the name slice, and `next <= pos`
+/// breaks on an overflow wraparound. So a truncated header, an oversized
+/// `name_len`, or trailing garbage all terminate the scan rather than read out
+/// of bounds.
 fn parse_central_directory(buf: &[u8]) -> std::collections::HashMap<String, u32> {
     const CD_SIG: u32 = 0x0201_4b50;
     let mut out = std::collections::HashMap::new();
@@ -485,11 +496,12 @@ fn parse_central_directory(buf: &[u8]) -> std::collections::HashMap<String, u32>
             break;
         }
         if host_system == 3 {
-            // Upper 16 bits include the file-type bits (S_IFREG etc.). Mask to
-            // the permission bits proper (rwxrwxrwx + setuid/setgid/sticky) so
-            // fs::set_permissions doesn't end up clearing perms when only the
-            // type bits happen to be set.
-            let mode = ((external_attrs >> 16) & 0xFFFF) & 0o7777;
+            // Upper 16 bits hold the Unix st_mode. Mask to the rwx permission
+            // bits only: drop the file-type bits (S_IFREG etc.) AND the special
+            // bits (setuid/setgid/sticky, 0o7000) — a downloaded CLI binary
+            // never legitimately needs setuid, and honoring it from an
+            // untrusted archive is needless attack surface.
+            let mode = (external_attrs >> 16) & 0o777;
             if mode != 0
                 && let Ok(name) = std::str::from_utf8(&buf[name_start..name_end])
             {
@@ -947,5 +959,81 @@ mod tests {
         cd[46] = b'x';
         let modes = parse_central_directory(&cd);
         assert!(modes.is_empty());
+    }
+
+    #[test]
+    fn parse_central_directory_survives_malformed_input() {
+        // Every one of these must terminate the scan, not read out of bounds.
+        // Truncated header (fewer than 46 bytes after the signature).
+        let mut cd = vec![0u8; 20];
+        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
+        assert!(parse_central_directory(&cd).is_empty());
+
+        // Oversized name_len: header claims a 60000-byte name the buffer can't
+        // hold. Must hit the `name_end > buf.len()` break, not slice past end.
+        let mut cd = vec![0u8; 46 + 4];
+        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
+        cd[4..6].copy_from_slice(&((3u16 << 8) | 20).to_le_bytes());
+        cd[28..30].copy_from_slice(&60000u16.to_le_bytes());
+        cd[38..42].copy_from_slice(&((0o755u32) << 16).to_le_bytes());
+        assert!(parse_central_directory(&cd).is_empty());
+
+        // Pure garbage with no signature, and an empty buffer.
+        assert!(parse_central_directory(&[0xab; 200]).is_empty());
+        assert!(parse_central_directory(&[]).is_empty());
+
+        // A valid Unix entry immediately followed by trailing garbage: the good
+        // entry parses, the garbage (wrong signature) stops the loop cleanly.
+        let mut cd = vec![0u8; 46 + 2];
+        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
+        cd[4..6].copy_from_slice(&((3u16 << 8) | 20).to_le_bytes());
+        cd[28..30].copy_from_slice(&2u16.to_le_bytes());
+        cd[38..42].copy_from_slice(&((0o755u32) << 16).to_le_bytes());
+        cd[46..48].copy_from_slice(b"ok");
+        cd.extend_from_slice(&[0xff; 50]);
+        let modes = parse_central_directory(&cd);
+        assert_eq!(modes.get("ok").copied(), Some(0o755));
+    }
+
+    #[test]
+    fn parse_central_directory_strips_special_bits() {
+        // A malicious zip declaring setuid root (0o4755) must come back as the
+        // plain rwx bits only — the 0o7000 special bits are dropped.
+        let mut cd = vec![0u8; 46 + 3];
+        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
+        cd[4..6].copy_from_slice(&((3u16 << 8) | 20).to_le_bytes());
+        cd[28..30].copy_from_slice(&3u16.to_le_bytes()); // name_len = 3
+        cd[38..42].copy_from_slice(&((0o4755u32) << 16).to_le_bytes());
+        cd[46..49].copy_from_slice(b"sup");
+        let modes = parse_central_directory(&cd);
+        assert_eq!(modes.get("sup").copied(), Some(0o755));
+    }
+
+    fn full_mode_of(path: &Path) -> u32 {
+        // Includes setuid/setgid/sticky, unlike mode_of which masks to 0o777.
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn extract_zip_strips_setuid_from_unix_mode() {
+        let mut zw = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o4755); // setuid + rwxr-xr-x
+        zw.start_file("tool", opts).unwrap();
+        zw.write_all(&elf_bytes()).unwrap();
+        let bytes = zw.finish().unwrap().into_inner();
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.zip", &bytes[..], tmp.path()).unwrap();
+        assert_eq!(full_mode_of(&tmp.path().join("tool")), 0o755);
+    }
+
+    #[test]
+    fn extract_tar_strips_setuid_from_mode() {
+        let tar = tar_with(&[("tool", b"ELF-ish", 0o4755)]); // setuid bit set
+        let tmp = tempfile::tempdir().unwrap();
+        extract("pkg.tar", &tar[..], tmp.path()).unwrap();
+        assert_eq!(full_mode_of(&tmp.path().join("tool")), 0o755);
     }
 }
