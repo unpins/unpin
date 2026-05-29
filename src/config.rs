@@ -7,7 +7,10 @@
 //!   blank                    → skipped
 //!   `<key> = <value>`        → key/value pair; both sides trimmed
 //!   anything after a `#`     → stripped as inline comment (values are scalars
-//!                              like ints/bools, so `#` never appears inside)
+//!                              like ints/bools, so `#` never appears inside;
+//!                              a future key whose value could legitimately
+//!                              contain `#` — a path or URL — would need
+//!                              quoting support added here first)
 //!
 //! No sections, no quoting, no escapes — intentionally smaller than INI.
 //! Unknown keys are kept in the map and silently ignored; bad values fall back
