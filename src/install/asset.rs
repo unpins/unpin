@@ -6,7 +6,7 @@
 //! tarball when the release ships one. `parse_sha256` + helpers consume the
 //! checksum file the release publishes alongside the asset.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crate::ctx::Ctx;
 use crate::github::{self, Asset};
@@ -157,6 +157,17 @@ pub fn pick_asset<'a>(
 }
 
 pub(super) fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, String> {
+    // No terminal to read a choice from (piped stdin, CI). Fail with a clear
+    // message instead of looping or returning a misleading "invalid choice"
+    // when the first read hits EOF.
+    if !io::stdin().is_terminal() {
+        return Err(
+            "multiple assets match and stdin is not a terminal; \
+             re-run on a terminal to pick one"
+                .into(),
+        );
+    }
+
     let header = if candidates.len() == 1 {
         "Available asset:"
     } else {
@@ -179,20 +190,25 @@ pub(super) fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, Str
             println!("  [{}] {}", i + 1, a.name);
         }
     }
-    print!("Pick [1-{}]: ", candidates.len());
-    io::stdout().flush().ok();
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| format!("stdin: {e}"))?;
-    let idx: usize = line
-        .trim()
-        .parse()
-        .map_err(|_| "invalid choice".to_string())?;
-    if idx < 1 || idx > candidates.len() {
-        return Err("choice out of range".into());
+    loop {
+        print!("Pick [1-{}]: ", candidates.len());
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        let n = io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("stdin: {e}"))?;
+        if n == 0 {
+            // EOF (Ctrl-D) — a deliberate cancel, not an invalid number.
+            return Err("no asset selected".into());
+        }
+        match line.trim().parse::<usize>() {
+            Ok(idx) if (1..=candidates.len()).contains(&idx) => return Ok(candidates[idx - 1]),
+            _ => {
+                eprintln!("invalid choice; enter a number 1-{}", candidates.len());
+                continue;
+            }
+        }
     }
-    Ok(candidates[idx - 1])
 }
 
 /// Find `<pkg>-<tag>-data.tar.zst` in the release's assets. Tries both raw
@@ -364,6 +380,26 @@ mod tests {
         assert_eq!(c.name, "gvim-9.2.0-data.tar.zst");
         let c2 = find_companion("gvim", "9.2.0", &assets).unwrap();
         assert_eq!(c2.name, "gvim-9.2.0-data.tar.zst");
+    }
+
+    #[test]
+    fn prompt_pick_errors_clearly_when_stdin_is_not_a_terminal() {
+        // Under `cargo test` stdin is piped, so prompt_pick can't read a
+        // choice. It must fail with the non-TTY message — not the old
+        // misleading "invalid choice" that EOF used to produce.
+        let a = Asset {
+            name: "tool-linux".into(),
+            browser_download_url: "u1".into(),
+            size: 0,
+        };
+        let b = Asset {
+            name: "tool-mac".into(),
+            browser_download_url: "u2".into(),
+            size: 0,
+        };
+        let candidates = vec![&a, &b];
+        let err = prompt_pick(&candidates).unwrap_err();
+        assert!(err.contains("not a terminal"), "got: {err}");
     }
 
     #[test]
