@@ -535,7 +535,7 @@ fn pick_jobs(requested: u8, n_inputs: usize) -> usize {
     let req = if requested == 0 {
         4
     } else {
-        requested as usize
+        usize::from(requested)
     };
     req.min(n_inputs).max(1)
 }
