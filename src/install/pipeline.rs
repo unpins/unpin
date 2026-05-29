@@ -165,10 +165,10 @@ fn prepare_workspace_dirs(
     vdir: &Path,
     extract_dir: &Path,
 ) -> Result<RepoLock, String> {
-    // Acquire the cross-process lock *after* any user prompt (asset picker)
-    // and *before* the first destructive write. Holding it through the
-    // prompt would force a parallel install on the same package to error
-    // out while the user is at coffee.
+    // Acquire the cross-process lock *after* every user prompt (asset picker
+    // AND the missing-checksum confirm) and *before* the first destructive
+    // write. Holding it through a prompt would force a parallel install on the
+    // same package to error out while the user is at coffee.
     let lock = RepoLock::acquire(&paths.repo_dir(&spec.owner, &spec.name))?;
     // --pick (or incomplete cache) on a cached version: wipe before re-extracting.
     // Also wipe a leftover `.part` from a previous run that got SIGKILL'd between
@@ -225,8 +225,12 @@ pub fn preflight_extract(
         });
     }
     let asset = pick_asset(&release.assets, &spec.name, pick, ctx.verbose)?.clone();
-    let extract_dir = part_dir_for(&vdir);
-    let lock = prepare_workspace_dirs(&ctx.paths, &spec, &vdir, &extract_dir)?;
+    // Resolve checksums (network fetch + the missing-checksum y/n prompt)
+    // BEFORE acquiring the repo lock. resolve_checksum_for may block on a
+    // prompt; holding the cross-process lock across it would make a parallel
+    // install/run on the same package error out while the user is deciding.
+    // The asset picker above is likewise pre-lock. Mirrors run_pipeline_v2,
+    // which resolves on a worker thread and only locks in finalize_resolution.
     let expected_sha256 =
         resolve_checksum_for(ctx, &release.assets, &asset.name, ChecksumKind::Primary, assume_yes)?;
     let companion = if include_data {
@@ -244,6 +248,10 @@ pub fn preflight_extract(
         )?,
         None => None,
     };
+    // All prompts are done — now take the lock and clear stale staging, the
+    // smallest window that still fully covers the destructive extract.
+    let extract_dir = part_dir_for(&vdir);
+    let lock = prepare_workspace_dirs(&ctx.paths, &spec, &vdir, &extract_dir)?;
     Ok(ExtractJob {
         spec,
         release,
