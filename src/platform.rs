@@ -203,91 +203,58 @@ pub fn current_arch_keys() -> &'static [&'static str] {
     }
 }
 
+/// Arch tokens that mark an asset as built for some *other* architecture —
+/// match (on a token boundary, via `contains_arch_token`) → exclude. Each
+/// target lists every arch family except its own.
+///
+/// The 32-bit ARM family carries both the `uname -m` labels the catalog uses
+/// (`armv6l`/`armv7l` — note the trailing `l`) and the bare Rust/Debian forms
+/// (`armv6`/`armv7`/`armhf`) third parties use. Both must be present: boundary
+/// matching is exact, so `armv7` no longer catches `armv7l` the way the old
+/// substring match did. `s390x` is exclusion-only — unpin isn't built for it,
+/// so it's never a *current* arch, but it appears in third-party releases
+/// (e.g. ripgrep) and must be excluded on every target.
 pub fn other_arch_keys() -> &'static [&'static str] {
     #[cfg(target_arch = "x86_64")]
     {
         &[
-            "i386",
-            "i686",
-            "armv6",
-            "armv7",
-            "armhf",
-            "aarch64",
-            "arm64",
-            "ppc64le",
-            "powerpc64le",
-            "riscv64",
+            "i386", "i686", "armv6", "armv6l", "armv7", "armv7l", "armhf", "aarch64", "arm64",
+            "ppc64le", "powerpc64le", "riscv64", "s390x",
         ]
     }
     #[cfg(target_arch = "aarch64")]
     {
         &[
-            "i386",
-            "i686",
-            "armv6",
-            "armv7",
-            "armhf",
-            "x86_64",
-            "amd64",
-            "x64",
-            "ppc64le",
-            "powerpc64le",
-            "riscv64",
+            "i386", "i686", "armv6", "armv6l", "armv7", "armv7l", "armhf", "x86_64", "amd64",
+            "x64", "ppc64le", "powerpc64le", "riscv64", "s390x",
         ]
     }
     #[cfg(target_arch = "x86")]
     {
         &[
-            "x86_64",
-            "amd64",
-            "x64",
-            "aarch64",
-            "arm64",
-            "armv6",
-            "armv7",
-            "armhf",
-            "ppc64le",
-            "powerpc64le",
-            "riscv64",
+            "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv6l", "armv7", "armv7l",
+            "armhf", "ppc64le", "powerpc64le", "riscv64", "s390x",
         ]
     }
     #[cfg(target_arch = "arm")]
     {
         &[
-            "i386",
-            "i686",
-            "x86_64",
-            "amd64",
-            "x64",
-            "aarch64",
-            "arm64",
-            "ppc64le",
-            "powerpc64le",
-            "riscv64",
+            "i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "ppc64le", "powerpc64le",
+            "riscv64", "s390x",
         ]
     }
     #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
     {
         &[
-            "i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv7",
-            "armhf", "riscv64",
+            "i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv6l",
+            "armv7", "armv7l", "armhf", "riscv64", "s390x",
         ]
     }
     #[cfg(target_arch = "riscv64")]
     {
         &[
-            "i386",
-            "i686",
-            "x86_64",
-            "amd64",
-            "x64",
-            "aarch64",
-            "arm64",
-            "armv6",
-            "armv7",
-            "armhf",
-            "ppc64le",
-            "powerpc64le",
+            "i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv6l",
+            "armv7", "armv7l", "armhf", "ppc64le", "powerpc64le", "s390x",
         ]
     }
     #[cfg(not(any(

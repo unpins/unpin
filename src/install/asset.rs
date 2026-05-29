@@ -405,6 +405,20 @@ mod tests {
         assert!(!contains_arch_token("tool-x86_64bit.zip", "x86_64"));
     }
 
+    // Catalog (unpins) htop ships armv7l/armv6l with the `uname -m` `l` suffix.
+    // Boundary matching means `armv7` no longer catches `armv7l`, so other_arch
+    // must carry the `l` variants explicitly; assert the exclusion fires.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn other_arch_excludes_catalog_armv7l_on_x86_64() {
+        assert_eq!(
+            classify_excluded("htop-3.4.1-1-armv7l-linux.zst"),
+            Some("other arch")
+        );
+        // The native asset is still accepted.
+        assert_eq!(classify_excluded("htop-3.4.1-1-x86_64-linux.zst"), None);
+    }
+
     // The dev box and most CI runners are linux/x86_64; gate the end-to-end
     // resolution check on it so the expected pick is unambiguous.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -449,6 +463,23 @@ mod tests {
         let got = narrow_assets(&pd, "pandoc", false, false).unwrap();
         assert_eq!(got.len(), 1, "candidates: {:?}", got.iter().map(|a| &a.name).collect::<Vec<_>>());
         assert_eq!(got[0].name, "pandoc-3.9.0.2-linux-amd64.tar.gz");
+
+        // unpins catalog htop v3.4.1-1: canonical <pkg>-<tag>-<arch>-<os>.zst,
+        // incl. the armv7l/i686/ppc64le/riscv64 arms that must all be excluded.
+        let ht = mk(&[
+            "htop-3.4.1-1-aarch64-darwin.zst",
+            "htop-3.4.1-1-aarch64-linux.zst",
+            "htop-3.4.1-1-armv7l-linux.zst",
+            "htop-3.4.1-1-data.tar.zst",
+            "htop-3.4.1-1-i686-linux.zst",
+            "htop-3.4.1-1-ppc64le-linux.zst",
+            "htop-3.4.1-1-riscv64-linux.zst",
+            "htop-3.4.1-1-x86_64-darwin.zst",
+            "htop-3.4.1-1-x86_64-linux.zst",
+        ]);
+        let got = narrow_assets(&ht, "htop", false, false).unwrap();
+        assert_eq!(got.len(), 1, "candidates: {:?}", got.iter().map(|a| &a.name).collect::<Vec<_>>());
+        assert_eq!(got[0].name, "htop-3.4.1-1-x86_64-linux.zst");
     }
 
     #[test]
