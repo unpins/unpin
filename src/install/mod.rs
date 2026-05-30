@@ -157,7 +157,7 @@ pub(super) fn active_version(paths: &Paths, owner: &str, name: &str) -> Option<S
 
 /// Resolve an installed package name (`owner/repo` or bare) to the binary
 /// paths of its active version, primary first (file stem == repo). `unpin man`
-/// uses this to find the binary carrying the embedded `.unpin_man` blob.
+/// uses this to find the binary carrying the embedded `unpin/man/*` pages.
 pub(crate) fn installed_binaries(
     paths: &Paths,
     name: &str,
@@ -488,7 +488,7 @@ fn remove_one(paths: &Paths, name: &str) -> Result<(), String> {
 
     // Windows-only alias cleanup: hardlinks can't be reverse-mapped from
     // `bin_dir`, so we re-derive the alias names by scanning the binary's
-    // UNPIN_META block and unlinking each. On Unix the read_link sweep
+    // embedded `unpin/aliases` and unlinking each. On Unix the read_link sweep
     // below catches alias symlinks naturally — no extra I/O needed.
     let bin = &paths.bin;
     #[cfg(windows)]

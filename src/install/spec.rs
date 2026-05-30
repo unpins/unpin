@@ -6,7 +6,7 @@
 //! by the GitHub API in `fetch_release`.
 
 /// Owner under which curated unpins-org packages live. Aliases declared by an
-/// embedded UNPIN_META block are honored only when `spec.owner` matches this —
+/// embedded `unpin/aliases` are honored only when `spec.owner` matches this —
 /// `<owner>/<repo>` installs from arbitrary publishers always skip aliases,
 /// even with `--aliases` on the CLI. The catalog-only gate is the primary
 /// defense against PATH-shadow attacks via a malicious release.

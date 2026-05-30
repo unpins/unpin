@@ -1,7 +1,7 @@
 //! Filesystem-level link maintenance for a freshly-extracted vdir.
 //!
 //! `link_all_executables` is the entry point: it walks the vdir, creates a
-//! `bin_dir` link per executable, honors a package's UNPIN_META alias list,
+//! `bin_dir` link per executable, honors a package's `unpin/aliases` list,
 //! and (since the orphan-cleanup fix) wipes leftover links from prior versions
 //! the new manifest no longer declares.
 //!
@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use indicatif::MultiProgress;
 
 use crate::aliases::{self, AliasMode};
+use crate::meta;
 use crate::platform::{self, Paths};
 
 use super::prompt::{PromptResult, prompt_yes_no_with_skip};
@@ -275,7 +276,7 @@ pub fn link_all_executables(
     // Anything that survives a crash here is now a subset of one version.
     //
     // On Windows alias hardlinks aren't introspectable by `read_link`; they
-    // get a separate cleanup pass below keyed on the binary's UNPIN_META.
+    // get a separate cleanup pass below keyed on the binary's `unpin/aliases`.
     let existing_managed: Vec<PathBuf> = match fs::read_dir(&bin) {
         Ok(entries) => entries
             .flatten()
@@ -367,7 +368,7 @@ pub fn link_all_executables(
 
     // Windows-only: alias hardlinks have no introspectable target so the
     // `existing_managed` scan above didn't see them. Derive the name set
-    // from older vdirs' UNPIN_META blocks and remove any name the new
+    // from older vdirs' `unpin/aliases` and remove any name the new
     // version doesn't declare. `aliases_from_vdir` swallows scan errors —
     // a corrupted older binary is a degraded but safe outcome here.
     #[cfg(windows)]
@@ -438,15 +439,13 @@ fn link_aliases_for(
     alias_mode: AliasMode,
     assume_yes: bool,
 ) -> Result<AliasOutcome, String> {
-    let meta = match aliases::read_meta(primary)? {
-        None => {
-            return Ok(AliasOutcome::default());
-        }
-        Some(m) if m.aliases.is_empty() => {
-            return Ok(AliasOutcome::default());
-        }
-        Some(m) => m,
+    let declared = match meta::read(primary)? {
+        None => return Ok(AliasOutcome::default()),
+        Some(m) => m.aliases(),
     };
+    if declared.is_empty() {
+        return Ok(AliasOutcome::default());
+    }
 
     // Catalog gate: aliases declared by `<owner>/<repo>` packages are *always*
     // ignored regardless of config or CLI flag. The risk is shadowing of
@@ -456,7 +455,7 @@ fn link_aliases_for(
         return Ok(AliasOutcome {
             notes: vec![format!(
                 "{} alias(es) declared but ignored (non-catalog source)",
-                meta.aliases.len()
+                declared.len()
             )],
             ..Default::default()
         });
@@ -470,9 +469,9 @@ fn link_aliases_for(
         AliasMode::Ask => {
             let q = format!(
                 "Install {} alias(es) for {} ({})?",
-                meta.aliases.len(),
+                declared.len(),
                 spec.repo(),
-                meta.aliases.join(", ")
+                declared.join(", ")
             );
             match prompt_yes_no_with_skip(multi, &q) {
                 PromptResult::Got(true) => true,
@@ -482,15 +481,15 @@ fn link_aliases_for(
     };
     if !install {
         return Ok(AliasOutcome {
-            notes: vec![format!("{} alias(es) skipped", meta.aliases.len())],
+            notes: vec![format!("{} alias(es) skipped", declared.len())],
             ..Default::default()
         });
     }
 
-    if meta.aliases.len() > aliases::MAX_ALIASES {
+    if declared.len() > aliases::MAX_ALIASES {
         return Err(format!(
             "package declares {} aliases (max {})",
-            meta.aliases.len(),
+            declared.len(),
             aliases::MAX_ALIASES
         ));
     }
@@ -499,7 +498,7 @@ fn link_aliases_for(
     // clean failure, not half a manifest on disk that the user has to clean
     // up by hand. The validator catches blocklisted names (sudo, ssh, ...),
     // path traversal, Windows reserved names, and length/charset violations.
-    for name in &meta.aliases {
+    for name in &declared {
         aliases::validate_alias(name)?;
     }
 
@@ -509,7 +508,7 @@ fn link_aliases_for(
     // Foreign-file declines collapse into one summary line; collision notes
     // (cross-package / intra-package) carry their own per-name text.
     let mut declined: Vec<String> = Vec::new();
-    for name in &meta.aliases {
+    for name in &declared {
         let link_path = bin.join(platform::alias_link_filename(name));
         let r = link_alias(paths, multi, rdir, claimed, primary, &link_path, assume_yes)?;
         if r.linked {
@@ -537,7 +536,7 @@ fn link_aliases_for(
     }
     Ok(AliasOutcome {
         linked,
-        attempted: meta.aliases.clone(),
+        attempted: declared.clone(),
         notes,
     })
 }
@@ -577,7 +576,7 @@ fn link_alias(
     }
 }
 
-/// Scan every executable in `vdir` for an embedded UNPIN_META block and
+/// Scan every executable in `vdir` for an embedded `unpin/aliases` entry and
 /// return the union of alias names declared. Windows-only: alias entries
 /// in `bin_dir` are NTFS hardlinks with no introspectable target, so the
 /// only way to learn their names at cleanup time is to re-derive from the
@@ -598,8 +597,8 @@ pub fn aliases_from_vdir(vdir: &Path) -> Vec<String> {
         if !is_executable(f) {
             continue;
         }
-        if let Ok(Some(meta)) = aliases::read_meta(f) {
-            for a in meta.aliases {
+        if let Ok(Some(m)) = meta::read(f) {
+            for a in m.aliases() {
                 if !out.contains(&a) {
                     out.push(a);
                 }

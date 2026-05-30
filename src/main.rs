@@ -10,6 +10,7 @@ mod github;
 mod http;
 mod install;
 mod man;
+mod meta;
 mod panic;
 mod platform;
 mod sigint;
@@ -39,7 +40,7 @@ enum Cmd {
     Run(RunCmd),
     /// Print a shell completion script. Pipe it to your shell's completion directory (see README).
     Completion(CompletionCmd),
-    /// Show a package's embedded manual (reads the `.unpin_man` section; no argument = unpin's own).
+    /// Show a package's embedded manual (reads its `unpin/man/*` entries; no argument = unpin's own).
     Man(ManCmd),
 }
 

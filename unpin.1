@@ -1,5 +1,6 @@
 .\" Man page for unpin. Hand-written man(7) roff; embedded into the unpin
-.\" binary as a .unpin_man blob by build.rs and read back by `unpin man`.
+.\" binary as a unpin/man/unpin.1 ZIP entry by build.rs and read back by
+.\" `unpin man` (see docs/embedded-metadata.md).
 .TH UNPIN 1 "2026" "unpin" "User Commands"
 .SH NAME
 unpin \- install single-binary CLI tools straight from GitHub releases
@@ -73,9 +74,9 @@ Print a shell completion script for
 .IR bash ", " zsh ", " fish ", or " elvish .
 .TP
 .BI man " [PKG] [PAGE]"
-Show an installed package's embedded manual, read from the binary's
-.B .unpin_man
-section. With no argument, shows unpin's own manual.
+Show an installed package's embedded manual, read from the man pages
+baked into the binary's embedded metadata. With no argument, shows unpin's
+own manual.
 .B \-\-list
 lists the embedded pages and
 .B \-\-raw

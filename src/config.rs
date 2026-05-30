@@ -86,7 +86,7 @@ impl Config {
     }
 
     /// How to handle multi-call aliases declared by a catalog package's
-    /// embedded UNPIN_META block. Default [`AliasMode::Yes`] — install them
+    /// embedded `unpin/aliases`. Default [`AliasMode::Yes`] — install them
     /// silently and print the list. CLI `--aliases` / `--no-aliases` and
     /// the per-install prompt (when `ask`) override this for a single
     /// invocation. Garbage values fall back to the default.

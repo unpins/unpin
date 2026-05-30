@@ -1,26 +1,23 @@
-//! Embed unpin's own man page into the binary as a `.unpin_man` container.
+//! Embed unpin's own man page into the binary as a `unpin/man/unpin.1` entry of
+//! an embedded ZIP (the unified embedded-metadata container).
 //!
-//! Catalog packages get their man pages embedded by the nix-lib `withMan`
-//! pipeline (`mkman.py` + `llvm-objcopy`), but unpin's man is self-authored
-//! (`unpin.1`), so we build the same on-disk container here and let
-//! `include_bytes!` plant it in the binary. The byte-scanning reader in
-//! `src/man.rs` then finds it the same way it finds any other binary's blob.
+//! Catalog packages get their `unpin/*` entries embedded by the nix-lib
+//! `withMeta` pipeline (`zipfile` + objcopy), but unpin's man is self-authored
+//! (`unpin.1`), so we build the same kind of ZIP here and let `include_bytes!`
+//! plant it. The byte-scanning reader in `src/meta.rs` then finds it the same
+//! way it finds any other binary's ZIP (docs/embedded-metadata.md §2).
 //!
-//! Format mirrors `nix-lib/mkman.py` (docs/embedded-man.md §1-2). We emit the
-//! uncompressed variant (`compression = 0`): unpin's single page is tiny, and
-//! skipping zstd keeps the build dependency-free (the reader still handles the
-//! zstd variant for catalog binaries).
+//! We emit a single **stored** (uncompressed) entry: unpin's one page is tiny
+//! and storing it keeps the build dependency-free (no Python, no zip crate at
+//! build time). The reader still handles `deflate` entries from catalog
+//! binaries.
 
 use std::env;
 use std::fs;
 use std::path::Path;
 
-// Sentinels — exact bytes from docs/embedded-man.md §1.3, matched by src/man.rs.
-const BEGIN: &[u8] = b"\xff\xffUNPIN_MAN_v1_b2c9d1\xff\xff";
-const END: &[u8] = b"\xff\xffUNPIN_MAN_ENDb2c9d1\xff\xff";
-
 fn crc32(data: &[u8]) -> u32 {
-    // IEEE poly 0xEDB88320, matching mkman.py / zlib.crc32.
+    // IEEE poly 0xEDB88320, matching zlib.crc32 / the zip per-entry CRC.
     let mut table = [0u32; 256];
     let mut n = 0;
     while n < 256 {
@@ -44,12 +41,7 @@ fn crc32(data: &[u8]) -> u32 {
     c ^ 0xffff_ffff
 }
 
-/// Length-prefixed UTF-8 string: u16 LE length + bytes.
-fn push_str(out: &mut Vec<u8>, s: &str) {
-    let b = s.as_bytes();
-    out.extend_from_slice(&(b.len() as u16).to_le_bytes());
-    out.extend_from_slice(b);
-}
+const NAME: &str = "unpin/man/unpin.1";
 
 fn main() {
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -58,36 +50,68 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     let roff = fs::read(&man_path).expect("read unpin.1");
+    let crc = crc32(&roff);
+    let name = NAME.as_bytes();
+    let nlen = name.len() as u16;
+    let dlen = roff.len() as u32;
 
-    // --- Inner archive (UPMAN), one roff entry: name=unpin section=1 lang=en ---
-    let mut index = Vec::new();
-    push_str(&mut index, "unpin"); // name
-    index.push(1u8); // section
-    push_str(&mut index, "en"); // lang
-    index.push(1u8); // kind = 1 (roff)
-    index.extend_from_slice(&0u32.to_le_bytes()); // blob_off
-    index.extend_from_slice(&(roff.len() as u32).to_le_bytes()); // blob_len
+    // DOS date 1980-01-01, time 0 — fixed for reproducibility.
+    const DOS_DATE: u16 = 0x0021;
+    const DOS_TIME: u16 = 0x0000;
 
-    let mut inner = Vec::new();
-    inner.extend_from_slice(b"UPMAN"); // magic (5)
-    inner.push(1u8); // archive version
-    inner.push(0u8); // reserved
-    inner.extend_from_slice(&1u16.to_le_bytes()); // entry_count
-    inner.extend_from_slice(&(index.len() as u32).to_le_bytes()); // index_len
-    inner.extend_from_slice(&index);
-    inner.extend_from_slice(&roff); // blob region
+    let mut zip = Vec::new();
 
-    // --- Outer container ---
-    let crc = crc32(&inner);
-    let mut blob = Vec::new();
-    blob.extend_from_slice(BEGIN);
-    blob.push(1u8); // container_version
-    blob.push(0u8); // compression = 0 (none)
-    blob.extend_from_slice(&(inner.len() as u32).to_le_bytes()); // payload_len
-    blob.extend_from_slice(&inner); // payload
-    blob.extend_from_slice(&crc.to_le_bytes()); // payload_crc32
-    blob.extend_from_slice(END);
+    // --- Local file header (offset 0) ---
+    zip.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]); // PK\x03\x04
+    zip.extend_from_slice(&20u16.to_le_bytes()); // version needed
+    zip.extend_from_slice(&0u16.to_le_bytes()); // flags
+    zip.extend_from_slice(&0u16.to_le_bytes()); // method 0 = stored
+    zip.extend_from_slice(&DOS_TIME.to_le_bytes());
+    zip.extend_from_slice(&DOS_DATE.to_le_bytes());
+    zip.extend_from_slice(&crc.to_le_bytes());
+    zip.extend_from_slice(&dlen.to_le_bytes()); // compressed size
+    zip.extend_from_slice(&dlen.to_le_bytes()); // uncompressed size
+    zip.extend_from_slice(&nlen.to_le_bytes());
+    zip.extend_from_slice(&0u16.to_le_bytes()); // extra len
+    zip.extend_from_slice(name);
+    zip.extend_from_slice(&roff); // stored data
+
+    let cd_offset = zip.len() as u32;
+
+    // --- Central directory header ---
+    zip.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]); // PK\x01\x02
+    // version made by: high byte 3 = unix (so unix_mode is honored), low = 30.
+    zip.extend_from_slice(&0x031eu16.to_le_bytes());
+    zip.extend_from_slice(&20u16.to_le_bytes()); // version needed
+    zip.extend_from_slice(&0u16.to_le_bytes()); // flags
+    zip.extend_from_slice(&0u16.to_le_bytes()); // method 0 = stored
+    zip.extend_from_slice(&DOS_TIME.to_le_bytes());
+    zip.extend_from_slice(&DOS_DATE.to_le_bytes());
+    zip.extend_from_slice(&crc.to_le_bytes());
+    zip.extend_from_slice(&dlen.to_le_bytes()); // compressed size
+    zip.extend_from_slice(&dlen.to_le_bytes()); // uncompressed size
+    zip.extend_from_slice(&nlen.to_le_bytes());
+    zip.extend_from_slice(&0u16.to_le_bytes()); // extra len
+    zip.extend_from_slice(&0u16.to_le_bytes()); // comment len
+    zip.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+    zip.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+    // external attrs: regular file, mode 0644 in the high 16 bits.
+    zip.extend_from_slice(&((0o100644u32) << 16).to_le_bytes());
+    zip.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+    zip.extend_from_slice(name);
+
+    let cd_size = zip.len() as u32 - cd_offset;
+
+    // --- End of central directory ---
+    zip.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]); // PK\x05\x06
+    zip.extend_from_slice(&0u16.to_le_bytes()); // this disk
+    zip.extend_from_slice(&0u16.to_le_bytes()); // cd start disk
+    zip.extend_from_slice(&1u16.to_le_bytes()); // entries this disk
+    zip.extend_from_slice(&1u16.to_le_bytes()); // total entries
+    zip.extend_from_slice(&cd_size.to_le_bytes());
+    zip.extend_from_slice(&cd_offset.to_le_bytes());
+    zip.extend_from_slice(&0u16.to_le_bytes()); // comment len (no marker)
 
     let out_dir = env::var("OUT_DIR").unwrap();
-    fs::write(Path::new(&out_dir).join("unpin_man.blob"), &blob).expect("write unpin_man.blob");
+    fs::write(Path::new(&out_dir).join("unpin_meta.zip"), &zip).expect("write unpin_meta.zip");
 }
