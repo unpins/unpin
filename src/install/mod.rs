@@ -155,6 +155,34 @@ pub(super) fn active_version(paths: &Paths, owner: &str, name: &str) -> Option<S
     None
 }
 
+/// Resolve an installed package name (`owner/repo` or bare) to the binary
+/// paths of its active version, primary first (file stem == repo). `unpin man`
+/// uses this to find the binary carrying the embedded `.unpin_man` blob.
+pub(crate) fn installed_binaries(
+    paths: &Paths,
+    name: &str,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let (owner, repo) =
+        resolve_installed(paths, name)?.ok_or_else(|| format!("`{name}` is not installed"))?;
+    let version = active_version(paths, &owner, &repo)
+        .ok_or_else(|| format!("`{name}` has no linked version (try `unpin install {name}`)"))?;
+    let vdir = paths.version_dir(&owner, &repo, &version);
+    let mut cands = Vec::new();
+    linker::walk_binary_candidates(&vdir, &mut cands)
+        .map_err(|e| format!("scan {}: {e}", vdir.display()))?;
+    // The man blob lives in the primary binary; sort name-match first so the
+    // reader hits it before any helper binaries.
+    cands.sort_by_key(|p| {
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_owned();
+        (stem != repo, stem)
+    });
+    Ok(cands)
+}
+
 pub(super) fn prompt_yes_no(question: &str) -> bool {
     if !io::stdin().is_terminal() {
         return false;

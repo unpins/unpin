@@ -57,7 +57,7 @@ impl Cmd {
             Cmd::Prune => install::prune(paths).map(|()| 0),
             Cmd::Run(c) => c.run(paths),
             Cmd::Completion(c) => c.run().map(|()| 0),
-            Cmd::Man(c) => c.run().map(|()| 0),
+            Cmd::Man(c) => c.run(paths).map(|()| 0),
         }
     }
 }
@@ -199,8 +199,8 @@ struct ManCmd {
 }
 
 impl ManCmd {
-    fn run(self) -> Result<(), String> {
-        man::run(self.list, self.raw, self.pkg, self.page)
+    fn run(self, paths: &platform::Paths) -> Result<(), String> {
+        man::run(paths, self.list, self.raw, self.pkg, self.page)
     }
 }
 

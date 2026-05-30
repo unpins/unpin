@@ -73,10 +73,16 @@ Print a shell completion script for
 .IR bash ", " zsh ", " fish ", or " elvish .
 .TP
 .BI man " [PKG] [PAGE]"
-Show a package's embedded manual, read from the binary's
+Show an installed package's embedded manual, read from the binary's
 .B .unpin_man
-section.
-With no argument it shows unpin's own manual.
+section. With no argument, shows unpin's own manual.
+.B \-\-list
+lists the embedded pages and
+.B \-\-raw
+dumps the raw roff source. (Terminal rendering is not implemented yet; until it
+lands, the page found is reported and
+.B \-\-raw
+prints its source.)
 .SH OPTIONS
 These apply to
 .B install

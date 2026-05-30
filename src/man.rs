@@ -17,9 +17,11 @@
 
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::aliases;
+use crate::install;
+use crate::platform::Paths;
 
 /// Plant unpin's own man container in the binary so the byte-scan below finds
 /// it in our own file, the same way it would in any other unpins binary.
@@ -157,7 +159,7 @@ fn parse_at<R: Read>(reader: &mut R, acc: &mut Vec<u8>) -> Result<Parsed, String
 /// Read until `acc` holds at least `n` bytes or the reader hits EOF. The
 /// caller checks `acc.len()` to distinguish "filled" from "truncated".
 fn fill_to<R: Read>(reader: &mut R, acc: &mut Vec<u8>, n: usize) -> Result<(), String> {
-    let mut tmp = [0u8; SCAN_CHUNK];
+    let mut tmp = vec![0u8; SCAN_CHUNK];
     while acc.len() < n {
         let k = reader.read(&mut tmp).map_err(|e| format!("unpin_man read: {e}"))?;
         if k == 0 {
@@ -334,12 +336,35 @@ impl Archive {
         section: Option<u8>,
         lang: &str,
     ) -> Result<(u8, Vec<u8>), String> {
+        // Follow `.so` redirects, naming the broken link on a dangling target
+        // or a cycle (docs/embedded-man.md §3.3). `seen` detects cycles and
+        // also bounds the chain at MAX_SO_DEPTH lookups as a backstop.
+        let sec_str = |s: Option<u8>| s.map_or_else(|| "?".to_string(), |s| s.to_string());
+        let mut seen: Vec<(String, Option<u8>)> = Vec::new();
         let mut cur_name = name.to_string();
         let mut cur_section = section;
-        for _ in 0..MAX_SO_DEPTH {
+        loop {
+            if seen.iter().any(|(n, s)| n == &cur_name && *s == cur_section) {
+                return Err(format!(
+                    "unpin man: circular .so redirect at {cur_name}({})",
+                    sec_str(cur_section)
+                ));
+            }
+            if seen.len() as u32 >= MAX_SO_DEPTH {
+                return Err(format!(
+                    "unpin man: .so redirect chain for {name} exceeds {MAX_SO_DEPTH} hops"
+                ));
+            }
+            let redirected = !seen.is_empty();
+            seen.push((cur_name.clone(), cur_section));
+
             let e = self.pick(&cur_name, cur_section, lang).ok_or_else(|| {
-                let sec = cur_section.map_or_else(|| "?".to_string(), |s| s.to_string());
-                format!("unpin man: no page for {cur_name}({sec}) — try `unpin man --list`")
+                let sec = sec_str(cur_section);
+                if redirected {
+                    format!("unpin man: broken .so redirect — {cur_name}({sec}) not found")
+                } else {
+                    format!("unpin man: no page for {cur_name}({sec}) — try `unpin man --list`")
+                }
             })?;
             match &e.body {
                 Body::Roff { off, len } => {
@@ -362,26 +387,47 @@ impl Archive {
                 }
             }
         }
-        Err(format!("unpin man: .so redirect chain too deep for {name}"))
     }
 }
 
 // ----------------------------------------------------------------- command
 
-/// `unpin man [PKG] [PAGE]` — read and report a binary's embedded manual.
-pub fn run(list: bool, raw: bool, pkg: Option<String>, page: Option<String>) -> Result<(), String> {
-    let target = pkg.as_deref().unwrap_or("unpin");
-    if target != "unpin" {
-        return Err(format!(
-            "unpin man: only unpin's own manual is supported for now (got `{target}`); \
-             reading other packages' embedded man lands with the renderer"
-        ));
+/// Candidate binaries for `pkg`: the running binary for unpin's own manual,
+/// else the installed package's binaries (primary first).
+fn locate(paths: &Paths, pkg: Option<&str>) -> Result<Vec<PathBuf>, String> {
+    match pkg {
+        // The running unpin is authoritative for its own manual — no need to
+        // resolve an installed copy (and unpin may not be installed via unpin).
+        None | Some("unpin") => {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("unpin man: cannot locate own binary: {e}"))?;
+            Ok(vec![exe])
+        }
+        Some(name) => install::installed_binaries(paths, name).map_err(|e| format!("unpin man: {e}")),
     }
+}
 
-    let exe =
-        std::env::current_exe().map_err(|e| format!("unpin man: cannot locate own binary: {e}"))?;
-    let container = read_container(&exe)?
-        .ok_or_else(|| format!("unpin man: no embedded manual found in {}", exe.display()))?;
+/// `unpin man [PKG] [PAGE]` — read and report a binary's embedded manual.
+pub fn run(
+    paths: &Paths,
+    list: bool,
+    raw: bool,
+    pkg: Option<String>,
+    page: Option<String>,
+) -> Result<(), String> {
+    let label = pkg.as_deref().unwrap_or("unpin").to_string();
+    let candidates = locate(paths, pkg.as_deref())?;
+
+    // The man blob lives in one binary (the primary); use the first candidate
+    // that carries a container. A corrupt container surfaces as an error here.
+    let mut found = None;
+    for cand in &candidates {
+        if let Some(c) = read_container(cand)? {
+            found = Some(c);
+            break;
+        }
+    }
+    let container = found.ok_or_else(|| format!("unpin man: `{label}` has no embedded manual"))?;
     let inner = decompress(&container)?;
     let archive = parse_archive(&inner)?;
 
@@ -402,7 +448,7 @@ pub fn run(list: bool, raw: bool, pkg: Option<String>, page: Option<String>) -> 
         return Ok(());
     }
 
-    let want = page.as_deref().unwrap_or(target);
+    let want = page.as_deref().unwrap_or(label.as_str());
     let lang = "en";
     let (section, roff) = archive.roff_for(want, None, lang)?;
 
@@ -471,14 +517,20 @@ mod tests {
     }
 
     fn mk_container(inner: &[u8]) -> Vec<u8> {
+        mk_container_comp(inner, 0)
+    }
+
+    /// Wrap `payload` (already compressed per `comp`) in an outer container.
+    /// The CRC is over the payload bytes, as the spec and reader require.
+    fn mk_container_comp(payload: &[u8], comp: u8) -> Vec<u8> {
         let mut blob = Vec::new();
         blob.extend_from_slice(b"some binary preamble\x00\x01");
         blob.extend_from_slice(MARKER_BEGIN);
         blob.push(1u8); // version
-        blob.push(0u8); // compression none
-        blob.extend_from_slice(&(inner.len() as u32).to_le_bytes());
-        blob.extend_from_slice(inner);
-        blob.extend_from_slice(&crc32(inner).to_le_bytes());
+        blob.push(comp);
+        blob.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        blob.extend_from_slice(payload);
+        blob.extend_from_slice(&crc32(payload).to_le_bytes());
         blob.extend_from_slice(MARKER_END);
         blob.extend_from_slice(b"trailing\x02\x03");
         blob
@@ -584,5 +636,63 @@ mod tests {
         ]);
         let arch = parse_archive(&read_inner(&mk_container(&inner)).unwrap()).unwrap();
         assert!(arch.roff_for("a", None, "en").is_err());
+    }
+
+    #[test]
+    fn zstd_compressed_container_roundtrips() {
+        // The path every catalog binary uses (mkman.py emits zstd-19). Proves
+        // ruzstd decodes a standard zstd frame and the whole container + inner
+        // archive survives a compressed roundtrip — comp=1 is otherwise
+        // unexercised by the self-embed (which uses comp=0).
+        let inner = mk_inner(&[("unpin", 1, "en", Ok(b".TH UNPIN 1\nzstd body"))]);
+        let payload = zstd::encode_all(&inner[..], 19).unwrap();
+        let got = read_inner(&mk_container_comp(&payload, 1)).unwrap();
+        assert_eq!(got, inner, "decompressed inner must match the original");
+        let arch = parse_archive(&got).unwrap();
+        let (_, roff) = arch.roff_for("unpin", None, "en").unwrap();
+        assert_eq!(roff, b".TH UNPIN 1\nzstd body");
+    }
+
+    #[test]
+    fn reads_own_embedded_blob() {
+        // The test binary carries the same `#[used]` UNPIN_MAN_BLOB + build.rs
+        // blob as the real `unpin` binary, so scanning our own file must find
+        // it. Locks down `#[used]` retention AND the self-scan skip (the
+        // reader's own MARKER_BEGIN constant precedes the blob in .rodata) —
+        // the regression that first surfaced as `container_version 255`.
+        let exe = std::env::current_exe().expect("current_exe");
+        let container = read_container(&exe)
+            .expect("read own binary")
+            .expect("embedded .unpin_man blob present");
+        let inner = decompress(&container).expect("decompress");
+        let arch = parse_archive(&inner).expect("parse archive");
+        let (sec, roff) = arch.roff_for("unpin", None, "en").expect("unpin(1) page");
+        assert_eq!(sec, 1);
+        assert!(
+            roff.windows(9).any(|w| w == b".TH UNPIN"),
+            "expected unpin man roff source"
+        );
+    }
+
+    #[test]
+    fn so_cycle_is_detected() {
+        let inner = mk_inner(&[
+            ("a", 1, "en", Err(("b", 1))),
+            ("b", 1, "en", Err(("a", 1))),
+        ]);
+        let arch = parse_archive(&read_inner(&mk_container(&inner)).unwrap()).unwrap();
+        let err = arch.roff_for("a", None, "en").unwrap_err();
+        assert!(err.contains("circular"), "got: {err}");
+    }
+
+    #[test]
+    fn dangling_so_redirect_is_named() {
+        let inner = mk_inner(&[("a", 1, "en", Err(("ghost", 1)))]);
+        let arch = parse_archive(&read_inner(&mk_container(&inner)).unwrap()).unwrap();
+        let err = arch.roff_for("a", None, "en").unwrap_err();
+        assert!(
+            err.contains("broken .so redirect") && err.contains("ghost"),
+            "got: {err}"
+        );
     }
 }
