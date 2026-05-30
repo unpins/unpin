@@ -201,7 +201,10 @@ fn stream_scan<R: Read>(mut reader: R) -> Result<Option<Meta>, String> {
 /// minimum needed to detect a needle straddling chunk boundaries). Returns
 /// the offset within `acc` (post-compaction) of the match, or Ok(None) if
 /// EOF arrives without a match.
-fn find_in_chunks<R: Read>(
+///
+/// Shared with `man.rs`, which locates the `.unpin_man` BEGIN sentinel the
+/// same way before reading the length-prefixed container that follows.
+pub(crate) fn find_in_chunks<R: Read>(
     reader: &mut R,
     acc: &mut Vec<u8>,
     needle: &[u8],

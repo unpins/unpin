@@ -1,0 +1,148 @@
+.\" Man page for unpin. Hand-written man(7) roff; embedded into the unpin
+.\" binary as a .unpin_man blob by build.rs and read back by `unpin man`.
+.TH UNPIN 1 "2026" "unpin" "User Commands"
+.SH NAME
+unpin \- install single-binary CLI tools straight from GitHub releases
+.SH SYNOPSIS
+.B unpin
+.RI [ COMMAND ]
+.RI [ OPTIONS ]
+.RI [ PKG ...]
+.br
+.B unpin
+.I owner/repo
+.RB [ @ \fIversion\fR ]
+.SH DESCRIPTION
+.B unpin
+downloads prebuilt, single-file executables from GitHub releases and links
+them onto your
+.BR PATH \(em
+no root, no distribution package manager, and no
+.I /nix/store
+closure at runtime. Each installed tool is one executable per OS, with no
+companion DLL, dylib, or shared object.
+.PP
+Packages are addressed as
+.IR owner/repo .
+A bare
+.I name
+is shorthand for
+.IR unpins/ name ,
+the curated catalog. A version may be pinned with
+.RI @ version
+(for example
+.BR unpins/jq@1.7.1 ).
+.PP
+If the first argument is not a known command, it is treated as a package to
+.BR install ,
+so
+.B unpin owner/repo
+is equivalent to
+.BR "unpin install owner/repo" .
+.SH COMMANDS
+.TP
+.BI install " PKG..."
+Install one or more packages from GitHub releases. This is the default
+command.
+.TP
+.BI update " [NAME...]"
+Update one, several, or (with no arguments) all installed packages.
+.TP
+.BI remove " [NAME...]"
+Remove one, several, or (with no arguments, after confirmation) all
+installed packages.
+.TP
+.B list
+List installed packages.
+.TP
+.BI info " PKG..."
+Show details about one or more packages, installed or remote.
+.TP
+.B prune
+Remove dangling links and unused version directories from the unpin cache.
+.TP
+.BI run " PKG " [ \fB\-\-\fR " ARG..." ]
+Run a package's binary without installing it; no entry is added to
+.BR PATH .
+Arguments after
+.B \-\-
+are forwarded to the binary.
+.TP
+.BI completion " SHELL"
+Print a shell completion script for
+.IR bash ", " zsh ", " fish ", or " elvish .
+.TP
+.BI man " [PKG] [PAGE]"
+Show a package's embedded manual, read from the binary's
+.B .unpin_man
+section.
+With no argument it shows unpin's own manual.
+.SH OPTIONS
+These apply to
+.B install
+and
+.B update
+unless noted.
+.TP
+.BR \-y ", " \-\-yes
+Skip prompts (assume yes).
+.TP
+.BR \-j ", " \-\-jobs " \fIN\fR"
+Number of parallel downloads (default: min(N, 4)).
+.TP
+.BR \-p ", " \-\-pick
+Always prompt to choose the release asset instead of auto-picking.
+.TP
+.BR \-v ", " \-\-verbose
+Print every HTTP request and show release assets that were filtered out.
+.TP
+.B \-\-no\-data
+Skip the per-release runtime-data tarball (overrides config
+.IR data ).
+.TP
+.B \-\-aliases
+Install multi-call aliases declared by a catalog package.
+.TP
+.B \-\-no\-aliases
+Skip multi-call aliases (wins over
+.B \-\-aliases
+and
+.BR \-\-ask\-aliases ).
+.TP
+.B \-\-ask\-aliases
+Prompt before installing aliases.
+.SH CONFIGURATION
+A flat
+.I key = value
+file with
+.B #
+comments. Recognized keys:
+.TP
+.BI http_timeout " seconds"
+Per-request HTTP timeout (default: 30).
+.TP
+.BI use_gh_auth " true|false"
+Shell out to
+.B gh auth token
+for the GitHub token (default: false).
+.TP
+.BI data " true|false"
+Download the per-release runtime-data tarball (default: true).
+.TP
+.BI aliases " yes|no|ask"
+Install multi-call aliases declared by catalog packages (default: yes).
+Non-catalog
+.I owner/repo
+installs always skip aliases.
+.SH ENVIRONMENT
+.TP
+.BR GITHUB_TOKEN ", " GH_TOKEN
+GitHub API token. Raises the rate limit from 60 to 5000 requests per hour.
+.SH SEE ALSO
+Project home:
+.UR https://unpins.org
+.UE .
+.SH BUGS
+Report issues at
+.UR https://github.com/unpins/unpin
+.UE .

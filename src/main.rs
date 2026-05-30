@@ -9,6 +9,7 @@ mod ctx;
 mod github;
 mod http;
 mod install;
+mod man;
 mod panic;
 mod platform;
 mod sigint;
@@ -38,6 +39,8 @@ enum Cmd {
     Run(RunCmd),
     /// Print a shell completion script. Pipe it to your shell's completion directory (see README).
     Completion(CompletionCmd),
+    /// Show a package's embedded manual (reads the `.unpin_man` section; no argument = unpin's own).
+    Man(ManCmd),
 }
 
 impl Cmd {
@@ -54,6 +57,7 @@ impl Cmd {
             Cmd::Prune => install::prune(paths).map(|()| 0),
             Cmd::Run(c) => c.run(paths),
             Cmd::Completion(c) => c.run().map(|()| 0),
+            Cmd::Man(c) => c.run().map(|()| 0),
         }
     }
 }
@@ -179,6 +183,28 @@ impl CompletionCmd {
 }
 
 #[derive(Args, Debug)]
+struct ManCmd {
+    /// List the manual pages embedded in the binary
+    #[arg(long = "list")]
+    list: bool,
+    /// Dump the raw roff source instead of the (not-yet-implemented) rendered page
+    #[arg(long = "raw")]
+    raw: bool,
+    /// Package whose manual to show (default: unpin itself)
+    #[arg(value_name = "PKG")]
+    pkg: Option<String>,
+    /// Specific page name (default: the package's own name)
+    #[arg(value_name = "PAGE")]
+    page: Option<String>,
+}
+
+impl ManCmd {
+    fn run(self) -> Result<(), String> {
+        man::run(self.list, self.raw, self.pkg, self.page)
+    }
+}
+
+#[derive(Args, Debug)]
 struct InstallUpdateFlags {
     /// Skip prompts
     #[arg(short = 'y', long = "yes")]
@@ -288,6 +314,7 @@ const SUBCOMMANDS: &[&str] = &[
     "prune",
     "run",
     "completion",
+    "man",
     "help",
 ];
 
