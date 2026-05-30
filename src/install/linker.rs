@@ -344,6 +344,15 @@ pub fn link_all_executables(
     // already physically removed by the pre-link sweep above — this is just
     // the name diff so the user sees the dropped entry in the summary. Their
     // removal is also what lets `prune` reclaim the older vdir later.
+    //
+    // The diff against `refreshed` (created this run) can't mis-report a name
+    // as removed while a file still sits at its path: an `existing_managed`
+    // entry points into *this* rdir, so even if the pre-sweep removal failed,
+    // classify_slot reads it as our own version and re-Writes it (→ refreshed)
+    // rather than taking a declinable prompt. A foreign file the user might
+    // decline never pointed into rdir, so it was never in `existing_managed`.
+    // Anything left here is genuinely gone. (A concurrent external swap in the
+    // sweep→classify window is the only gap, and InstallLock serializes us.)
     let mut orphans = Vec::new();
     for old in &existing_managed {
         if !refreshed.iter().any(|r| r == old) {
