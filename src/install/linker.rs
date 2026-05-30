@@ -9,6 +9,7 @@
 //! the parent module and come in via `super::`; the on-disk layout (`bin`,
 //! `data`, `repo_dir`) arrives as a borrowed [`crate::platform::Paths`].
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -299,6 +300,11 @@ pub fn link_all_executables(
 
     let mut summary = LinkSummary::default();
     let mut refreshed: Vec<PathBuf> = Vec::new();
+    // Names the new version declared and attempted to link, across all
+    // primaries. The Windows alias sweep below consults this so it never
+    // deletes an alias the new version still declares but couldn't (re)link
+    // this run. Built on every platform; only read under `cfg(windows)`.
+    let mut attempted_aliases: HashSet<String> = HashSet::new();
     for target in &executables {
         let basename = target
             .file_name()
@@ -326,6 +332,7 @@ pub fn link_all_executables(
         for a in &alias_outcome.linked {
             refreshed.push(bin.join(platform::alias_link_filename(a)));
         }
+        attempted_aliases.extend(alias_outcome.attempted);
         // `classify_slot` already kept first-seen on disk (via `refreshed`),
         // so a name can't appear twice here — no extra dedup needed.
         summary.aliases.extend(alias_outcome.linked);
@@ -365,7 +372,13 @@ pub fn link_all_executables(
                     continue;
                 }
                 for old_alias in aliases_from_vdir(&p) {
-                    if summary.aliases.iter().any(|a| a == &old_alias) {
+                    // Keep any alias the new version still declares — whether it
+                    // linked cleanly or was blocked this run (a foreign file the
+                    // user declined to overwrite, or a name collision). Deleting
+                    // a still-declared name would remove the very file the user
+                    // chose to keep. `attempted_aliases` ⊇ the linked set, so it
+                    // subsumes the old `summary.aliases` check.
+                    if attempted_aliases.contains(&old_alias) {
                         continue;
                     }
                     let link_p = bin.join(platform::alias_link_filename(&old_alias));
@@ -389,8 +402,17 @@ pub fn link_all_executables(
 }
 
 /// Outcome of attempting to install aliases for a single primary binary.
+#[derive(Default)]
 struct AliasOutcome {
+    /// Aliases successfully linked this run.
     linked: Vec<String>,
+    /// Every alias the new version *declared and attempted* — the create loop
+    /// ran over them, whether they linked, were declined, or collided. Empty
+    /// when aliases were skipped wholesale (non-catalog, `--no-aliases`, or the
+    /// whole-list prompt declined). The Windows orphan sweep keeps any name in
+    /// here, so a still-declared alias that merely failed to link this run
+    /// isn't deleted out from under the user. `linked` ⊆ `attempted`.
+    attempted: Vec<String>,
     /// Zero or more one-line summary notes: aliases declared but skipped
     /// (non-catalog source, `--no-aliases`, existing files) or a name that
     /// collided with another binary/package.
@@ -409,16 +431,10 @@ fn link_aliases_for(
 ) -> Result<AliasOutcome, String> {
     let meta = match aliases::read_meta(primary)? {
         None => {
-            return Ok(AliasOutcome {
-                linked: vec![],
-                notes: vec![],
-            });
+            return Ok(AliasOutcome::default());
         }
         Some(m) if m.aliases.is_empty() => {
-            return Ok(AliasOutcome {
-                linked: vec![],
-                notes: vec![],
-            });
+            return Ok(AliasOutcome::default());
         }
         Some(m) => m,
     };
@@ -429,11 +445,11 @@ fn link_aliases_for(
     // audit; honoring aliases there would silently expand the trust surface.
     if spec.owner != CATALOG_OWNER {
         return Ok(AliasOutcome {
-            linked: vec![],
             notes: vec![format!(
                 "{} alias(es) declared but ignored (non-catalog source)",
                 meta.aliases.len()
             )],
+            ..Default::default()
         });
     }
 
@@ -457,8 +473,8 @@ fn link_aliases_for(
     };
     if !install {
         return Ok(AliasOutcome {
-            linked: vec![],
             notes: vec![format!("{} alias(es) skipped", meta.aliases.len())],
+            ..Default::default()
         });
     }
 
@@ -510,7 +526,11 @@ fn link_aliases_for(
             declined.join(", ")
         ));
     }
-    Ok(AliasOutcome { linked, notes })
+    Ok(AliasOutcome {
+        linked,
+        attempted: meta.aliases.clone(),
+        notes,
+    })
 }
 
 /// Create an alias link at `link`, classifying an existing entry the same way
