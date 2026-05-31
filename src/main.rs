@@ -4,6 +4,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 mod aliases;
 mod archive;
+mod bundle;
 mod config;
 mod ctx;
 mod github;
@@ -42,6 +43,8 @@ enum Cmd {
     Completion(CompletionCmd),
     /// Show a package's embedded manual (reads its `unpin/man/*` entries; no argument = unpin's own).
     Man(ManCmd),
+    /// Inspect a package's embedded metadata bundle — its `unpin/*` entries (stable interface used by helper packages such as `man`).
+    Bundle(BundleCmd),
 }
 
 impl Cmd {
@@ -59,6 +62,7 @@ impl Cmd {
             Cmd::Run(c) => c.run(paths),
             Cmd::Completion(c) => c.run().map(|()| 0),
             Cmd::Man(c) => c.run(paths).map(|()| 0),
+            Cmd::Bundle(c) => c.run(paths).map(|()| 0),
         }
     }
 }
@@ -206,6 +210,40 @@ impl ManCmd {
 }
 
 #[derive(Args, Debug)]
+struct BundleCmd {
+    #[command(subcommand)]
+    op: BundleOp,
+}
+
+#[derive(Subcommand, Debug)]
+enum BundleOp {
+    /// List every entry in the bundle (`path<TAB>size`, or `path<TAB>-> target` for a `.so` symlink).
+    List {
+        /// Package whose binary to read (installed name, or `unpin` for the running binary)
+        #[arg(value_name = "PKG")]
+        pkg: String,
+    },
+    /// Print one entry's bytes to stdout; prints nothing if the entry (or the whole bundle) is absent.
+    Dump {
+        /// Package whose binary to read (installed name, or `unpin` for the running binary)
+        #[arg(value_name = "PKG")]
+        pkg: String,
+        /// Entry path, e.g. `unpin/aliases`
+        #[arg(value_name = "ENTRY")]
+        entry: String,
+    },
+}
+
+impl BundleCmd {
+    fn run(self, paths: &platform::Paths) -> Result<(), String> {
+        match self.op {
+            BundleOp::List { pkg } => bundle::list(paths, &pkg),
+            BundleOp::Dump { pkg, entry } => bundle::dump(paths, &pkg, &entry),
+        }
+    }
+}
+
+#[derive(Args, Debug)]
 struct InstallUpdateFlags {
     /// Skip prompts
     #[arg(short = 'y', long = "yes")]
@@ -316,6 +354,7 @@ const SUBCOMMANDS: &[&str] = &[
     "run",
     "completion",
     "man",
+    "bundle",
     "help",
 ];
 
