@@ -4,9 +4,13 @@
 
 `unpin` is the bootstrap CLI of the [unpins](https://unpins.org) project. It
 fetches a pre-built binary from a GitHub release, verifies its checksum, and
-drops it in your PATH.
+either runs it on the spot or drops it in your PATH.
 
 ```sh
+# A bare name fetches and runs the tool — nothing is installed (the default):
+unpin BurntSushi/ripgrep --version
+
+# Install it onto your PATH instead:
 unpin install BurntSushi/ripgrep
 rg --version
 ```
