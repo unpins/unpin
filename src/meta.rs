@@ -23,7 +23,8 @@ use std::path::Path;
 /// Plant unpin's own metadata ZIP (its `unpin.1`, built by `build.rs`) in the
 /// binary so the byte-scan below finds it in our own file, exactly as it would
 /// in any other unpins binary. `#[used]` keeps the bytes through dead-code
-/// elimination — `unpin man` reads them back off disk via `current_exe()`.
+/// elimination — `unpin bundle` reads them back off disk via `current_exe()`,
+/// which is how the `man` package fetches unpin's own manual (`unpin man unpin`).
 #[used]
 static UNPIN_META_ZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unpin_meta.zip"));
 

@@ -35,16 +35,27 @@ the curated catalog. A version may be pinned with
 .BR unpins/jq@1.7.1 ).
 .PP
 If the first argument is not a known command, it is treated as a package to
-.BR install ,
+.BR run ,
 so
 .B unpin owner/repo
 is equivalent to
-.BR "unpin install owner/repo" .
+.BR "unpin run owner/repo" .
+Installing onto
+.B PATH
+is the explicit
+.BR "unpin install" .
+This also dispatches helper verbs to their packages: with no
+.B man
+command built in,
+.B unpin man coreutils ls
+runs the
+.I man
+package (a patched mandoc) on coreutils' embedded manual.
 .SH COMMANDS
 .TP
 .BI install " PKG..."
-Install one or more packages from GitHub releases. This is the default
-command.
+Install one or more packages from GitHub releases onto
+.BR PATH .
 .TP
 .BI update " [NAME...]"
 Update one, several, or (with no arguments) all installed packages.
@@ -65,25 +76,15 @@ Remove dangling links and unused version directories from the unpin cache.
 .BI run " PKG " [ \fB\-\-\fR " ARG..." ]
 Run a package's binary without installing it; no entry is added to
 .BR PATH .
-Arguments after
+This is the default command, so the
+.B run
+keyword may be omitted. Arguments after
 .B \-\-
 are forwarded to the binary.
 .TP
 .BI completion " SHELL"
 Print a shell completion script for
 .IR bash ", " zsh ", " fish ", or " elvish .
-.TP
-.BI man " [PKG] [PAGE]"
-Show an installed package's embedded manual, read from the man pages
-baked into the binary's embedded metadata. With no argument, shows unpin's
-own manual.
-.B \-\-list
-lists the embedded pages and
-.B \-\-raw
-dumps the raw roff source. (Terminal rendering is not implemented yet; until it
-lands, the page found is reported and
-.B \-\-raw
-prints its source.)
 .SH OPTIONS
 These apply to
 .B install

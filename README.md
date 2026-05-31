@@ -61,15 +61,20 @@ Windows. See `flake.nix` for the build matrix.
 ## Usage
 
 ```text
-unpin [install] <repo>...    Install one or more packages (default command)
+unpin [run] <repo> [args...] Fetch and execute a binary without linking (default command)
+unpin install <repo>...      Install one or more packages onto PATH
 unpin update [<name>...]     Pull newer releases (all packages if no names)
 unpin remove <name>...       Uninstall packages
 unpin list                   List installed packages
 unpin info <name>...         Show details for installed packages
 unpin prune                  Drop old versions, keep the active one
-unpin run <repo> [args...]   Fetch and execute a binary without linking
 unpin completion <shell>     Print a shell completion script
 ```
+
+A bare name with no command runs the package; installing onto `PATH` is the
+explicit `unpin install`. Helper verbs dispatch the same way — `unpin man
+coreutils ls` runs the [`man`](https://github.com/unpins/man) package (a
+patched mandoc) on coreutils' embedded manual.
 
 Common flags:
 

@@ -10,7 +10,6 @@ mod ctx;
 mod github;
 mod http;
 mod install;
-mod man;
 mod meta;
 mod panic;
 mod platform;
@@ -25,7 +24,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Install one or more packages from GitHub releases. Default command — `unpin owner/repo` is equivalent to `unpin install owner/repo`.
+    /// Install one or more packages from GitHub releases onto your PATH.
     Install(InstallCmd),
     /// Update one, several, or (with no args) all installed packages.
     Update(UpdateCmd),
@@ -37,12 +36,10 @@ enum Cmd {
     Info(InfoCmd),
     /// Remove dangling links and unused version dirs from the unpin cache.
     Prune,
-    /// Run a package's binary without installing it (no entry added to PATH).
+    /// Run a package's binary without installing it (no entry added to PATH). Default command — `unpin owner/repo` is equivalent to `unpin run owner/repo`.
     Run(RunCmd),
     /// Print a shell completion script. Pipe it to your shell's completion directory (see README).
     Completion(CompletionCmd),
-    /// Show a package's embedded manual (reads its `unpin/man/*` entries; no argument = unpin's own).
-    Man(ManCmd),
     /// Inspect a package's embedded metadata bundle — its `unpin/*` entries (stable interface used by helper packages such as `man`).
     Bundle(BundleCmd),
 }
@@ -61,7 +58,6 @@ impl Cmd {
             Cmd::Prune => install::prune(paths).map(|()| 0),
             Cmd::Run(c) => c.run(paths),
             Cmd::Completion(c) => c.run().map(|()| 0),
-            Cmd::Man(c) => c.run(paths).map(|()| 0),
             Cmd::Bundle(c) => c.run(paths).map(|()| 0),
         }
     }
@@ -184,28 +180,6 @@ impl CompletionCmd {
         std::io::stdout()
             .write_all(&buf)
             .map_err(|e| format!("write completions: {e}"))
-    }
-}
-
-#[derive(Args, Debug)]
-struct ManCmd {
-    /// List the manual pages embedded in the binary
-    #[arg(long = "list")]
-    list: bool,
-    /// Dump the raw roff source instead of the (not-yet-implemented) rendered page
-    #[arg(long = "raw")]
-    raw: bool,
-    /// Package whose manual to show (default: unpin itself)
-    #[arg(value_name = "PKG")]
-    pkg: Option<String>,
-    /// Specific page name (default: the package's own name)
-    #[arg(value_name = "PAGE")]
-    page: Option<String>,
-}
-
-impl ManCmd {
-    fn run(self, paths: &platform::Paths) -> Result<(), String> {
-        man::run(paths, self.list, self.raw, self.pkg, self.page)
     }
 }
 
@@ -353,7 +327,6 @@ const SUBCOMMANDS: &[&str] = &[
     "prune",
     "run",
     "completion",
-    "man",
     "bundle",
     "help",
 ];
@@ -389,9 +362,12 @@ fn classify_help(pre_ddash: &[&str]) -> HelpKind {
 }
 
 /// Parse argv. If the user didn't lead with a subcommand or top-level flag,
-/// try a second pass with `install` injected as the default subcommand.
-/// On retry failure, return the original error so clap's error usage line
-/// doesn't expose the injected prefix.
+/// try a second pass with `run` injected as the default subcommand — so
+/// `unpin owner/repo [args...]` runs the package, and `unpin man coreutils ls`
+/// dispatches the `man` verb to the `man` package (a bare name is now run, not
+/// installed; installing is the explicit `unpin install`). On retry failure,
+/// return the original error so clap's error usage line doesn't expose the
+/// injected prefix.
 fn parse_args(raw: &[String]) -> Result<Cli, clap::Error> {
     let e1 = match Cli::try_parse_from(raw) {
         Ok(c) => return Ok(c),
@@ -404,7 +380,7 @@ fn parse_args(raw: &[String]) -> Result<Cli, clap::Error> {
     if can_retry {
         let mut prefixed = Vec::with_capacity(raw.len() + 1);
         prefixed.push(raw[0].clone());
-        prefixed.push("install".to_owned());
+        prefixed.push("run".to_owned());
         prefixed.extend_from_slice(&raw[1..]);
         if let Ok(c) = Cli::try_parse_from(&prefixed) {
             return Ok(c);

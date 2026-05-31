@@ -969,8 +969,16 @@ pub fn run(
         }
     };
 
-    let status = Command::new(&bin)
-        .args(args)
+    // Expose this unpin binary to the launched package via $UNPIN_SELF, so a
+    // helper package (e.g. `man`) can shell back to `unpin bundle …` against
+    // exactly this binary instead of guessing one off $PATH. Best-effort: if we
+    // can't resolve our own path the child just falls back to `unpin` on $PATH.
+    let mut cmd = Command::new(&bin);
+    cmd.args(args);
+    if let Ok(self_exe) = std::env::current_exe() {
+        cmd.env("UNPIN_SELF", self_exe);
+    }
+    let status = cmd
         .status()
         .map_err(|e| format!("exec {}: {e}", bin.display()))?;
     match status.code() {
