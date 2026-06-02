@@ -1,11 +1,13 @@
-//! `unpin install` with no package = self-install. Relocate the running
-//! binary into the managed `bin` dir and make sure that dir is on `PATH`.
+//! `unpin install` with no package = self-install. Register the running binary
+//! as the `unpins/unpin` package — exactly the layout a normal install
+//! produces — and make sure the `bin` dir is on `PATH`.
 //!
-//! The flow a first-time user hits: download `unpin` anywhere with `curl`,
-//! run `unpin install`. We move the binary to `bin/unpin[.exe]`, then (with a
-//! prompt) add `bin` to `PATH` — editing the right shell profile on Unix, or
-//! the per-user `Path` registry value on Windows. Running it again once it's
-//! already in place just reports that and re-checks `PATH`.
+//! The flow a first-time user hits: download `unpin` anywhere with `curl`, run
+//! `unpin install`. We drop the binary into its version dir under `data` and
+//! link it into `bin` via the regular linker, so `unpin update` self-updates,
+//! `unpin list` shows it, and `unpin uninstall` removes it like any package.
+//! Then (with a prompt) we add `bin` to `PATH` — editing the right shell
+//! profile on Unix, or the per-user `Path` registry value on Windows.
 //!
 //! Windows can't delete the running `.exe`, so when we have to *copy* (the
 //! download lives on another volume) rather than rename, the freshly placed
@@ -17,6 +19,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use crate::install;
 use crate::platform::{self, Paths};
 
 /// Internal handoff env var. When set, names the original download path that a
@@ -24,8 +27,9 @@ use crate::platform::{self, Paths};
 /// purely as a janitor (delete the file, exit) and does nothing else.
 const CLEANUP_ENV: &str = "UNPIN_CLEANUP_ORIGIN";
 
-/// On-disk file name for unpin's own binary in `bin` — the real executable,
-/// not a `.cmd` wrapper (those forward to *package* binaries under `data`).
+/// On-disk file name for unpin's own binary inside its version dir — the real
+/// executable. The `bin` entry that points at it is a symlink (Unix) or a
+/// `.cmd` wrapper (Windows), created by the linker like any package's.
 const SELF_NAME: &str = if cfg!(windows) { "unpin.exe" } else { "unpin" };
 
 /// Entry point for `unpin install` with no package argument.
@@ -40,15 +44,27 @@ pub fn run(paths: &Paths, assume_yes: bool) -> Result<(), String> {
 
     let current =
         env::current_exe().map_err(|e| format!("cannot locate the running unpin binary: {e}"))?;
-    let dest = paths.bin.join(SELF_NAME);
+    let spec = install::self_spec();
+    let tag = spec.version.clone().unwrap_or_default();
+    let vdir = paths.version_dir(&spec.owner, &spec.name, &tag);
+    // The binary lives at `<vdir>/unpin[.exe]`; the PATH entry is the link the
+    // linker creates next to the other packages' wrappers.
+    let dest = vdir.join(SELF_NAME);
+    let link = paths.bin.join(platform::link_filename(&spec.name));
 
     if dest.exists() && same_file(&current, &dest) {
-        println!("unpin is already installed at {}", dest.display());
+        // Already the installed binary of this version — just make sure the
+        // link exists (cheap, idempotent) and re-check PATH.
+        install::link_installed(paths, &spec, &vdir, assume_yes)?;
+        println!("unpin {tag} is already installed ({}).", link.display());
     } else {
         let reloc = relocate(&current, &dest)?;
-        println!("Installed unpin to {}", dest.display());
+        install::link_installed(paths, &spec, &vdir, assume_yes)?;
+        println!("Installed unpin {tag} ({}).", link.display());
         #[cfg(windows)]
         if let Relocation::CopiedOriginRemains(origin) = &reloc {
+            // Spawn the real `.exe` we just placed (not the `.cmd` wrapper —
+            // CreateProcess can't run a batch file directly).
             spawn_janitor(&dest, origin);
         }
         // Bind on non-Windows so the `reloc` value is always "used".

@@ -2,10 +2,11 @@
 //! asset filtering) routes through here so the rest of the crate stays portable.
 //!
 //! - Linux/macOS: XDG-ish paths, symlinks for binaries, +x bit for executable.
-//! - Windows: `%LOCALAPPDATA%\unpin\` holds `unpin.exe` itself plus the `.cmd`
-//!   wrappers (the user adds this single folder to PATH); extracted package
-//!   binaries go under `%LOCALAPPDATA%\unpin\packages\`. Wrappers (no admin,
-//!   no Developer Mode) replace symlinks; `.exe` extension marks executables.
+//! - Windows: `%LOCALAPPDATA%\unpin\` holds the `.cmd` wrappers the user adds
+//!   to PATH; extracted package binaries go under `%LOCALAPPDATA%\unpin\packages\`.
+//!   unpin manages itself the same way — `unpin.exe` lives under `packages\`
+//!   with a `unpin.cmd` wrapper alongside the rest. Wrappers (no admin, no
+//!   Developer Mode) replace symlinks; `.exe` extension marks executables.
 
 use std::env;
 use std::fs;

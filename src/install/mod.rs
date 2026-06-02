@@ -20,7 +20,10 @@ use asset::pick_asset;
 use job::{PipelineMode, PipelineRequest};
 #[cfg(windows)]
 use linker::aliases_from_vdir;
-use linker::{ensure_executable, is_executable, sweep_dangling_links, walk_binary_candidates};
+use linker::{
+    ensure_executable, is_executable, link_all_executables, sweep_dangling_links,
+    walk_binary_candidates,
+};
 pub use pipeline::InstallOptions;
 use pipeline::{do_extract, finalize_primary_bar, preflight_extract, run_pipeline_v2};
 use prompt::{PromptResult, prompt_pick_with_skip};
@@ -414,6 +417,43 @@ pub fn list(paths: &Paths) -> Result<(), String> {
             ver_w = ver_w
         );
     }
+    Ok(())
+}
+
+/// The package spec for unpin itself. Self-install registers the running
+/// binary under this, so `update`/`list`/`uninstall` then treat unpin like any
+/// other package. The release tag is always `v` + the crate version, so the
+/// locally bootstrapped version dir lines up with what `update` fetches.
+pub fn self_spec() -> Spec {
+    Spec {
+        owner: spec::CATALOG_OWNER.to_owned(),
+        name: "unpin".to_owned(),
+        version: Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
+    }
+}
+
+/// Link an already-populated version dir as `spec`'s active version, taking the
+/// same repo→links locks the install pipeline uses. The self-install bootstrap
+/// calls this after dropping unpin's own binary into `vdir` — there's no
+/// download/extract, just the linking half of a normal install. unpin declares
+/// no aliases, so alias handling is off.
+pub fn link_installed(
+    paths: &Paths,
+    spec: &Spec,
+    vdir: &Path,
+    assume_yes: bool,
+) -> Result<(), String> {
+    let _repo = RepoLock::acquire(&paths.repo_dir(&spec.owner, &spec.name))?;
+    let _links = platform::acquire_links_lock(&paths.data, || {})?;
+    let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+    link_all_executables(
+        paths,
+        &multi,
+        spec,
+        vdir,
+        assume_yes,
+        crate::aliases::AliasMode::No,
+    )?;
     Ok(())
 }
 
