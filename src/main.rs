@@ -175,6 +175,9 @@ struct RunCmd {
     /// Skip prompts (e.g. proceed without a SHA-256 checksum)
     #[arg(short = 'y', long = "yes")]
     assume_yes: bool,
+    /// Re-resolve the latest release from GitHub instead of running a cached version
+    #[arg(long = "refresh")]
+    refresh: bool,
     /// Print every HTTP request and show release assets that were filtered out
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
@@ -193,7 +196,14 @@ struct RunCmd {
 impl RunCmd {
     fn run(self, paths: &platform::Paths) -> Result<i32, String> {
         let ctx = ctx::Ctx::new(self.verbose, paths.clone());
-        install::run(&ctx, &self.pkg, &self.args, self.pick, self.assume_yes)
+        install::run(
+            &ctx,
+            &self.pkg,
+            &self.args,
+            self.pick,
+            self.assume_yes,
+            self.refresh,
+        )
     }
 }
 

@@ -889,8 +889,31 @@ pub fn run(
     args: &[String],
     pick: bool,
     assume_yes: bool,
+    refresh: bool,
 ) -> Result<i32, String> {
     let spec = parse_spec(input)?;
+
+    // Cache-first: if a suitable version is already on disk, run it without
+    // touching GitHub. `run` is the ephemeral "just execute it" path — keeping
+    // up with the latest release is `update`/`install`'s job, not every run's.
+    // An explicit `@version` matches that tag; a bare spec uses the most
+    // recently fetched version. `--refresh` forces a re-resolve; `--pick` needs
+    // the live asset list, so it can't short-circuit here.
+    if !refresh && !pick {
+        if let Some(vdir) = cached_run_target(&ctx.paths, &spec) {
+            // Quiet by default — a cache hit should feel like running any local
+            // binary. `-v` still surfaces which version ran, for debugging.
+            if ctx.verbose {
+                let tag = vdir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                eprintln!("Using {} {} (cached)", spec.repo(), tag);
+            }
+            return run_binary(&spec, &vdir, args, assume_yes);
+        }
+    }
+
     println!("Resolving {}...", spec.repo());
     let release = fetch_release(ctx, &spec)?;
     // `run` always includes data — bypassing it could leave the binary
@@ -954,8 +977,60 @@ pub fn run(
     // contents are stable from here — the child only reads them.
     drop(job);
 
+    run_binary(&spec, &vdir, args, assume_yes)
+}
+
+/// The version dir to run straight from the local cache, or `None` to fall
+/// through to a GitHub resolve. An explicit `@version` matches a version dir by
+/// tag (tolerating a leading `v` on either side); a bare spec picks the most
+/// recently fetched version. A real version dir is always a complete extraction
+/// (incomplete ones stay as `.part`), so its presence is enough — `run_binary`
+/// does the actual executable selection.
+fn cached_run_target(paths: &Paths, spec: &Spec) -> Option<PathBuf> {
+    let rdir = paths.repo_dir(&spec.owner, &spec.name);
+    let mut versions: Vec<(PathBuf, std::time::SystemTime)> = fs::read_dir(&rdir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| !is_part_dir_name(&e.file_name().to_string_lossy()))
+        .filter_map(|e| {
+            let mtime = e.metadata().and_then(|m| m.modified()).ok()?;
+            Some((e.path(), mtime))
+        })
+        .collect();
+    if versions.is_empty() {
+        return None;
+    }
+    match &spec.version {
+        Some(want) => versions.into_iter().find_map(|(p, _)| {
+            let name = p.file_name()?.to_str()?;
+            tag_matches(name, want).then_some(p)
+        }),
+        None => {
+            // Most recently fetched — "the last one you got". Avoids version-
+            // string sorting, which the rest of the cache does only lexically.
+            versions.sort_by_key(|(_, mtime)| *mtime);
+            versions.pop().map(|(p, _)| p)
+        }
+    }
+}
+
+/// Whether a version-dir name equals the requested `@version`, ignoring a single
+/// leading `v` on either side (so `@3.4.1` matches a `v3.4.1` dir and vice
+/// versa).
+fn tag_matches(dir_name: &str, want: &str) -> bool {
+    fn strip(s: &str) -> &str {
+        s.strip_prefix('v').unwrap_or(s)
+    }
+    dir_name == want || strip(dir_name) == strip(want)
+}
+
+/// Pick the executable inside `vdir` and exec it with `args`, returning the
+/// child's exit code. Shared by the cache-first short-circuit and the
+/// post-download path.
+fn run_binary(spec: &Spec, vdir: &Path, args: &[String], assume_yes: bool) -> Result<i32, String> {
     let mut files = Vec::new();
-    walk_binary_candidates(&vdir, &mut files)
+    walk_binary_candidates(vdir, &mut files)
         .map_err(|e| format!("walk {}: {e}", vdir.display()))?;
     let executables: Vec<PathBuf> = files.iter().filter(|p| is_executable(p)).cloned().collect();
     let bin = match executables.len() {
@@ -1095,6 +1170,89 @@ mod tests {
         assert!(!is_part_dir_name("v1.0.0"));
         assert!(!is_part_dir_name("part"));
         assert!(!is_part_dir_name("partial"));
+    }
+
+    #[test]
+    fn tag_matches_tolerates_a_single_leading_v() {
+        assert!(tag_matches("v3.4.1", "3.4.1"));
+        assert!(tag_matches("3.4.1", "v3.4.1"));
+        assert!(tag_matches("v3.4.1", "v3.4.1"));
+        assert!(tag_matches("3.4.1", "3.4.1"));
+        // No false prefix matches.
+        assert!(!tag_matches("v3.4.1", "3.4.2"));
+        assert!(!tag_matches("v3.4.10", "3.4.1"));
+    }
+
+    fn paths_with_data(tmp: &Path) -> Paths {
+        Paths {
+            data: tmp.join("data"),
+            bin: tmp.join("bin"),
+            config: tmp.join("config"),
+        }
+    }
+
+    #[test]
+    fn cached_run_target_none_when_nothing_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        let (_, spec) = mk("htop", "unpins", "htop", None);
+        assert!(cached_run_target(&paths, &spec).is_none());
+    }
+
+    #[test]
+    fn cached_run_target_explicit_version_matches_with_v_tolerance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        let vdir = paths.version_dir("unpins", "htop", "v3.4.0");
+        fs::create_dir_all(&vdir).unwrap();
+
+        let (_, want_v) = mk("htop@v3.4.0", "unpins", "htop", Some("v3.4.0"));
+        assert_eq!(
+            cached_run_target(&paths, &want_v).as_deref(),
+            Some(vdir.as_path())
+        );
+        // Without the leading `v`, still matches the `v`-prefixed dir.
+        let (_, want_bare) = mk("htop@3.4.0", "unpins", "htop", Some("3.4.0"));
+        assert_eq!(
+            cached_run_target(&paths, &want_bare).as_deref(),
+            Some(vdir.as_path())
+        );
+        // A version we don't have on disk → fall through to a GitHub resolve.
+        let (_, want_miss) = mk("htop@9.9.9", "unpins", "htop", Some("9.9.9"));
+        assert!(cached_run_target(&paths, &want_miss).is_none());
+    }
+
+    #[test]
+    fn cached_run_target_ignores_part_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        // Only a half-finished extract on disk → nothing complete to run.
+        fs::create_dir_all(paths.repo_dir("unpins", "htop").join("v3.4.0.part")).unwrap();
+        let (_, spec) = mk("htop", "unpins", "htop", None);
+        assert!(cached_run_target(&paths, &spec).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_run_target_bare_picks_most_recently_fetched() {
+        use std::time::{Duration, SystemTime};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        let older = paths.version_dir("unpins", "htop", "v3.4.0");
+        let newer = paths.version_dir("unpins", "htop", "v3.5.0");
+        fs::create_dir_all(&older).unwrap();
+        fs::create_dir_all(&newer).unwrap();
+        // Force `older`'s mtime back so the ordering is unambiguous regardless
+        // of how close together the two dirs were created.
+        std::fs::File::open(&older)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let (_, spec) = mk("htop", "unpins", "htop", None);
+        assert_eq!(
+            cached_run_target(&paths, &spec).as_deref(),
+            Some(newer.as_path())
+        );
     }
 
     fn mk(label: &str, owner: &str, name: &str, version: Option<&str>) -> (String, Spec) {
