@@ -231,6 +231,27 @@ pub(super) fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, Str
     }
 }
 
+/// Error for a non-interactive run that matched more than one installable
+/// asset. Pulled out (and unit-tested) so the install/update pipeline fails
+/// loudly with the exact choices instead of silently skipping the package with
+/// a success exit code — the catalog (`unpins/*`) ships one asset per OS/arch
+/// and never hits this, but third-party repos that publish e.g. both a
+/// `-gnu` and a `-msvc` Windows build do.
+pub fn ambiguous_assets_error(candidate_names: &[String]) -> String {
+    let list = candidate_names
+        .iter()
+        .map(|n| format!("  {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{n} release assets match this {os}/{arch}; unpin won't guess between them:\n{list}\n\
+         Re-run in an interactive terminal to choose one.",
+        n = candidate_names.len(),
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+    )
+}
+
 /// Find `<pkg>-<tag>-data.tar.zst` in the release's assets. Tries both raw
 /// `tag` and `v`-stripped (GitHub releases typically tag as `v9.2.0` but our
 /// build emits the data asset using the bare version). Returns `None` for
@@ -553,6 +574,22 @@ mod tests {
         let candidates = vec![&a, &b];
         let err = prompt_pick(&candidates).unwrap_err();
         assert!(err.contains("not a terminal"), "got: {err}");
+    }
+
+    #[test]
+    fn ambiguous_assets_error_lists_every_candidate() {
+        // The non-interactive ambiguity failure must name each choice (so the
+        // user can pick one on a terminal) and state the count — it replaced a
+        // silent exit-0 skip, so the wording is the only signal the user gets.
+        let names = vec![
+            "ripgrep-15.1.0-x86_64-pc-windows-gnu.zip".to_owned(),
+            "ripgrep-15.1.0-x86_64-pc-windows-msvc.zip".to_owned(),
+        ];
+        let msg = ambiguous_assets_error(&names);
+        assert!(msg.contains("2 release assets"), "got: {msg}");
+        assert!(msg.contains("windows-gnu.zip"), "got: {msg}");
+        assert!(msg.contains("windows-msvc.zip"), "got: {msg}");
+        assert!(msg.contains("interactive terminal"), "got: {msg}");
     }
 
     #[test]

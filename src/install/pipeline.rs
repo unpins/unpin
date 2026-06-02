@@ -23,7 +23,8 @@ use crate::github::{self, Asset, Release};
 use crate::platform::{self, Paths};
 
 use super::asset::{
-    fetch_expected_sha256, find_checksum_url, find_companion, narrow_assets, pick_asset,
+    ambiguous_assets_error, fetch_expected_sha256, find_checksum_url, find_companion,
+    narrow_assets, pick_asset,
 };
 use super::job::{PipelineMode, PipelineRequest, PrepareOutcome, PromptKind, ResolutionData};
 use super::linker::{LinkSummary, link_all_executables};
@@ -999,6 +1000,17 @@ fn finalize_resolution(
                     } else {
                         "Available assets:"
                     };
+                    // Genuine ambiguity (>1 candidate) that we can't prompt for:
+                    // fail loudly rather than letting `prompt_pick_with_skip`
+                    // return Skip below, which would mark this an exit-0
+                    // "skipped" — an explicit `install <repo>` would then look
+                    // like it succeeded while installing nothing. An
+                    // interactive cancel (Esc/q) still maps to a non-fatal skip.
+                    if data.candidates.len() > 1 && !io::stdin().is_terminal() {
+                        let names: Vec<String> =
+                            data.candidates.iter().map(|a| a.name.clone()).collect();
+                        return Err(ambiguous_assets_error(&names));
+                    }
                     let chosen_idx = match prompt_pick_with_skip(multi, header, &items) {
                         PromptResult::Got(i) => i,
                         PromptResult::Skip => {
