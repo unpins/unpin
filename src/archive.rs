@@ -19,7 +19,7 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
     } else if lower.ends_with(".tar") {
         unpack_tar(reader, dest)
     } else if lower.ends_with(".zip") {
-        unpack_zip_stream(reader, dest)
+        unpack_zip(reader, dest)
     } else if lower.ends_with(".zst") {
         // Single-stream zstd (no tar inside). Asset name minus `.zst` is the
         // binary name. Place under `bin/` so siblings extracted from a `.tar.zst`
@@ -314,40 +314,50 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
+fn unpack_zip<R: Read>(mut reader: R, dest: &Path) -> Result<(), String> {
+    // The central directory at the END of a zip is the only place that
+    // reliably carries each entry's size and unix mode. Entries written with
+    // the data-descriptor flag (general-purpose bit 3 — what Go's archive/zip
+    // emits, e.g. fzf's release zips) leave the local-header sizes zeroed,
+    // which a forward-only stream reader can't resolve ("file length is not
+    // available in the local header"). So buffer the archive and hand it to
+    // the seek-based ZipArchive, which reads the central directory up front
+    // and also transparently handles zip64. Release zips are single binaries
+    // (a few MB); only the tar.* paths stay fully streaming.
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read zip: {e}"))?;
+    let mut zip =
+        zip::ZipArchive::new(io::Cursor::new(buf)).map_err(|e| format!("open zip: {e}"))?;
+
     fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
     let dir = cap_std::fs::Dir::open_ambient_dir(dest, cap_std::ambient_authority())
         .map_err(|e| format!("open {}: {e}", dest.display()))?;
 
-    // When read_zipfile_from_stream encounters the central directory it has
-    // already consumed some bytes from the stream — exactly how many is an
-    // internal detail of the zip crate. To recover those bytes we sit a pass-
-    // through reader between the network and the zip parser; it keeps a rolling
-    // tail of the last `TAIL` bytes that flowed. After the loop ends, we
-    // scan the tail (plus whatever's left in the inner stream) for the CD
-    // signature `0x02014b50` and parse from there. TAIL is sized generously
-    // so the consumed prefix always fits, regardless of crate internals.
-    const TAIL: usize = 128;
-    let mut filter = CdFilter::new(reader, TAIL);
-    // raw_name → relative path, kept separately for files vs directories so
-    // we can chmod files inline and defer dir chmods to the end (same
-    // reason as in unpack_tar: locking a parent to 0o555 inline blocks
-    // mkdir of its descendants).
-    let mut file_entries: Vec<(String, PathBuf)> = Vec::new();
-    let mut dir_entries: Vec<(String, PathBuf)> = Vec::new();
+    // Relative path + resolved unix mode, kept separately for files vs
+    // directories so we can chmod files inline and defer dir chmods to the end
+    // (same reason as in unpack_tar: locking a parent to 0o555 inline blocks
+    // mkdir of its descendants). Mode is masked to 0o777 here, dropping the
+    // file-type bits and the special bits (setuid/setgid/sticky) — a downloaded
+    // CLI binary never legitimately needs setuid, and honoring it from an
+    // untrusted archive is needless attack surface.
+    let mut file_entries: Vec<(PathBuf, Option<u32>)> = Vec::new();
+    let mut dir_entries: Vec<(PathBuf, Option<u32>)> = Vec::new();
 
-    while let Some(mut entry) = zip::read::read_zipfile_from_stream(&mut filter)
-        .map_err(|e| format!("read zip entry: {e}"))?
-    {
-        let raw_name = entry.name().to_owned();
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| format!("read zip entry: {e}"))?;
         let rel = match entry.enclosed_name() {
             Some(p) => p,
             None => continue,
         };
+        let mode = entry.unix_mode().map(|m| m & 0o777).filter(|&m| m != 0);
         if entry.is_dir() {
             dir.create_dir_all(&rel)
                 .map_err(|e| format!("mkdir {}: {e}", rel.display()))?;
-            dir_entries.push((raw_name, rel));
+            dir_entries.push((rel, mode));
             continue;
         }
         if let Some(parent) = rel.parent()
@@ -360,38 +370,25 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
         let mut out = dir
             .create(&rel)
             .map_err(|e| format!("create {}: {e}", rel.display()))?;
+        // io::copy drains the entry through the zip crate's Crc32 reader, so a
+        // corrupt entry surfaces as a CRC error here rather than silently
+        // writing garbage.
         io::copy(&mut entry, &mut out).map_err(|e| format!("write {}: {e}", rel.display()))?;
-        file_entries.push((raw_name, rel));
+        file_entries.push((rel, mode));
     }
-
-    // Drain the rest of the stream — this is the remainder of the CD + EOCD.
-    let (mut inner, mut cd_buf) = filter.finish();
-    inner
-        .read_to_end(&mut cd_buf)
-        .map_err(|e| format!("read zip central directory: {e}"))?;
-
-    // Locate the first CD entry magic in the recovered buffer. Anything
-    // before it was either entry data spillover or the bytes the zip parser
-    // already consumed past the signature start.
-    const CD_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
-    let cd_start = cd_buf
-        .windows(4)
-        .position(|w| w == CD_SIG)
-        .unwrap_or(cd_buf.len());
-    let modes = parse_central_directory(&cd_buf[cd_start..]);
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         // Files first — they're leaves, so chmod-ing them can't block
         // anything else. ELF/shebang fallback only applies to files.
-        for (name, rel) in &file_entries {
-            let mode = if let Some(&m) = modes.get(name) {
-                Some(m)
+        for (rel, mode) in &file_entries {
+            let mode = if let Some(m) = mode {
+                Some(*m)
             } else {
-                // Zip made on a non-Unix host doesn't encode permissions. Fall
-                // back to detecting ELF/shebang and promoting to 0o755. Reading
-                // via `dir.open` keeps the capability scope.
+                // Zip made on a host that encoded no usable mode. Fall back to
+                // detecting ELF/shebang and promoting to 0o755. Reading via
+                // `dir.open` keeps the capability scope.
                 match dir.open(rel) {
                     Ok(mut f) => {
                         let mut head = [0u8; 4];
@@ -419,116 +416,22 @@ fn unpack_zip_stream<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
         // Then dirs, deepest-first. Same rationale as in unpack_tar: a zip
         // declaring a 0o555 dir would otherwise lock us out before we
         // chmod-ed its children, if we did this inline during the loop.
-        // We sort after the loop so the order in the CD doesn't matter.
+        // We sort after the loop so the order in the archive doesn't matter.
         dir_entries.sort_by(|a, b| {
-            b.1.as_os_str()
+            b.0.as_os_str()
                 .as_encoded_bytes()
-                .cmp(a.1.as_os_str().as_encoded_bytes())
+                .cmp(a.0.as_os_str().as_encoded_bytes())
         });
-        for (name, rel) in &dir_entries {
-            if let Some(&m) = modes.get(name) {
-                let perms = cap_std::fs::Permissions::from_std(fs::Permissions::from_mode(m));
+        for (rel, mode) in &dir_entries {
+            if let Some(m) = mode {
+                let perms = cap_std::fs::Permissions::from_std(fs::Permissions::from_mode(*m));
                 let _ = dir.set_permissions(rel, perms);
             }
         }
     }
     #[cfg(not(unix))]
-    let _ = (file_entries, dir_entries, modes); // suppress unused warnings on Windows
+    let _ = (file_entries, dir_entries); // suppress unused warnings on Windows
     Ok(())
-}
-
-/// Pass-through Read that records a rolling tail of the last `max` bytes that
-/// flowed through. Used to recover the start of the central directory entry
-/// that the streaming zip parser consumed before returning None.
-struct CdFilter<R> {
-    inner: R,
-    tail: Vec<u8>,
-    max: usize,
-}
-impl<R: Read> CdFilter<R> {
-    fn new(inner: R, max: usize) -> Self {
-        Self {
-            inner,
-            tail: Vec::with_capacity(max),
-            max,
-        }
-    }
-    fn finish(self) -> (R, Vec<u8>) {
-        (self.inner, self.tail)
-    }
-}
-impl<R: Read> Read for CdFilter<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.tail.extend_from_slice(&buf[..n]);
-            let excess = self.tail.len().saturating_sub(self.max);
-            if excess > 0 {
-                self.tail.drain(..excess);
-            }
-        }
-        Ok(n)
-    }
-}
-
-/// Parse the central directory bytes and return a `name → unix_mode` map for
-/// entries written by Unix-mode zip tools. Returns empty on any structural
-/// issue — caller falls back to leaving permissions alone.
-///
-/// Bounds are self-contained against arbitrary/malicious input: the loop guard
-/// `pos + 46 <= buf.len()` covers every fixed-field read (max index `pos+41`),
-/// the `name_end > buf.len()` break covers the name slice, and the next
-/// position is computed with `checked_add` so an overflow stops the scan
-/// instead of wrapping (the `> pos` guard also rejects a non-advancing step).
-/// So a truncated header, an oversized `name_len`, or trailing garbage all
-/// terminate the scan rather than read out of bounds.
-fn parse_central_directory(buf: &[u8]) -> std::collections::HashMap<String, u32> {
-    const CD_SIG: u32 = 0x0201_4b50;
-    let mut out = std::collections::HashMap::new();
-    let mut pos = 0;
-    while pos + 46 <= buf.len() {
-        let sig = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
-        if sig != CD_SIG {
-            break;
-        }
-        let version_made_by = u16::from_le_bytes([buf[pos + 4], buf[pos + 5]]);
-        let host_system = (version_made_by >> 8) as u8; // 3 = Unix
-        let name_len = u16::from_le_bytes([buf[pos + 28], buf[pos + 29]]) as usize;
-        let extra_len = u16::from_le_bytes([buf[pos + 30], buf[pos + 31]]) as usize;
-        let comment_len = u16::from_le_bytes([buf[pos + 32], buf[pos + 33]]) as usize;
-        let external_attrs =
-            u32::from_le_bytes([buf[pos + 38], buf[pos + 39], buf[pos + 40], buf[pos + 41]]);
-
-        let name_start = pos + 46;
-        let name_end = name_start + name_len;
-        if name_end > buf.len() {
-            break;
-        }
-        if host_system == 3 {
-            // Upper 16 bits hold the Unix st_mode. Mask to the rwx permission
-            // bits only: drop the file-type bits (S_IFREG etc.) AND the special
-            // bits (setuid/setgid/sticky, 0o7000) — a downloaded CLI binary
-            // never legitimately needs setuid, and honoring it from an
-            // untrusted archive is needless attack surface.
-            let mode = (external_attrs >> 16) & 0o777;
-            if mode != 0
-                && let Ok(name) = std::str::from_utf8(&buf[name_start..name_end])
-            {
-                out.insert(name.to_owned(), mode);
-            }
-        }
-        let next = match name_end
-            .checked_add(extra_len)
-            .and_then(|n| n.checked_add(comment_len))
-        {
-            Some(n) if n > pos => n,
-            // checked_add overflow, or a non-advancing position — either way
-            // there's no valid next header, so stop rather than wrap/loop.
-            _ => break,
-        };
-        pos = next;
-    }
-    out
 }
 
 // Tests check Unix permission bits, so they only run on Unix targets. (The
@@ -658,7 +561,7 @@ mod tests {
             // Force a non-Unix host so external_attrs has no unix_mode.
             .last_modified_time(zip::DateTime::default());
         // We can't easily set host = DOS via the public API. Use unix_permissions(0)
-        // which makes parse_central_directory skip the entry (mode == 0).
+        // so unix_mode() yields no usable mode and the ELF/shebang fallback runs.
         let opts_zero = opts.unix_permissions(0);
         zw.start_file("native", opts_zero).unwrap();
         zw.write_all(&elf_bytes()).unwrap();
@@ -936,91 +839,84 @@ mod tests {
         fs::set_permissions(tmp.path().join("share"), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    #[test]
-    fn cd_filter_keeps_rolling_tail_and_forwards_all_bytes() {
-        let data: Vec<u8> = (0u8..200).collect();
-        let mut filter = CdFilter::new(&data[..], 64);
-        let mut sink = Vec::new();
-        io::copy(&mut filter, &mut sink).unwrap();
-        assert_eq!(sink, data);
-        let (_, tail) = filter.finish();
-        assert_eq!(tail.len(), 64);
-        assert_eq!(&tail[..], &data[136..]);
+    /// Hand-build a single-entry zip that mimics Go's `archive/zip` output:
+    /// the data-descriptor flag (general-purpose bit 3) is set and the local
+    /// header sizes are zeroed, so the real sizes live only in the trailing
+    /// data descriptor and the central directory. This is the shape that broke
+    /// the old stream reader; the entry is `Stored` (uncompressed) and the CD
+    /// records a Unix host with `mode`.
+    fn streaming_data_descriptor_zip(name: &str, data: &[u8], mode: u32) -> Vec<u8> {
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        let crc = crc.sum();
+        let nb = name.as_bytes();
+        let n = data.len() as u32;
+        let mut z = Vec::new();
+        // Local file header — sizes zeroed, bit 3 (data descriptor) set.
+        z.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
+        z.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        z.extend_from_slice(&0x0008u16.to_le_bytes()); // flags: bit 3
+        z.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        z.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        z.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        z.extend_from_slice(&0u32.to_le_bytes()); // crc-32 (deferred)
+        z.extend_from_slice(&0u32.to_le_bytes()); // comp size (deferred)
+        z.extend_from_slice(&0u32.to_le_bytes()); // uncomp size (deferred)
+        z.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        z.extend_from_slice(nb);
+        z.extend_from_slice(data);
+        // Data descriptor (with optional signature) carrying the real sizes.
+        z.extend_from_slice(&[0x50, 0x4b, 0x07, 0x08]);
+        z.extend_from_slice(&crc.to_le_bytes());
+        z.extend_from_slice(&n.to_le_bytes()); // comp size (stored == uncomp)
+        z.extend_from_slice(&n.to_le_bytes()); // uncomp size
+        // Central directory header — Unix host, real sizes + mode.
+        let cd_offset = z.len() as u32;
+        z.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
+        z.extend_from_slice(&((3u16 << 8) | 20).to_le_bytes()); // made by: Unix
+        z.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        z.extend_from_slice(&0x0008u16.to_le_bytes()); // flags: bit 3
+        z.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        z.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        z.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        z.extend_from_slice(&crc.to_le_bytes());
+        z.extend_from_slice(&n.to_le_bytes()); // comp size
+        z.extend_from_slice(&n.to_le_bytes()); // uncomp size
+        z.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        z.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        z.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        z.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        z.extend_from_slice(&((mode) << 16).to_le_bytes()); // external attrs
+        z.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        z.extend_from_slice(nb);
+        // End of central directory.
+        let cd_size = z.len() as u32 - cd_offset;
+        z.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        z.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        z.extend_from_slice(&0u16.to_le_bytes()); // cd start disk
+        z.extend_from_slice(&1u16.to_le_bytes()); // entries this disk
+        z.extend_from_slice(&1u16.to_le_bytes()); // total entries
+        z.extend_from_slice(&cd_size.to_le_bytes());
+        z.extend_from_slice(&cd_offset.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        z
     }
 
     #[test]
-    fn parse_central_directory_extracts_unix_mode_from_unix_host() {
-        let mut cd = vec![0u8; 46 + 2];
-        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
-        // version_made_by: upper byte 3 = Unix
-        cd[4..6].copy_from_slice(&((3u16 << 8) | 20).to_le_bytes());
-        cd[28..30].copy_from_slice(&2u16.to_le_bytes()); // name_len
-        let mode: u32 = 0o755;
-        cd[38..42].copy_from_slice(&(mode << 16).to_le_bytes());
-        cd[46..48].copy_from_slice(b"rg");
-        let modes = parse_central_directory(&cd);
-        assert_eq!(modes.get("rg").copied(), Some(0o755));
-    }
-
-    #[test]
-    fn parse_central_directory_skips_non_unix_host() {
-        let mut cd = vec![0u8; 46 + 1];
-        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
-        // version_made_by: upper byte 0 = DOS (not Unix)
-        cd[4..6].copy_from_slice(&20u16.to_le_bytes());
-        cd[28..30].copy_from_slice(&1u16.to_le_bytes());
-        cd[38..42].copy_from_slice(&((0o755u32) << 16).to_le_bytes());
-        cd[46] = b'x';
-        let modes = parse_central_directory(&cd);
-        assert!(modes.is_empty());
-    }
-
-    #[test]
-    fn parse_central_directory_survives_malformed_input() {
-        // Every one of these must terminate the scan, not read out of bounds.
-        // Truncated header (fewer than 46 bytes after the signature).
-        let mut cd = vec![0u8; 20];
-        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
-        assert!(parse_central_directory(&cd).is_empty());
-
-        // Oversized name_len: header claims a 60000-byte name the buffer can't
-        // hold. Must hit the `name_end > buf.len()` break, not slice past end.
-        let mut cd = vec![0u8; 46 + 4];
-        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
-        cd[4..6].copy_from_slice(&((3u16 << 8) | 20).to_le_bytes());
-        cd[28..30].copy_from_slice(&60000u16.to_le_bytes());
-        cd[38..42].copy_from_slice(&((0o755u32) << 16).to_le_bytes());
-        assert!(parse_central_directory(&cd).is_empty());
-
-        // Pure garbage with no signature, and an empty buffer.
-        assert!(parse_central_directory(&[0xab; 200]).is_empty());
-        assert!(parse_central_directory(&[]).is_empty());
-
-        // A valid Unix entry immediately followed by trailing garbage: the good
-        // entry parses, the garbage (wrong signature) stops the loop cleanly.
-        let mut cd = vec![0u8; 46 + 2];
-        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
-        cd[4..6].copy_from_slice(&((3u16 << 8) | 20).to_le_bytes());
-        cd[28..30].copy_from_slice(&2u16.to_le_bytes());
-        cd[38..42].copy_from_slice(&((0o755u32) << 16).to_le_bytes());
-        cd[46..48].copy_from_slice(b"ok");
-        cd.extend_from_slice(&[0xff; 50]);
-        let modes = parse_central_directory(&cd);
-        assert_eq!(modes.get("ok").copied(), Some(0o755));
-    }
-
-    #[test]
-    fn parse_central_directory_strips_special_bits() {
-        // A malicious zip declaring setuid root (0o4755) must come back as the
-        // plain rwx bits only — the 0o7000 special bits are dropped.
-        let mut cd = vec![0u8; 46 + 3];
-        cd[0..4].copy_from_slice(&0x0201_4b50u32.to_le_bytes());
-        cd[4..6].copy_from_slice(&((3u16 << 8) | 20).to_le_bytes());
-        cd[28..30].copy_from_slice(&3u16.to_le_bytes()); // name_len = 3
-        cd[38..42].copy_from_slice(&((0o4755u32) << 16).to_le_bytes());
-        cd[46..49].copy_from_slice(b"sup");
-        let modes = parse_central_directory(&cd);
-        assert_eq!(modes.get("sup").copied(), Some(0o755));
+    fn extract_zip_handles_streaming_data_descriptor_entries() {
+        // Go's archive/zip (fzf and friends) sets the data-descriptor flag and
+        // zeroes the local-header sizes. The seek-based reader recovers the
+        // sizes and mode from the central directory; the old stream reader
+        // errored with "file length is not available in the local header".
+        let data = elf_bytes();
+        let zip = streaming_data_descriptor_zip("fzf", &data, 0o755);
+        let tmp = tempfile::tempdir().unwrap();
+        extract("fzf.zip", &zip[..], tmp.path()).unwrap();
+        let p = tmp.path().join("fzf");
+        assert_eq!(read_file(&p), data);
+        assert_eq!(mode_of(&p), 0o755);
     }
 
     fn full_mode_of(path: &Path) -> u32 {
