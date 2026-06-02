@@ -43,6 +43,10 @@ enum Cmd {
     Completion(CompletionCmd),
     /// Inspect a package's embedded metadata bundle — its `unpin/*` entries (stable interface used by helper packages such as `man`).
     Bundle(BundleCmd),
+    /// (internal) Detached cleanup helper for Windows self-(un)install: delete a
+    /// stray file and/or unpin's own repo dir once the spawning process exits.
+    #[command(hide = true)]
+    Reap(ReapCmd),
 }
 
 impl Cmd {
@@ -60,6 +64,10 @@ impl Cmd {
             Cmd::Run(c) => c.run(paths),
             Cmd::Completion(c) => c.run().map(|()| 0),
             Cmd::Bundle(c) => c.run(paths).map(|()| 0),
+            Cmd::Reap(c) => {
+                c.run();
+                Ok(0)
+            }
         }
     }
 }
@@ -113,14 +121,27 @@ struct UninstallCmd {
 
 impl UninstallCmd {
     fn run(self, paths: &platform::Paths) -> Result<(), String> {
-        // Windows self-uninstall janitor handoff: a detached copy spawned with
-        // UNPIN_UNINSTALL_DIR set finishes the removal of unpin's own repo dir
-        // (the running `.exe` couldn't delete itself) and exits, never touching
-        // the real uninstall below.
-        if setup::run_dir_janitor_if_handed_off() {
-            return Ok(());
-        }
         install::uninstall_many(paths, &self.names, self.assume_yes)
+    }
+}
+
+/// Hidden cleanup helper spawned by the Windows self-(un)install janitors. The
+/// spawning parent — which still holds the exact paths in memory — passes them
+/// here as arguments; this process does nothing but the deletes and exits, so
+/// the parent can finish removing files/dirs it couldn't unlink while running.
+#[derive(Args, Debug)]
+struct ReapCmd {
+    /// A stray file to delete (the copied-from download, after a self-install).
+    #[arg(long)]
+    file: Option<std::path::PathBuf>,
+    /// unpin's own repo dir to remove, owner dir pruned (after a self-uninstall).
+    #[arg(long)]
+    dir: Option<std::path::PathBuf>,
+}
+
+impl ReapCmd {
+    fn run(self) {
+        setup::reap(self.file, self.dir);
     }
 }
 
@@ -346,6 +367,7 @@ const SUBCOMMANDS: &[&str] = &[
     "run",
     "completion",
     "bundle",
+    "reap",
     "help",
 ];
 

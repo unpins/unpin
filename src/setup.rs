@@ -11,8 +11,11 @@
 //!
 //! Windows can't delete the running `.exe`, so when we have to *copy* (the
 //! download lives on another volume) rather than rename, the freshly placed
-//! copy is re-spawned as a silent janitor — keyed by [`INSTALL_FILE_ENV`] —
-//! to remove the original once this process exits and unlocks it.
+//! copy is re-spawned as a detached `unpin reap --file <origin>` (a hidden
+//! janitor subcommand) to remove the original once this process exits and
+//! unlocks it. The self-uninstall sibling spawns `unpin reap --dir <repo>` the
+//! same way. The exact path is passed as an argument — carried from the
+//! parent's memory, never re-derived or read from the ambient environment.
 
 use std::env;
 use std::fs;
@@ -22,28 +25,6 @@ use std::path::{Path, PathBuf};
 use crate::install;
 use crate::platform::{self, Paths};
 
-/// Internal handoff env var. When set, names the original download path that a
-/// freshly relocated Windows copy should delete. A process that sees it acts
-/// purely as a janitor (delete the file, exit) and does nothing else.
-///
-/// Windows-only by construction: it's only ever *set* by [`spawn_janitor`]
-/// (itself `cfg(windows)`), and only ever *honored* on Windows. Gating both
-/// ends keeps `unpin install` from turning an ambient `UNPIN_INSTALL_FILE`
-/// in some other platform's environment into an unprompted file delete — the
-/// whole mechanism exists for Windows' can't-unlink-a-running-`.exe` problem,
-/// which Unix doesn't have. The verb in the name marks which operation spawns
-/// it (install), distinct from the self-uninstall [`UNINSTALL_DIR_ENV`].
-#[cfg(windows)]
-const INSTALL_FILE_ENV: &str = "UNPIN_INSTALL_FILE";
-
-/// Sibling handoff for self-uninstall on Windows: names a directory (unpin's
-/// own repo dir) a detached janitor copy should `remove_dir_all` once the
-/// running unpin — whose `.exe` lives inside it — has exited. Windows-only for
-/// the same reason as [`INSTALL_FILE_ENV`] — and the stakes are higher here
-/// (recursive delete), so it must never be honored where it's never set.
-#[cfg(windows)]
-const UNINSTALL_DIR_ENV: &str = "UNPIN_UNINSTALL_DIR";
-
 /// On-disk file name for unpin's own binary inside its version dir — the real
 /// executable. The `bin` entry that points at it is a symlink (Unix) or a
 /// `.cmd` wrapper (Windows), created by the linker like any package's.
@@ -51,20 +32,6 @@ const SELF_NAME: &str = if cfg!(windows) { "unpin.exe" } else { "unpin" };
 
 /// Entry point for `unpin install` with no package argument.
 pub fn run(paths: &Paths, assume_yes: bool) -> Result<(), String> {
-    // Janitor handoff (Windows copy path): delete the named origin and exit
-    // silently. Must be the very first thing — this process exists only to
-    // reap the file the parent couldn't delete while it was still running.
-    // Windows-only: this var is only ever set by the `cfg(windows)` spawner
-    // below, so honoring it anywhere else would just be a footgun (an ambient
-    // env var turning `unpin install` into an unprompted delete). The sibling
-    // self-uninstall janitor rides on `unpin uninstall` instead — see
-    // [`run_dir_janitor_if_handed_off`].
-    #[cfg(windows)]
-    if let Some(origin) = env::var_os(INSTALL_FILE_ENV) {
-        janitor_delete(Path::new(&origin));
-        return Ok(());
-    }
-
     let current =
         env::current_exe().map_err(|e| format!("cannot locate the running unpin binary: {e}"))?;
     let spec = install::self_spec();
@@ -156,15 +123,18 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Re-spawn the just-placed `unpin.exe` as a detached janitor that deletes
-/// `origin` once we exit and release the file lock. Best-effort: if the spawn
-/// itself fails the stray download just lingers, which is harmless.
+/// Re-spawn the just-placed `unpin.exe` as a detached `unpin reap --file
+/// <origin>` that deletes `origin` once we exit and release the file lock.
+/// Best-effort: if the spawn itself fails the stray download just lingers,
+/// which is harmless. The exact origin path is passed as an argument, so the
+/// reaper never has to re-derive or guess it.
 #[cfg(windows)]
 fn spawn_janitor(dest: &Path, origin: &Path) {
     use std::process::Command;
     let _ = Command::new(dest)
-        .arg("install")
-        .env(INSTALL_FILE_ENV, origin)
+        .arg("reap")
+        .arg("--file")
+        .arg(origin)
         .spawn();
 }
 
@@ -201,20 +171,24 @@ fn janitor_delete_dir(dir: &Path) {
     }
 }
 
-/// If this process was spawned as the self-uninstall dir-janitor — its
-/// environment carries [`UNINSTALL_DIR_ENV`], set only by [`spawn_dir_janitor`] —
-/// delete the handed-off repo dir (and prune the now-empty owner dir) and
-/// return `true` so the caller short-circuits before doing a real uninstall.
-/// The janitor rides on `unpin uninstall` (not `install`) because that's the
-/// operation it completes. Windows-only; always `false` elsewhere, where the
-/// var is never set.
-pub fn run_dir_janitor_if_handed_off() -> bool {
+/// Entry point for the hidden `unpin reap` subcommand: the janitor body that a
+/// detached copy runs to finish a Windows self-(un)install. `file` (if given)
+/// is a stray download to unlink; `dir` is unpin's own repo dir to remove (and
+/// its now-empty owner pruned). Both paths come straight from the spawning
+/// parent's memory as CLI arguments — never re-derived. A no-op off Windows,
+/// where the reaper is never spawned.
+pub fn reap(file: Option<PathBuf>, dir: Option<PathBuf>) {
     #[cfg(windows)]
-    if let Some(dir) = env::var_os(UNINSTALL_DIR_ENV) {
-        janitor_delete_dir(Path::new(&dir));
-        return true;
+    {
+        if let Some(f) = file {
+            janitor_delete(&f);
+        }
+        if let Some(d) = dir {
+            janitor_delete_dir(&d);
+        }
     }
-    false
+    #[cfg(not(windows))]
+    let _ = (file, dir);
 }
 
 /// True if the running binary lives inside `dir` — i.e. uninstalling `dir`
@@ -230,27 +204,26 @@ pub fn running_from(dir: &Path) -> bool {
 }
 
 /// Hand unpin's own repo dir to a detached janitor for self-uninstall on
-/// Windows: copy the running exe to `%TEMP%` and spawn it with
-/// [`UNINSTALL_DIR_ENV`] set, so it can `remove_dir_all` the dir — including the
-/// no-longer-running exe — once this process exits. The staged copy is left in
-/// `%TEMP%` (it can't delete itself); the OS reclaims it.
+/// Windows: copy the running exe to `%TEMP%` and spawn it as `unpin reap --dir
+/// <dir>`, so it can `remove_dir_all` the dir — including the no-longer-running
+/// exe — once this process exits. The staged copy is left in `%TEMP%` (it can't
+/// delete itself); the OS reclaims it.
 ///
 /// The staged copy's name carries our PID so concurrent or back-to-back
 /// self-uninstalls don't collide on a single fixed path — a still-running or
 /// still-locked earlier copy would make `fs::copy` to a shared name fail and
-/// abort the cleanup.
+/// abort the cleanup. The repo dir is passed verbatim as an argument — exactly
+/// what the parent resolved, not re-derived by the reaper.
 #[cfg(windows)]
 pub fn spawn_dir_janitor(dir: &Path) -> Result<(), String> {
     use std::process::Command;
     let current = env::current_exe().map_err(|e| format!("locate self: {e}"))?;
-    let tmp = env::temp_dir().join(format!("unpin-cleanup-{}.exe", std::process::id()));
+    let tmp = env::temp_dir().join(format!("unpin-reap-{}.exe", std::process::id()));
     fs::copy(&current, &tmp).map_err(|e| format!("stage janitor: {e}"))?;
-    // Spawn as `unpin uninstall`: the env var makes the copy short-circuit into
-    // janitor mode (see `run_dir_janitor_if_handed_off`) before any real
-    // uninstall, so the no-arg "uninstall all" path is never reached.
     Command::new(&tmp)
-        .arg("uninstall")
-        .env(UNINSTALL_DIR_ENV, dir)
+        .arg("reap")
+        .arg("--dir")
+        .arg(dir)
         .spawn()
         .map_err(|e| format!("spawn janitor: {e}"))?;
     Ok(())
