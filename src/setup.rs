@@ -222,11 +222,16 @@ pub fn running_from(dir: &Path) -> bool {
 /// [`CLEANUP_DIR_ENV`] set, so it can `remove_dir_all` the dir — including the
 /// no-longer-running exe — once this process exits. The staged copy is left in
 /// `%TEMP%` (it can't delete itself); the OS reclaims it.
+///
+/// The staged copy's name carries our PID so concurrent or back-to-back
+/// self-uninstalls don't collide on a single fixed path — a still-running or
+/// still-locked earlier copy would make `fs::copy` to a shared name fail and
+/// abort the cleanup.
 #[cfg(windows)]
 pub fn spawn_dir_janitor(dir: &Path) -> Result<(), String> {
     use std::process::Command;
     let current = env::current_exe().map_err(|e| format!("locate self: {e}"))?;
-    let tmp = env::temp_dir().join("unpin-cleanup.exe");
+    let tmp = env::temp_dir().join(format!("unpin-cleanup-{}.exe", std::process::id()));
     fs::copy(&current, &tmp).map_err(|e| format!("stage janitor: {e}"))?;
     Command::new(&tmp)
         .arg("install")
