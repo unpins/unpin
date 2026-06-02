@@ -30,8 +30,10 @@ use crate::platform::{self, Paths};
 /// `.cmd` wrapper (Windows), created by the linker like any package's.
 const SELF_NAME: &str = if cfg!(windows) { "unpin.exe" } else { "unpin" };
 
-/// Entry point for `unpin install` with no package argument.
-pub fn run(paths: &Paths, assume_yes: bool) -> Result<(), String> {
+/// Entry point for `unpin install` with no package argument. `force` reinstalls
+/// even when this binary is already the installed one — though there's nothing
+/// to relocate then (it's in place), so force only refreshes the link + PATH.
+pub fn run(paths: &Paths, assume_yes: bool, force: bool) -> Result<(), String> {
     let current =
         env::current_exe().map_err(|e| format!("cannot locate the running unpin binary: {e}"))?;
     let spec = install::self_spec();
@@ -43,10 +45,19 @@ pub fn run(paths: &Paths, assume_yes: bool) -> Result<(), String> {
     let link = paths.bin.join(platform::link_filename(&spec.name));
 
     if dest.exists() && same_file(&current, &dest) {
-        // Already the installed binary of this version — just make sure the
-        // link exists (cheap, idempotent) and re-check PATH.
+        // We ARE the installed binary — there's nothing to relocate (a copy
+        // onto itself would just delete the file). Re-link (idempotent) and
+        // re-check PATH. `--force` can't redo a no-op relocation, so it only
+        // changes the message.
         install::link_installed(paths, &spec, &vdir, assume_yes)?;
-        println!("unpin {tag} is already installed ({}).", link.display());
+        if force {
+            println!(
+                "Reinstalled unpin {tag} ({}) — already in place, links refreshed.",
+                link.display()
+            );
+        } else {
+            println!("unpin {tag} is already installed ({}).", link.display());
+        }
     } else {
         let reloc = relocate(&current, &dest)?;
         install::link_installed(paths, &spec, &vdir, assume_yes)?;

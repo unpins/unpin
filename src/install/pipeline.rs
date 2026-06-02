@@ -44,6 +44,9 @@ pub struct InstallOptions {
     pub pick: bool,
     pub include_data: bool,
     pub alias_mode: AliasMode,
+    /// Reinstall over a complete cache: bypass the `UpToDate`/`Cached`
+    /// short-circuits so the package is re-downloaded and re-extracted.
+    pub force: bool,
 }
 
 impl InstallOptions {
@@ -57,6 +60,7 @@ impl InstallOptions {
         jobs: u8,
         pick: bool,
         no_data: bool,
+        force: bool,
         alias_override: Option<AliasMode>,
     ) -> Self {
         Self {
@@ -65,6 +69,7 @@ impl InstallOptions {
             pick,
             include_data: !no_data && ctx.cfg.data(),
             alias_mode: alias_override.unwrap_or_else(|| ctx.cfg.aliases()),
+            force,
         }
     }
 }
@@ -845,7 +850,8 @@ fn preflight_resolve(
 
     // Update-mode short-circuit: nothing changed → skip the whole pipeline
     // for this request. Read of bin_dir is pure; safe to call concurrently.
-    if matches!(mode, PipelineMode::Update) {
+    // `--force` bypasses it so the package is re-extracted even when current.
+    if matches!(mode, PipelineMode::Update) && !opts.force {
         let current = active_version(&ctx.paths, &spec.owner, &spec.name);
         if current.as_deref() == Some(release.tag_name.as_str()) {
             return Ok(PrepareOutcome::UpToDate(Box::new(release)));
@@ -861,7 +867,7 @@ fn preflight_resolve(
         None
     };
     let cache_complete = vdir.is_dir() && (companion_peek.is_none() || vdir.join("share").is_dir());
-    if cache_complete && !opts.pick {
+    if cache_complete && !opts.pick && !opts.force {
         return Ok(PrepareOutcome::Cached(Box::new(release)));
     }
 

@@ -86,7 +86,7 @@ impl InstallCmd {
         // No package = self-install: relocate this binary into `bin` and put
         // that dir on PATH. Only `-y` matters here (skip the PATH prompt).
         if self.pkgs.is_empty() {
-            return setup::run(paths, self.flags.assume_yes);
+            return setup::run(paths, self.flags.assume_yes, self.flags.force);
         }
         let (ctx, opts) = self.flags.resolve(paths);
         install::install_many(&ctx, &opts, &self.pkgs)
@@ -261,6 +261,10 @@ struct InstallUpdateFlags {
     /// Skip prompts
     #[arg(short = 'y', long = "yes")]
     assume_yes: bool,
+    /// Reinstall even if already present: re-download and re-extract over the
+    /// cached version (self-install just refreshes the placed binary and links)
+    #[arg(short = 'f', long = "force")]
+    force: bool,
     /// Parallel downloads (default: min(N, 4))
     #[arg(
         short = 'j',
@@ -301,6 +305,7 @@ impl InstallUpdateFlags {
             self.jobs,
             self.pick,
             self.no_data,
+            self.force,
             alias_override,
         );
         (ctx, opts)
@@ -627,5 +632,52 @@ mod tests {
             HelpKind::Subcommand
         ));
         assert!(matches!(classify_help(&["list"]), HelpKind::None));
+    }
+
+    /// `force` on the `Install` flags for an invocation, or `None` if it didn't
+    /// parse as `install`.
+    fn install_force(parts: &[&str]) -> Option<bool> {
+        match parse_args(&argv(parts)).ok()?.command {
+            Cmd::Install(c) => Some(c.flags.force),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn force_flag_parses_on_install() {
+        // The bug this guards: `--force`/`-f` used to be an unknown argument,
+        // so the whole command was rejected.
+        assert_eq!(
+            install_force(&["install", "--force", "owner/repo"]),
+            Some(true)
+        );
+        assert_eq!(install_force(&["install", "-f", "owner/repo"]), Some(true));
+        assert_eq!(install_force(&["install", "owner/repo"]), Some(false));
+    }
+
+    #[test]
+    fn force_flag_parses_on_self_install() {
+        // `unpin install --force` with no package — the self-install path.
+        match parse_args(&argv(&["install", "--force"]))
+            .expect("self-install --force should parse")
+            .command
+        {
+            Cmd::Install(c) => {
+                assert!(c.flags.force);
+                assert!(c.pkgs.is_empty(), "no package = self-install");
+            }
+            other => panic!("expected install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn force_flag_parses_on_update_too() {
+        // `force` rides the shared install/update flags, so update gets it free.
+        let force = |parts: &[&str]| match parse_args(&argv(parts)).ok()?.command {
+            Cmd::Update(c) => Some(c.flags.force),
+            _ => None,
+        };
+        assert_eq!(force(&["update", "--force"]), Some(true));
+        assert_eq!(force(&["update"]), Some(false));
     }
 }
