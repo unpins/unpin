@@ -53,19 +53,14 @@ pub fn run(paths: &Paths, assume_yes: bool) -> Result<(), String> {
     // Janitor handoff (Windows copy path): delete the named origin and exit
     // silently. Must be the very first thing — this process exists only to
     // reap the file the parent couldn't delete while it was still running.
-    // Windows-only: these vars are only ever set by the `cfg(windows)` spawners
-    // below, so honoring them anywhere else would just be a footgun (an ambient
-    // env var turning `unpin install` into an unprompted delete).
+    // Windows-only: this var is only ever set by the `cfg(windows)` spawner
+    // below, so honoring it anywhere else would just be a footgun (an ambient
+    // env var turning `unpin install` into an unprompted delete). The sibling
+    // self-uninstall janitor rides on `unpin uninstall` instead — see
+    // [`run_dir_janitor_if_handed_off`].
     #[cfg(windows)]
     if let Some(origin) = env::var_os(CLEANUP_ENV) {
         janitor_delete(Path::new(&origin));
-        return Ok(());
-    }
-    // Sibling janitor: remove unpin's own repo dir after a self-uninstall (the
-    // exe inside it has now exited, so it's finally deletable).
-    #[cfg(windows)]
-    if let Some(dir) = env::var_os(CLEANUP_DIR_ENV) {
-        janitor_delete_dir(Path::new(&dir));
         return Ok(());
     }
 
@@ -205,6 +200,22 @@ fn janitor_delete_dir(dir: &Path) {
     }
 }
 
+/// If this process was spawned as the self-uninstall dir-janitor — its
+/// environment carries [`CLEANUP_DIR_ENV`], set only by [`spawn_dir_janitor`] —
+/// delete the handed-off repo dir (and prune the now-empty owner dir) and
+/// return `true` so the caller short-circuits before doing a real uninstall.
+/// The janitor rides on `unpin uninstall` (not `install`) because that's the
+/// operation it completes. Windows-only; always `false` elsewhere, where the
+/// var is never set.
+pub fn run_dir_janitor_if_handed_off() -> bool {
+    #[cfg(windows)]
+    if let Some(dir) = env::var_os(CLEANUP_DIR_ENV) {
+        janitor_delete_dir(Path::new(&dir));
+        return true;
+    }
+    false
+}
+
 /// True if the running binary lives inside `dir` — i.e. uninstalling `dir`
 /// would have to delete the very `.exe` we're executing, which Windows forbids.
 #[cfg(windows)]
@@ -233,8 +244,11 @@ pub fn spawn_dir_janitor(dir: &Path) -> Result<(), String> {
     let current = env::current_exe().map_err(|e| format!("locate self: {e}"))?;
     let tmp = env::temp_dir().join(format!("unpin-cleanup-{}.exe", std::process::id()));
     fs::copy(&current, &tmp).map_err(|e| format!("stage janitor: {e}"))?;
+    // Spawn as `unpin uninstall`: the env var makes the copy short-circuit into
+    // janitor mode (see `run_dir_janitor_if_handed_off`) before any real
+    // uninstall, so the no-arg "uninstall all" path is never reached.
     Command::new(&tmp)
-        .arg("install")
+        .arg("uninstall")
         .env(CLEANUP_DIR_ENV, dir)
         .spawn()
         .map_err(|e| format!("spawn janitor: {e}"))?;
