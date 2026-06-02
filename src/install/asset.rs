@@ -159,6 +159,14 @@ pub fn narrow_assets<'a>(
         }
     }
 
+    // Toolchain tiebreak: a repo shipping >1 build for this exact OS+arch
+    // (e.g. windows `-gnu` *and* `-msvc`, or linux `-gnu` *and* `-musl`) is
+    // otherwise an ambiguous pick. Prefer the portable variant so the common
+    // case resolves without a prompt; `--pick` keeps the full list to choose.
+    if !force_pick {
+        candidates = apply_toolchain_preference(candidates, platform::preferred_toolchain_keys());
+    }
+
     if verbose && !ignored.is_empty() {
         let w = ignored.iter().map(|(a, _)| a.name.len()).max().unwrap_or(0);
         eprintln!("Ignored {} assets:", ignored.len());
@@ -180,6 +188,32 @@ pub fn narrow_assets<'a>(
         ));
     }
     Ok(candidates)
+}
+
+/// Tiebreak among same-OS/arch candidates by toolchain/libc preference
+/// (`prefer`, e.g. `["musl"]` on Linux, `["msvc"]` on Windows). Narrows to the
+/// subset whose name contains a preferred token — but **only** when that's a
+/// strict, non-empty subset, so it disambiguates without ever excluding the
+/// sole build a repo ships. A list that can't be narrowed this way is returned
+/// untouched and falls through to the picker / ambiguity error. Pure; the
+/// preference table lives in `platform::preferred_toolchain_keys`.
+fn apply_toolchain_preference<'a>(candidates: Vec<&'a Asset>, prefer: &[&str]) -> Vec<&'a Asset> {
+    if prefer.is_empty() || candidates.len() < 2 {
+        return candidates;
+    }
+    let preferred: Vec<&Asset> = candidates
+        .iter()
+        .copied()
+        .filter(|a| {
+            let l = a.name.to_ascii_lowercase();
+            prefer.iter().any(|k| l.contains(k))
+        })
+        .collect();
+    if !preferred.is_empty() && preferred.len() < candidates.len() {
+        preferred
+    } else {
+        candidates
+    }
 }
 
 pub fn pick_asset<'a>(
@@ -531,6 +565,46 @@ mod tests {
         assert_eq!(got[0].name, "htop-3.4.1-1-x86_64-linux.zst");
     }
 
+    // A repo that ships both glibc and musl x86_64-linux builds (sharkdp/fd,
+    // eza, …) used to be an ambiguous pick; the musl preference now auto-picks
+    // the static build, while `--pick` still surfaces both.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn narrow_prefers_musl_for_multivariant_linux_repo() {
+        let mk = |names: &[&str]| -> Vec<Asset> {
+            names
+                .iter()
+                .map(|n| Asset {
+                    name: (*n).into(),
+                    browser_download_url: "u".into(),
+                    size: 0,
+                })
+                .collect()
+        };
+        let fd = mk(&[
+            "fd-v10.4.2-aarch64-unknown-linux-musl.tar.gz",
+            "fd-v10.4.2-x86_64-pc-windows-gnu.zip",
+            "fd-v10.4.2-x86_64-unknown-linux-gnu.tar.gz",
+            "fd-v10.4.2-x86_64-unknown-linux-musl.tar.gz",
+        ]);
+        let got = narrow_assets(&fd, "fd", false, false).unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "candidates: {:?}",
+            got.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+        assert_eq!(got[0].name, "fd-v10.4.2-x86_64-unknown-linux-musl.tar.gz");
+
+        // `--pick` keeps both x86_64-linux variants so the user can choose.
+        let picked = narrow_assets(&fd, "fd", true, false).unwrap();
+        assert!(
+            picked.len() >= 2 && picked.iter().any(|a| a.name.contains("gnu")),
+            "picked: {:?}",
+            picked.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn find_companion_matches_tagged_data_asset() {
         let assets = vec![
@@ -574,6 +648,47 @@ mod tests {
         let candidates = vec![&a, &b];
         let err = prompt_pick(&candidates).unwrap_err();
         assert!(err.contains("not a terminal"), "got: {err}");
+    }
+
+    #[test]
+    fn toolchain_preference_narrows_to_preferred_subset() {
+        let mk = |n: &str| Asset {
+            name: n.into(),
+            browser_download_url: "u".into(),
+            size: 0,
+        };
+        // Windows split — preference passed explicitly, so this is
+        // host-independent (the cfg table is exercised via narrow_assets below).
+        let gnu = mk("ripgrep-15.1.0-x86_64-pc-windows-gnu.zip");
+        let msvc = mk("ripgrep-15.1.0-x86_64-pc-windows-msvc.zip");
+        let got = apply_toolchain_preference(vec![&gnu, &msvc], &["msvc"]);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].name.contains("msvc"), "got: {}", got[0].name);
+
+        // Linux split.
+        let lg = mk("fd-x86_64-unknown-linux-gnu.tar.gz");
+        let lm = mk("fd-x86_64-unknown-linux-musl.tar.gz");
+        let got = apply_toolchain_preference(vec![&lg, &lm], &["musl"]);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].name.contains("musl"), "got: {}", got[0].name);
+    }
+
+    #[test]
+    fn toolchain_preference_is_a_noop_when_it_cannot_disambiguate() {
+        let mk = |n: &str| Asset {
+            name: n.into(),
+            browser_download_url: "u".into(),
+            size: 0,
+        };
+        let a = mk("tool-x86_64-linux-gnu.tar.gz");
+        let b = mk("tool-x86_64-linux-uclibc.tar.gz");
+        // No candidate carries the preferred token → unchanged, so a repo that
+        // ships only non-preferred builds still installs (just stays ambiguous).
+        assert_eq!(apply_toolchain_preference(vec![&a, &b], &["musl"]).len(), 2);
+        // A single candidate is never touched, even if it lacks the token.
+        assert_eq!(apply_toolchain_preference(vec![&a], &["musl"]).len(), 1);
+        // Empty preference table (macOS) → unchanged.
+        assert_eq!(apply_toolchain_preference(vec![&a, &b], &[]).len(), 2);
     }
 
     #[test]

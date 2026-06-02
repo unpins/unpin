@@ -374,6 +374,33 @@ pub fn auxiliary_keys() -> &'static [&'static str] {
     }
 }
 
+/// Toolchain/libc variants to prefer when a release ships more than one build
+/// for this exact OS **and** arch. unpin favors the most portable option: on
+/// Linux that's `musl` (statically linked, no glibc-version coupling) over a
+/// `gnu`/glibc build; on Windows it's `msvc` (the native toolchain, no mingw
+/// runtime) over a `gnu`/mingw build. Empty on macOS and elsewhere — there's
+/// no comparable split. Applied only as a tiebreak (see
+/// `asset::apply_toolchain_preference`): it never excludes a sole candidate,
+/// so a repo shipping only the non-preferred variant still installs.
+pub fn preferred_toolchain_keys() -> &'static [&'static str] {
+    #[cfg(target_os = "linux")]
+    {
+        &["musl"]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &[]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        &["msvc"]
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        &[]
+    }
+}
+
 /// Whether `p` is invocable as a native executable on this OS.
 /// Unix: any `+x` permission bit. Windows: `.exe` extension (unpin only ships
 /// native binaries, so the rest of PATHEXT doesn't apply).
