@@ -134,7 +134,12 @@ impl InfoCmd {
     }
 }
 
+// `disable_help_flag`: everything after the package belongs to the package, so
+// `-h`/`--help` must reach the tool (e.g. `unpin owner/repo --help` shows the
+// tool's help, not run's). `run`'s own help stays reachable via `unpin help run`
+// and the top-level `unpin --help`.
 #[derive(Args, Debug)]
+#[command(disable_help_flag = true)]
 struct RunCmd {
     /// Always prompt to choose the asset (instead of auto-picking)
     #[arg(short = 'p', long = "pick")]
@@ -348,6 +353,19 @@ enum HelpKind {
 /// (top-level help only). Mirrors clap's own routing for `--help`/`-h`
 /// and the auto `help` subcommand.
 fn classify_help(pre_ddash: &[&str]) -> HelpKind {
+    // An invocation that resolves to `run` — explicit `run …`, or the default-
+    // run injection (a leading token that is neither a subcommand nor a
+    // top-level help/version flag) — forwards *all* of its args to the package,
+    // `--help`/`-h` included. So it never triggers unpin's own help banner. This
+    // mirrors `parse_args`' retry condition.
+    let first = pre_ddash.first().copied().unwrap_or("");
+    let resolves_to_run = first == "run"
+        || (!first.is_empty()
+            && !SUBCOMMANDS.contains(&first)
+            && !matches!(first, "--help" | "-h" | "--version" | "-V"));
+    if resolves_to_run {
+        return HelpKind::None;
+    }
     if pre_ddash.first() == Some(&"help") {
         return match pre_ddash.get(1) {
             Some(a) if SUBCOMMANDS.contains(a) && *a != "help" => HelpKind::Subcommand,
@@ -416,9 +434,12 @@ fn main() -> ExitCode {
     panic::install();
     panic::restore_sigpipe_default();
     sigint::install();
-    // Look for --version / --help only in args BEFORE `--` so that
-    // `unpin run pkg -- --version` forwards the flag to the child instead of
-    // being intercepted here.
+    // Build the pre-`--` view used to classify unpin's own help banner. After a
+    // package spec (`unpin owner/repo …` or `unpin run owner/repo …`) every arg
+    // — `--help`/`--version` included — is forwarded to the tool, so the banner
+    // is gated on the invocation NOT resolving to `run` (see classify_help) and
+    // clap's top-level `version`/`help` flags (not propagated to subcommands)
+    // handle the bare `unpin --version` / `unpin --help` cases.
     let raw: Vec<String> = std::env::args().collect();
     let pre_ddash: Vec<&str> = raw
         .iter()
@@ -426,10 +447,6 @@ fn main() -> ExitCode {
         .map(String::as_str)
         .take_while(|a| *a != "--")
         .collect();
-    if pre_ddash.iter().any(|a| *a == "--version" || *a == "-V") {
-        println!("unpin {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
-    }
     let help_kind = classify_help(&pre_ddash);
     if !matches!(help_kind, HelpKind::None) {
         print_banner();
@@ -471,5 +488,115 @@ fn main() -> ExitCode {
             eprintln!("unpin: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        std::iter::once("unpin")
+            .chain(parts.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    /// The `run` args actually parsed for an invocation, or `None` if it didn't
+    /// resolve to `run` (e.g. it was a different verb or a clap short-circuit).
+    fn run_args(parts: &[&str]) -> Option<Vec<String>> {
+        match parse_args(&argv(parts)).ok()?.command {
+            Cmd::Run(c) => Some(c.args),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn version_flag_forwards_to_the_package_in_the_default_run_path() {
+        // `unpin owner/repo --version` must reach the tool, not print unpin's.
+        assert_eq!(
+            run_args(&["BurntSushi/ripgrep", "--version"]).as_deref(),
+            Some(&["--version".to_string()][..])
+        );
+        assert_eq!(
+            run_args(&["BurntSushi/ripgrep", "-V"]).as_deref(),
+            Some(&["-V".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn version_flag_forwards_with_an_explicit_run_verb() {
+        assert_eq!(
+            run_args(&["run", "owner/repo", "--version"]).as_deref(),
+            Some(&["--version".to_string()][..])
+        );
+        assert_eq!(
+            run_args(&["run", "owner/repo", "--", "--version"]).as_deref(),
+            Some(&["--version".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn top_level_version_flag_is_clap_native_not_a_run() {
+        // `unpin --version` / `-V` short-circuit in clap (DisplayVersion), so
+        // they neither parse as `run` nor reach the package.
+        for flag in ["--version", "-V"] {
+            let err =
+                parse_args(&argv(&[flag])).expect_err("top-level version should short-circuit");
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        }
+    }
+
+    #[test]
+    fn help_flag_forwards_to_the_package_after_a_pkg_spec() {
+        // Everything after the package is the tool's, including --help/-h —
+        // both in the default-run path and after an explicit `run`.
+        for flag in ["--help", "-h"] {
+            assert_eq!(
+                run_args(&["BurntSushi/ripgrep", flag]).as_deref(),
+                Some(&[flag.to_string()][..]),
+                "default-run should forward {flag}"
+            );
+            assert_eq!(
+                run_args(&["run", "owner/repo", flag]).as_deref(),
+                Some(&[flag.to_string()][..]),
+                "explicit run should forward {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_help_skips_the_banner_for_run_invocations() {
+        // A package spec forwards --help to the tool, so unpin's banner must
+        // not fire — neither in the default-run path nor after `run`.
+        assert!(matches!(
+            classify_help(&["owner/repo", "--help"]),
+            HelpKind::None
+        ));
+        assert!(matches!(
+            classify_help(&["run", "owner/repo", "--help"]),
+            HelpKind::None
+        ));
+        assert!(matches!(
+            classify_help(&["owner/repo", "-h"]),
+            HelpKind::None
+        ));
+    }
+
+    #[test]
+    fn classify_help_still_recognizes_unpins_own_help() {
+        // unpin's own help paths keep their banner.
+        assert!(matches!(classify_help(&["--help"]), HelpKind::TopLevel));
+        assert!(matches!(classify_help(&["-h"]), HelpKind::TopLevel));
+        assert!(matches!(classify_help(&["help"]), HelpKind::TopLevel));
+        assert!(matches!(
+            classify_help(&["install", "--help"]),
+            HelpKind::Subcommand
+        ));
+        assert!(matches!(
+            classify_help(&["help", "install"]),
+            HelpKind::Subcommand
+        ));
+        assert!(matches!(classify_help(&["list"]), HelpKind::None));
     }
 }
