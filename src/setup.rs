@@ -27,6 +27,11 @@ use crate::platform::{self, Paths};
 /// purely as a janitor (delete the file, exit) and does nothing else.
 const CLEANUP_ENV: &str = "UNPIN_CLEANUP_ORIGIN";
 
+/// Sibling handoff for self-uninstall on Windows: names a directory (unpin's
+/// own repo dir) a detached janitor copy should `remove_dir_all` once the
+/// running unpin — whose `.exe` lives inside it — has exited.
+const CLEANUP_DIR_ENV: &str = "UNPIN_CLEANUP_DIR";
+
 /// On-disk file name for unpin's own binary inside its version dir — the real
 /// executable. The `bin` entry that points at it is a symlink (Unix) or a
 /// `.cmd` wrapper (Windows), created by the linker like any package's.
@@ -39,6 +44,12 @@ pub fn run(paths: &Paths, assume_yes: bool) -> Result<(), String> {
     // reap the file the parent couldn't delete while it was still running.
     if let Some(origin) = env::var_os(CLEANUP_ENV) {
         janitor_delete(Path::new(&origin));
+        return Ok(());
+    }
+    // Sibling janitor: remove unpin's own repo dir after a self-uninstall (the
+    // exe inside it has now exited, so it's finally deletable).
+    if let Some(dir) = env::var_os(CLEANUP_DIR_ENV) {
+        janitor_delete_dir(Path::new(&dir));
         return Ok(());
     }
 
@@ -160,6 +171,47 @@ fn janitor_delete(origin: &Path) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Like [`janitor_delete`] but for a whole directory — unpin's repo dir on a
+/// self-uninstall, retried until the just-exited parent's `.exe` is unlocked.
+fn janitor_delete_dir(dir: &Path) {
+    use std::time::Duration;
+    for _ in 0..50 {
+        if !dir.exists() || fs::remove_dir_all(dir).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// True if the running binary lives inside `dir` — i.e. uninstalling `dir`
+/// would have to delete the very `.exe` we're executing, which Windows forbids.
+#[cfg(windows)]
+pub fn running_from(dir: &Path) -> bool {
+    match (env::current_exe(), fs::canonicalize(dir)) {
+        (Ok(exe), Ok(d)) => fs::canonicalize(&exe).map(|e| e.starts_with(&d)).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Hand unpin's own repo dir to a detached janitor for self-uninstall on
+/// Windows: copy the running exe to `%TEMP%` and spawn it with
+/// [`CLEANUP_DIR_ENV`] set, so it can `remove_dir_all` the dir — including the
+/// no-longer-running exe — once this process exits. The staged copy is left in
+/// `%TEMP%` (it can't delete itself); the OS reclaims it.
+#[cfg(windows)]
+pub fn spawn_dir_janitor(dir: &Path) -> Result<(), String> {
+    use std::process::Command;
+    let current = env::current_exe().map_err(|e| format!("locate self: {e}"))?;
+    let tmp = env::temp_dir().join("unpin-cleanup.exe");
+    fs::copy(&current, &tmp).map_err(|e| format!("stage janitor: {e}"))?;
+    Command::new(&tmp)
+        .arg("install")
+        .env(CLEANUP_DIR_ENV, dir)
+        .spawn()
+        .map_err(|e| format!("spawn janitor: {e}"))?;
+    Ok(())
 }
 
 enum PathOutcome {

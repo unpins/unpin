@@ -558,6 +558,16 @@ fn uninstall_one(paths: &Paths, name: &str) -> Result<(), String> {
         }
     }
     if rdir.exists() {
+        // Self-uninstall on Windows: the running unpin.exe lives inside rdir
+        // and can't be deleted while executing. The bin links are already gone
+        // (above); hand the dir to a detached janitor that wipes it once we
+        // exit, and report success now.
+        #[cfg(windows)]
+        if crate::setup::running_from(&rdir) {
+            crate::setup::spawn_dir_janitor(&rdir)?;
+            println!("Removed {owner}/{repo} (cleanup finishes after unpin exits)");
+            return Ok(());
+        }
         fs::remove_dir_all(&rdir).map_err(|e| format!("remove {}: {e}", rdir.display()))?;
     }
     let _ = fs::remove_dir(paths.data.join(&owner));
