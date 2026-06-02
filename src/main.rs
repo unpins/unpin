@@ -29,8 +29,8 @@ enum Cmd {
     Install(InstallCmd),
     /// Update one, several, or (with no args) all installed packages.
     Update(UpdateCmd),
-    /// Remove one, several, or (with no args) all installed packages.
-    Remove(RemoveCmd),
+    /// Uninstall one, several, or (with no args) all installed packages.
+    Uninstall(UninstallCmd),
     /// List installed packages.
     List,
     /// Show details about one or more packages (installed or remote).
@@ -53,7 +53,7 @@ impl Cmd {
         match self {
             Cmd::Install(c) => c.run(paths).map(|()| 0),
             Cmd::Update(c) => c.run(paths).map(|()| 0),
-            Cmd::Remove(c) => c.run(paths).map(|()| 0),
+            Cmd::Uninstall(c) => c.run(paths).map(|()| 0),
             Cmd::List => install::list(paths).map(|()| 0),
             Cmd::Info(c) => c.run(paths).map(|()| 0),
             Cmd::Prune => install::prune(paths).map(|()| 0),
@@ -102,18 +102,18 @@ impl UpdateCmd {
 }
 
 #[derive(Args, Debug)]
-struct RemoveCmd {
+struct UninstallCmd {
     /// Skip prompts
     #[arg(short = 'y', long = "yes")]
     assume_yes: bool,
-    /// installed package name; empty = remove all (with confirmation)
+    /// installed package name; empty = uninstall all (with confirmation)
     #[arg(value_name = "NAME")]
     names: Vec<String>,
 }
 
-impl RemoveCmd {
+impl UninstallCmd {
     fn run(self, paths: &platform::Paths) -> Result<(), String> {
-        install::remove_many(paths, &self.names, self.assume_yes)
+        install::uninstall_many(paths, &self.names, self.assume_yes)
     }
 }
 
@@ -327,7 +327,7 @@ fn print_auth_footer(config_path: Option<&std::path::Path>) {
 const SUBCOMMANDS: &[&str] = &[
     "install",
     "update",
-    "remove",
+    "uninstall",
     "list",
     "info",
     "prune",

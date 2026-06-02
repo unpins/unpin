@@ -488,7 +488,7 @@ impl Drop for InstallLock {
         // unlock() can fail (e.g. fd already invalidated); ignore — the
         // upcoming File::drop closes the fd, which releases the kernel
         // lock regardless. The remove_file is cosmetic; it can fail when
-        // rdir was wiped underneath us (e.g. by `remove_one`).
+        // rdir was wiped underneath us (e.g. by `uninstall_one`).
         let _ = self.file.unlock();
         let _ = fs::remove_file(&self.path);
     }

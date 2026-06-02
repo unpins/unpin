@@ -72,7 +72,7 @@ unpin [run] <repo> [args...] Fetch and execute a binary without linking (default
 unpin install                Self-install: move this binary into place and add it to PATH
 unpin install <repo>...      Install one or more packages onto PATH
 unpin update [<name>...]     Pull newer releases (all packages if no names)
-unpin remove <name>...       Uninstall packages
+unpin uninstall <name>...    Uninstall one or more packages (all if no names)
 unpin list                   List installed packages
 unpin info <name>...         Show details for installed packages
 unpin prune                  Drop old versions, keep the active one

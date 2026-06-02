@@ -417,14 +417,14 @@ pub fn list(paths: &Paths) -> Result<(), String> {
     Ok(())
 }
 
-pub fn remove_many(paths: &Paths, names: &[String], assume_yes: bool) -> Result<(), String> {
+pub fn uninstall_many(paths: &Paths, names: &[String], assume_yes: bool) -> Result<(), String> {
     let targets: Vec<String> = if names.is_empty() {
         let all = installed_repos(paths);
         if all.is_empty() {
             println!("No packages installed");
             return Ok(());
         }
-        println!("This will remove all {} installed package(s):", all.len());
+        println!("This will uninstall all {} installed package(s):", all.len());
         for (owner, repo) in &all {
             println!("  {owner}/{repo}");
         }
@@ -433,7 +433,7 @@ pub fn remove_many(paths: &Paths, names: &[String], assume_yes: bool) -> Result<
         }
         all.into_iter().map(|(o, r)| format!("{o}/{r}")).collect()
     } else {
-        // Raw-string dedup so `remove tree tree` doesn't try to remove the
+        // Raw-string dedup so `uninstall tree tree` doesn't try to remove the
         // package twice (second call would error "not installed" since the
         // first already wiped it — non-fatal but ugly output). Note the
         // dropped dup so the user knows one of their args was folded in.
@@ -442,7 +442,7 @@ pub fn remove_many(paths: &Paths, names: &[String], assume_yes: bool) -> Result<
 
     let mut failures = 0usize;
     for name in &targets {
-        if let Err(e) = remove_one(paths, name) {
+        if let Err(e) = uninstall_one(paths, name) {
             eprintln!("unpin: {name}: {e}");
             failures += 1;
         }
@@ -450,11 +450,11 @@ pub fn remove_many(paths: &Paths, names: &[String], assume_yes: bool) -> Result<
     if failures == 0 {
         Ok(())
     } else {
-        Err(format!("{failures} remove(s) failed"))
+        Err(format!("{failures} uninstall(s) failed"))
     }
 }
 
-fn remove_one(paths: &Paths, name: &str) -> Result<(), String> {
+fn uninstall_one(paths: &Paths, name: &str) -> Result<(), String> {
     let (owner, repo) = resolve_installed(paths, name)?.ok_or("not installed")?;
     let rdir = paths.repo_dir(&owner, &repo);
 
