@@ -17,28 +17,31 @@ rg --version
 
 ## Install
 
-The official builds are at **<https://unpins.org>**. They are statically linked
-and download in one step:
+The official builds are at **<https://unpins.org>**. They are statically linked.
+Download the binary, then run `unpin install` — it moves the binary into place
+and offers to add that directory to your `PATH`:
 
 ```sh
 # Linux
-curl -sLo ~/.local/bin/unpin "https://unpins.org/unpin-$(uname -m)-linux"
-chmod +x ~/.local/bin/unpin
+curl -sLo unpin "https://unpins.org/unpin-$(uname -m)-linux"
+chmod +x unpin
+./unpin install
 
 # macOS
-curl -sLo ~/.local/bin/unpin "https://unpins.org/unpin-$(uname -m)-darwin"
-chmod +x ~/.local/bin/unpin
+curl -sLo unpin "https://unpins.org/unpin-$(uname -m)-darwin"
+chmod +x unpin
+./unpin install
 ```
 
 ```powershell
-# Windows (PowerShell)
-$DEST = "$env:LOCALAPPDATA\unpin"
-mkdir $DEST -Force > $null
-irm https://unpins.org/unpin-x86_64-windows.exe -OutFile "$DEST\unpin.exe"
+# Windows (PowerShell or cmd; needs Windows 10 1803+ for bundled curl)
+curl.exe -fsSLo unpin.exe https://unpins.org/unpin-x86_64-windows.exe
+.\unpin.exe install
 ```
 
-Ensure `~/.local/bin` (Linux/macOS) or `%LOCALAPPDATA%\unpin` (Windows) is in
-your `PATH`.
+`unpin install` drops the binary in `~/.local/bin` (Linux/macOS) or
+`%LOCALAPPDATA%\unpin` (Windows). After it edits your `PATH`, open a new shell
+for the change to take effect.
 
 ### From source via Cargo
 
@@ -66,6 +69,7 @@ Windows. See `flake.nix` for the build matrix.
 
 ```text
 unpin [run] <repo> [args...] Fetch and execute a binary without linking (default command)
+unpin install                Self-install: move this binary into place and add it to PATH
 unpin install <repo>...      Install one or more packages onto PATH
 unpin update [<name>...]     Pull newer releases (all packages if no names)
 unpin remove <name>...       Uninstall packages

@@ -13,6 +13,7 @@ mod install;
 mod meta;
 mod panic;
 mod platform;
+mod setup;
 mod sigint;
 
 #[derive(Parser, Debug)]
@@ -24,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Install one or more packages from GitHub releases onto your PATH.
+    /// Install one or more packages from GitHub releases onto your PATH. With no package, installs unpin itself: moves this binary into place and adds it to PATH.
     Install(InstallCmd),
     /// Update one, several, or (with no args) all installed packages.
     Update(UpdateCmd),
@@ -67,13 +68,18 @@ impl Cmd {
 struct InstallCmd {
     #[command(flatten)]
     flags: InstallUpdateFlags,
-    /// owner/repo (or bare name for unpins/<name>), optionally with @version
-    #[arg(value_name = "PKG", required = true)]
+    /// owner/repo (or bare name for unpins/<name>), optionally with @version. Omit to self-install unpin.
+    #[arg(value_name = "PKG")]
     pkgs: Vec<String>,
 }
 
 impl InstallCmd {
     fn run(self, paths: &platform::Paths) -> Result<(), String> {
+        // No package = self-install: relocate this binary into `bin` and put
+        // that dir on PATH. Only `-y` matters here (skip the PATH prompt).
+        if self.pkgs.is_empty() {
+            return setup::run(paths, self.flags.assume_yes);
+        }
         let (ctx, opts) = self.flags.resolve(paths);
         install::install_many(&ctx, &opts, &self.pkgs)
     }
