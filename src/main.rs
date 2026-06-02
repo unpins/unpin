@@ -114,7 +114,7 @@ struct UninstallCmd {
 impl UninstallCmd {
     fn run(self, paths: &platform::Paths) -> Result<(), String> {
         // Windows self-uninstall janitor handoff: a detached copy spawned with
-        // the cleanup env var set finishes the removal of unpin's own repo dir
+        // UNPIN_UNINSTALL_DIR set finishes the removal of unpin's own repo dir
         // (the running `.exe` couldn't delete itself) and exits, never touching
         // the real uninstall below.
         if setup::run_dir_janitor_if_handed_off() {

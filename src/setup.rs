@@ -11,8 +11,8 @@
 //!
 //! Windows can't delete the running `.exe`, so when we have to *copy* (the
 //! download lives on another volume) rather than rename, the freshly placed
-//! copy is re-spawned as a silent janitor — keyed by [`CLEANUP_ENV`] — to
-//! remove the original once this process exits and unlocks it.
+//! copy is re-spawned as a silent janitor — keyed by [`INSTALL_FILE_ENV`] —
+//! to remove the original once this process exits and unlocks it.
 
 use std::env;
 use std::fs;
@@ -28,20 +28,21 @@ use crate::platform::{self, Paths};
 ///
 /// Windows-only by construction: it's only ever *set* by [`spawn_janitor`]
 /// (itself `cfg(windows)`), and only ever *honored* on Windows. Gating both
-/// ends keeps `unpin install` from turning an ambient `UNPIN_CLEANUP_ORIGIN`
+/// ends keeps `unpin install` from turning an ambient `UNPIN_INSTALL_FILE`
 /// in some other platform's environment into an unprompted file delete — the
 /// whole mechanism exists for Windows' can't-unlink-a-running-`.exe` problem,
-/// which Unix doesn't have.
+/// which Unix doesn't have. The verb in the name marks which operation spawns
+/// it (install), distinct from the self-uninstall [`UNINSTALL_DIR_ENV`].
 #[cfg(windows)]
-const CLEANUP_ENV: &str = "UNPIN_CLEANUP_ORIGIN";
+const INSTALL_FILE_ENV: &str = "UNPIN_INSTALL_FILE";
 
 /// Sibling handoff for self-uninstall on Windows: names a directory (unpin's
 /// own repo dir) a detached janitor copy should `remove_dir_all` once the
 /// running unpin — whose `.exe` lives inside it — has exited. Windows-only for
-/// the same reason as [`CLEANUP_ENV`] — and the stakes are higher here
+/// the same reason as [`INSTALL_FILE_ENV`] — and the stakes are higher here
 /// (recursive delete), so it must never be honored where it's never set.
 #[cfg(windows)]
-const CLEANUP_DIR_ENV: &str = "UNPIN_CLEANUP_DIR";
+const UNINSTALL_DIR_ENV: &str = "UNPIN_UNINSTALL_DIR";
 
 /// On-disk file name for unpin's own binary inside its version dir — the real
 /// executable. The `bin` entry that points at it is a symlink (Unix) or a
@@ -59,7 +60,7 @@ pub fn run(paths: &Paths, assume_yes: bool) -> Result<(), String> {
     // self-uninstall janitor rides on `unpin uninstall` instead — see
     // [`run_dir_janitor_if_handed_off`].
     #[cfg(windows)]
-    if let Some(origin) = env::var_os(CLEANUP_ENV) {
+    if let Some(origin) = env::var_os(INSTALL_FILE_ENV) {
         janitor_delete(Path::new(&origin));
         return Ok(());
     }
@@ -163,7 +164,7 @@ fn spawn_janitor(dest: &Path, origin: &Path) {
     use std::process::Command;
     let _ = Command::new(dest)
         .arg("install")
-        .env(CLEANUP_ENV, origin)
+        .env(INSTALL_FILE_ENV, origin)
         .spawn();
 }
 
@@ -201,7 +202,7 @@ fn janitor_delete_dir(dir: &Path) {
 }
 
 /// If this process was spawned as the self-uninstall dir-janitor — its
-/// environment carries [`CLEANUP_DIR_ENV`], set only by [`spawn_dir_janitor`] —
+/// environment carries [`UNINSTALL_DIR_ENV`], set only by [`spawn_dir_janitor`] —
 /// delete the handed-off repo dir (and prune the now-empty owner dir) and
 /// return `true` so the caller short-circuits before doing a real uninstall.
 /// The janitor rides on `unpin uninstall` (not `install`) because that's the
@@ -209,7 +210,7 @@ fn janitor_delete_dir(dir: &Path) {
 /// var is never set.
 pub fn run_dir_janitor_if_handed_off() -> bool {
     #[cfg(windows)]
-    if let Some(dir) = env::var_os(CLEANUP_DIR_ENV) {
+    if let Some(dir) = env::var_os(UNINSTALL_DIR_ENV) {
         janitor_delete_dir(Path::new(&dir));
         return true;
     }
@@ -230,7 +231,7 @@ pub fn running_from(dir: &Path) -> bool {
 
 /// Hand unpin's own repo dir to a detached janitor for self-uninstall on
 /// Windows: copy the running exe to `%TEMP%` and spawn it with
-/// [`CLEANUP_DIR_ENV`] set, so it can `remove_dir_all` the dir — including the
+/// [`UNINSTALL_DIR_ENV`] set, so it can `remove_dir_all` the dir — including the
 /// no-longer-running exe — once this process exits. The staged copy is left in
 /// `%TEMP%` (it can't delete itself); the OS reclaims it.
 ///
@@ -249,7 +250,7 @@ pub fn spawn_dir_janitor(dir: &Path) -> Result<(), String> {
     // uninstall, so the no-arg "uninstall all" path is never reached.
     Command::new(&tmp)
         .arg("uninstall")
-        .env(CLEANUP_DIR_ENV, dir)
+        .env(UNINSTALL_DIR_ENV, dir)
         .spawn()
         .map_err(|e| format!("spawn janitor: {e}"))?;
     Ok(())
