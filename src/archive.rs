@@ -200,6 +200,10 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
         // CLI binary never legitimately needs them, and honoring them from an
         // untrusted archive is needless attack surface. Keep only the rwx
         // permission bits.
+        // Read only where it's used: every consumer below is `cfg(unix)`
+        // (Windows has no mode bits to apply), so binding it unconditionally
+        // is an unused-variable warning there.
+        #[cfg(unix)]
         let mode = entry.header().mode().ok().map(|m| m & 0o777);
 
         match entry_type {

@@ -142,13 +142,8 @@ fn relocate(current: &Path, dest: &Path) -> Result<Relocation, String> {
         return Ok(Relocation::Moved);
     }
 
-    fs::copy(current, dest).map_err(|e| {
-        format!(
-            "copy {} -> {}: {e}",
-            current.display(),
-            dest.display()
-        )
-    })?;
+    fs::copy(current, dest)
+        .map_err(|e| format!("copy {} -> {}: {e}", current.display(), dest.display()))?;
     platform::ensure_executable(dest)?;
     match fs::remove_file(current) {
         Ok(()) => Ok(Relocation::Moved),
@@ -208,7 +203,9 @@ fn janitor_delete_dir(dir: &Path) {
 #[cfg(windows)]
 pub fn running_from(dir: &Path) -> bool {
     match (env::current_exe(), fs::canonicalize(dir)) {
-        (Ok(exe), Ok(d)) => fs::canonicalize(&exe).map(|e| e.starts_with(&d)).unwrap_or(false),
+        (Ok(exe), Ok(d)) => fs::canonicalize(&exe)
+            .map(|e| e.starts_with(&d))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -295,9 +292,8 @@ fn bin_on_path(bin: &Path) -> bool {
         return false;
     };
     let target = fs::canonicalize(bin).ok();
-    env::split_paths(&path).any(|p| {
-        p == bin || (target.is_some() && fs::canonicalize(&p).ok() == target)
-    })
+    env::split_paths(&path)
+        .any(|p| p == bin || (target.is_some() && fs::canonicalize(&p).ok() == target))
 }
 
 /// A small yes/no prompt, defaulting to **yes** (this is the recommended
@@ -367,7 +363,9 @@ fn unix_target(bin: &Path) -> Result<(PathBuf, String), String> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    let home = env::var_os("HOME").map(PathBuf::from).ok_or("$HOME is not set")?;
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("$HOME is not set")?;
     Ok(unix_profile_for(shell, &home, bin))
 }
 
@@ -428,7 +426,10 @@ fn apply_path_change(bin: &Path) -> Result<PathOutcome, String> {
 #[cfg(windows)]
 fn plan_path_change(bin: &Path) -> Result<PathPlan, String> {
     Ok(PathPlan::Pending {
-        prompt: format!("{} is not on your PATH. Add it to your user PATH?", bin.display()),
+        prompt: format!(
+            "{} is not on your PATH. Add it to your user PATH?",
+            bin.display()
+        ),
     })
 }
 

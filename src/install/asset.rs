@@ -214,11 +214,9 @@ pub(super) fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, Str
     // Skip, but for a single-package caller "stdin is not a terminal" is far
     // more actionable than a generic "no asset selected".
     if !io::stdin().is_terminal() {
-        return Err(
-            "multiple assets match and stdin is not a terminal; \
+        return Err("multiple assets match and stdin is not a terminal; \
              re-run on a terminal to pick one"
-                .into(),
-        );
+            .into());
     }
     let header = if candidates.len() == 1 {
         "Available asset"
@@ -460,8 +458,16 @@ mod tests {
             "ripgrep_15.1.0-1_amd64.deb",
         ]);
         let got = narrow_assets(&rg, "ripgrep", false, false).unwrap();
-        assert_eq!(got.len(), 1, "candidates: {:?}", got.iter().map(|a| &a.name).collect::<Vec<_>>());
-        assert_eq!(got[0].name, "ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz");
+        assert_eq!(
+            got.len(),
+            1,
+            "candidates: {:?}",
+            got.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got[0].name,
+            "ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz"
+        );
 
         // pandoc 3.9.0.2 (os-amd64 / Debian-style naming).
         let pd = mk(&[
@@ -473,7 +479,12 @@ mod tests {
             "pandoc.wasm.zip",
         ]);
         let got = narrow_assets(&pd, "pandoc", false, false).unwrap();
-        assert_eq!(got.len(), 1, "candidates: {:?}", got.iter().map(|a| &a.name).collect::<Vec<_>>());
+        assert_eq!(
+            got.len(),
+            1,
+            "candidates: {:?}",
+            got.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
         assert_eq!(got[0].name, "pandoc-3.9.0.2-linux-amd64.tar.gz");
 
         // unpins catalog htop v3.4.1-1: canonical <pkg>-<tag>-<arch>-<os>.zst,
@@ -490,7 +501,12 @@ mod tests {
             "htop-3.4.1-1-x86_64-linux.zst",
         ]);
         let got = narrow_assets(&ht, "htop", false, false).unwrap();
-        assert_eq!(got.len(), 1, "candidates: {:?}", got.iter().map(|a| &a.name).collect::<Vec<_>>());
+        assert_eq!(
+            got.len(),
+            1,
+            "candidates: {:?}",
+            got.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
         assert_eq!(got[0].name, "htop-3.4.1-1-x86_64-linux.zst");
     }
 

@@ -195,7 +195,9 @@ pub fn preflight_extract(
     pick: bool,
     include_data: bool,
 ) -> Result<ExtractJob, String> {
-    let vdir = ctx.paths.version_dir(&spec.owner, &spec.name, &release.tag_name);
+    let vdir = ctx
+        .paths
+        .version_dir(&spec.owner, &spec.name, &release.tag_name);
     // `--no-data` (or `data = false` in config) suppresses the companion lookup
     // entirely. As a side effect the cache-complete check no longer requires
     // `share/`, so a vdir installed without data won't be re-extracted by a
@@ -231,8 +233,13 @@ pub fn preflight_extract(
     // install/run on the same package error out while the user is deciding.
     // The asset picker above is likewise pre-lock. Mirrors run_pipeline_v2,
     // which resolves on a worker thread and only locks in finalize_resolution.
-    let expected_sha256 =
-        resolve_checksum_for(ctx, &release.assets, &asset.name, ChecksumKind::Primary, assume_yes)?;
+    let expected_sha256 = resolve_checksum_for(
+        ctx,
+        &release.assets,
+        &asset.name,
+        ChecksumKind::Primary,
+        assume_yes,
+    )?;
     let companion = if include_data {
         find_companion(&spec.name, &release.tag_name, &release.assets).cloned()
     } else {
@@ -683,10 +690,7 @@ pub fn run_pipeline_v2(
                     let cbar = job.companion.as_ref().map(|companion| {
                         let cb = multi_ref.add(ProgressBar::new(0));
                         cb.set_style(github::download_progress_style());
-                        cb.set_prefix(format!(
-                            "{} {} (data)",
-                            job.spec.name, job.release.tag_name
-                        ));
+                        cb.set_prefix(format!("{} {} (data)", job.spec.name, job.release.tag_name));
                         if companion.size > 0 {
                             cb.set_length(companion.size);
                         }
@@ -802,7 +806,14 @@ fn link_on_main(
     // "Updated v1 → v2" instead of just "Installed v2" on an upgrade.
     // A fresh install gets `None` here and falls back to "Installed".
     let previous = active_version(paths, &job.spec.owner, &job.spec.name);
-    match link_all_executables(paths, multi, &job.spec, &job.vdir, opts.assume_yes, opts.alias_mode) {
+    match link_all_executables(
+        paths,
+        multi,
+        &job.spec,
+        &job.vdir,
+        opts.assume_yes,
+        opts.alias_mode,
+    ) {
         Ok(summary) => {
             pb.set_style(github::done_ok_style());
             pb.finish_with_message(install_summary_message(
@@ -840,14 +851,15 @@ fn preflight_resolve(
         }
     }
 
-    let vdir = ctx.paths.version_dir(&spec.owner, &spec.name, &release.tag_name);
+    let vdir = ctx
+        .paths
+        .version_dir(&spec.owner, &spec.name, &release.tag_name);
     let companion_peek = if opts.include_data {
         find_companion(&spec.name, &release.tag_name, &release.assets)
     } else {
         None
     };
-    let cache_complete =
-        vdir.is_dir() && (companion_peek.is_none() || vdir.join("share").is_dir());
+    let cache_complete = vdir.is_dir() && (companion_peek.is_none() || vdir.join("share").is_dir());
     if cache_complete && !opts.pick {
         return Ok(PrepareOutcome::Cached(Box::new(release)));
     }
@@ -868,7 +880,10 @@ fn preflight_resolve(
             primary_checksum_missing: false,
             companion_checksum_missing: false,
         };
-        return Ok(PrepareOutcome::NeedsPrompt(PromptKind::AssetPicker, Box::new(data)));
+        return Ok(PrepareOutcome::NeedsPrompt(
+            PromptKind::AssetPicker,
+            Box::new(data),
+        ));
     }
 
     let asset = candidates_ref[0].clone();
@@ -902,7 +917,10 @@ fn preflight_resolve(
     };
 
     if primary_checksum_missing {
-        Ok(PrepareOutcome::NeedsPrompt(PromptKind::MissingChecksum, Box::new(data)))
+        Ok(PrepareOutcome::NeedsPrompt(
+            PromptKind::MissingChecksum,
+            Box::new(data),
+        ))
     } else if companion_checksum_missing {
         Ok(PrepareOutcome::NeedsPrompt(
             PromptKind::MissingCompanionChecksum,
@@ -936,7 +954,9 @@ fn finalize_resolution(
             // Cached jobs have no lock — preflight already saw a complete
             // vdir, so the extractor will short-circuit. Lock semantics
             // match the legacy preflight path.
-            let vdir = ctx.paths.version_dir(&spec.owner, &spec.name, &release.tag_name);
+            let vdir = ctx
+                .paths
+                .version_dir(&spec.owner, &spec.name, &release.tag_name);
             Ok(Resolved::Cached(ExtractJob {
                 spec: spec.clone(),
                 release: *release,
@@ -950,7 +970,8 @@ fn finalize_resolution(
             }))
         }
         PrepareOutcome::Ready(data) => {
-            match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, multi) {
+            match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, multi)
+            {
                 ReplaceDecision::Proceed => {}
                 ReplaceDecision::Skip(reason) => return Ok(Resolved::Skipped(reason)),
             }
@@ -978,13 +999,12 @@ fn finalize_resolution(
                     } else {
                         "Available assets:"
                     };
-                    let chosen_idx =
-                        match prompt_pick_with_skip(multi, header, &items) {
-                            PromptResult::Got(i) => i,
-                            PromptResult::Skip => {
-                                return Ok(Resolved::Skipped("asset picker skipped".into()));
-                            }
-                        };
+                    let chosen_idx = match prompt_pick_with_skip(multi, header, &items) {
+                        PromptResult::Got(i) => i,
+                        PromptResult::Skip => {
+                            return Ok(Resolved::Skipped("asset picker skipped".into()));
+                        }
+                    };
                     let chosen = data.candidates[chosen_idx].clone();
                     // Re-fetch checksums for the chosen asset (the parallel
                     // pass deferred this because the asset was unknown).
@@ -1066,7 +1086,8 @@ fn finalize_resolution(
                 }
                 data.companion_checksum_missing = false;
             }
-            match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, multi) {
+            match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, multi)
+            {
                 ReplaceDecision::Proceed => {}
                 ReplaceDecision::Skip(reason) => return Ok(Resolved::Skipped(reason)),
             }
@@ -1174,7 +1195,6 @@ fn resolve_missing_checksum_prompt(
     }
     prompt_yes_no_with_skip(multi, question)
 }
-
 
 /// Compose the trailing "Installed v1.2.3 (binary names); aliases: ...; note: ..."
 /// message that sits inside the green check-mark bar. Mirrors the multi-line

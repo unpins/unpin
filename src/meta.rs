@@ -104,7 +104,9 @@ fn read_bytes(data: &[u8]) -> Result<Option<Meta>, String> {
             }
             total = total.saturating_add(sz);
             if total > MAX_META_TOTAL {
-                return Err(format!("embedded meta exceeds {MAX_META_TOTAL} bytes total"));
+                return Err(format!(
+                    "embedded meta exceeds {MAX_META_TOTAL} bytes total"
+                ));
             }
             if entries.len() >= MAX_META_ENTRIES {
                 return Err(format!("embedded meta exceeds {MAX_META_ENTRIES} entries"));
@@ -152,12 +154,12 @@ fn locate_zips(data: &[u8]) -> Vec<(usize, usize)> {
     // Last position an EOCD's 22-byte fixed record could start.
     let limit = data.len() - 22;
     while i <= limit {
-        if data[i..i + 4] == EOCD_SIG {
-            if let Some((start, end)) = validate_eocd(data, i) {
-                out.push((start, end));
-                i = end; // a validated ZIP can't overlap the next; skip past it
-                continue;
-            }
+        if data[i..i + 4] == EOCD_SIG
+            && let Some((start, end)) = validate_eocd(data, i)
+        {
+            out.push((start, end));
+            i = end; // a validated ZIP can't overlap the next; skip past it
+            continue;
         }
         i += 1;
     }
@@ -198,7 +200,9 @@ impl Meta {
 
     /// Every entry whose path starts with `prefix` (e.g. `"unpin/man/"`).
     pub fn entries_under<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a Entry> {
-        self.entries.iter().filter(move |e| e.path.starts_with(prefix))
+        self.entries
+            .iter()
+            .filter(move |e| e.path.starts_with(prefix))
     }
 
     /// Declared alias names from `unpin/aliases`: one per line, blank lines and

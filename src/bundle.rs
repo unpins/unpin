@@ -112,4 +112,3 @@ mod tests {
         assert_eq!(entry_line(&link), "unpin/man/dir.1\t-> ls.1");
     }
 }
-

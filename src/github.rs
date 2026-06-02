@@ -300,7 +300,10 @@ mod tests {
         let err = api_get(&ctx, "https://api.github.com/x").unwrap_err();
         assert!(err.contains("403"), "got: {err}");
         assert!(err.contains("GITHUB_TOKEN"), "missing token hint: {err}");
-        assert!(err.contains("rate limit exceeded"), "lost GitHub message: {err}");
+        assert!(
+            err.contains("rate limit exceeded"),
+            "lost GitHub message: {err}"
+        );
     }
 
     #[test]
@@ -309,7 +312,10 @@ mod tests {
         // token); the GITHUB_TOKEN hint would be misleading.
         let ctx = ctx_with(403, RATE_LIMIT, Some("Bearer x".into()));
         let err = api_get(&ctx, "https://api.github.com/x").unwrap_err();
-        assert!(!err.contains("GITHUB_TOKEN"), "unexpected token hint: {err}");
+        assert!(
+            !err.contains("GITHUB_TOKEN"),
+            "unexpected token hint: {err}"
+        );
     }
 
     #[test]
@@ -317,6 +323,9 @@ mod tests {
         let ctx = ctx_with(404, r#"{"message":"Not Found"}"#, None);
         let err = api_get(&ctx, "https://api.github.com/x").unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
-        assert!(!err.contains("GITHUB_TOKEN"), "404 shouldn't hint a token: {err}");
+        assert!(
+            !err.contains("GITHUB_TOKEN"),
+            "404 shouldn't hint a token: {err}"
+        );
     }
 }

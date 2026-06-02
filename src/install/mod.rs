@@ -322,8 +322,10 @@ fn resolve_argv_version_collisions(
             );
             Some(chosen)
         } else {
-            let header =
-                format!("{owner}/{name} specified with {} different versions:", group.len());
+            let header = format!(
+                "{owner}/{name} specified with {} different versions:",
+                group.len()
+            );
             let items: Vec<String> = group.iter().map(|&i| parsed[i].0.clone()).collect();
             // Safe to unwrap: has_conflict is true here, so hidden_multi was built.
             match prompt_pick_with_skip(hidden_multi.as_ref().unwrap(), &header, &items) {
@@ -464,7 +466,10 @@ pub fn uninstall_many(paths: &Paths, names: &[String], assume_yes: bool) -> Resu
             println!("No packages installed");
             return Ok(());
         }
-        println!("This will uninstall all {} installed package(s):", all.len());
+        println!(
+            "This will uninstall all {} installed package(s):",
+            all.len()
+        );
         for (owner, repo) in &all {
             println!("  {owner}/{repo}");
         }
@@ -697,7 +702,10 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
         println!("Repo:     {owner}/{repo}");
         if let Some(v) = &active {
             println!("Active:   {v}");
-            println!("Path:     {}", ctx.paths.version_dir(&owner, &repo, v).display());
+            println!(
+                "Path:     {}",
+                ctx.paths.version_dir(&owner, &repo, v).display()
+            );
         }
         if versions.len() > 1 || active.is_none() {
             println!("Versions: {}", versions.join(", "));
@@ -705,7 +713,7 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
         println!("Links:");
         let bin = &ctx.paths.bin;
         let mut any = false;
-        if let Ok(entries) = fs::read_dir(&bin) {
+        if let Ok(entries) = fs::read_dir(bin) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(target) = platform::read_link(&path)

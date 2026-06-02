@@ -166,13 +166,17 @@ fn classify_slot(
         Some(t) if t.starts_with(rdir) => SlotDecision::Write(None),
         // Owned by a different unpin package → cross-package collision.
         Some(t) if t.starts_with(&paths.data) => {
-            let owner = link_owner_repo(&paths.data, &t).unwrap_or_else(|| "another package".into());
+            let owner =
+                link_owner_repo(&paths.data, &t).unwrap_or_else(|| "another package".into());
             // The user explicitly asked for THIS package, so `-y` and non-TTY
             // let it win (with a shadow note). Interactive TTY gets to choose.
             if assume_yes || !io::stdin().is_terminal() {
                 SlotDecision::Write(Some(format!("replaced {owner}'s `{name}`")))
             } else {
-                let q = format!("{} is provided by {owner}. Replace it with this package?", link.display());
+                let q = format!(
+                    "{} is provided by {owner}. Replace it with this package?",
+                    link.display()
+                );
                 match prompt_yes_no_with_skip(multi, &q) {
                     PromptResult::Got(true) => {
                         SlotDecision::Write(Some(format!("replaced {owner}'s `{name}`")))
@@ -216,7 +220,10 @@ fn link_binary(
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
 
     match classify_slot(paths, multi, rdir, claimed, link, assume_yes) {
-        SlotDecision::Keep(note) => Ok(LinkResult { linked: false, note }),
+        SlotDecision::Keep(note) => Ok(LinkResult {
+            linked: false,
+            note,
+        }),
         SlotDecision::Write(note) => {
             if link.exists() || fs::symlink_metadata(link).is_ok() {
                 let _ = fs::remove_file(link);
@@ -277,7 +284,7 @@ pub fn link_all_executables(
     //
     // On Windows alias hardlinks aren't introspectable by `read_link`; they
     // get a separate cleanup pass below keyed on the binary's `unpin/aliases`.
-    let existing_managed: Vec<PathBuf> = match fs::read_dir(&bin) {
+    let existing_managed: Vec<PathBuf> = match fs::read_dir(bin) {
         Ok(entries) => entries
             .flatten()
             .filter_map(|e| {
@@ -328,8 +335,9 @@ pub fn link_all_executables(
         // most packages have one, but a multi-binary release with two
         // alias-bearing primaries would just contribute both lists. The
         // catalog-only gate is enforced inside `link_aliases_for`.
-        let alias_outcome =
-            link_aliases_for(paths, multi, &rdir, &refreshed, target, spec, alias_mode, assume_yes)?;
+        let alias_outcome = link_aliases_for(
+            paths, multi, &rdir, &refreshed, target, spec, alias_mode, assume_yes,
+        )?;
         for a in &alias_outcome.linked {
             refreshed.push(bin.join(platform::alias_link_filename(a)));
         }
@@ -429,6 +437,9 @@ struct AliasOutcome {
     notes: Vec<String>,
 }
 
+// Cohesive call: every argument is needed for one alias-linking pass and
+// bundling them into a struct would only move the noise. Allow the count.
+#[allow(clippy::too_many_arguments)]
 fn link_aliases_for(
     paths: &Paths,
     multi: &MultiProgress,
@@ -564,7 +575,10 @@ fn link_alias(
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
 
     match classify_slot(paths, multi, rdir, claimed, link, assume_yes) {
-        SlotDecision::Keep(note) => Ok(LinkResult { linked: false, note }),
+        SlotDecision::Keep(note) => Ok(LinkResult {
+            linked: false,
+            note,
+        }),
         SlotDecision::Write(note) => {
             if link.exists() || fs::symlink_metadata(link).is_ok() {
                 let _ = fs::remove_file(link);
@@ -688,7 +702,14 @@ mod tests {
 
         // 2. Already claimed this run → keep first, with a note.
         assert!(matches!(
-            classify_slot(&paths, &multi, &rdir, &[link.clone()], &link, true),
+            classify_slot(
+                &paths,
+                &multi,
+                &rdir,
+                std::slice::from_ref(&link),
+                &link,
+                true
+            ),
             SlotDecision::Keep(Some(_))
         ));
 
@@ -704,7 +725,10 @@ mod tests {
         symlink(mk_target("them", "other"), &link).unwrap();
         match classify_slot(&paths, &multi, &rdir, &[], &link, true) {
             SlotDecision::Write(Some(n)) => assert!(n.contains("them/other"), "note: {n}"),
-            d => panic!("expected cross-package Write(Some), got {:?}", matches!(d, SlotDecision::Keep(_))),
+            d => panic!(
+                "expected cross-package Write(Some), got {:?}",
+                matches!(d, SlotDecision::Keep(_))
+            ),
         }
         fs::remove_file(&link).unwrap();
 
@@ -758,14 +782,22 @@ mod tests {
         let v1 = mk_vdir("v1", &["foo", "bar"]);
         link_all_executables(&paths, &multi, &spec, &v1, true, AliasMode::No).unwrap();
         assert!(bin.join("foo").exists() && bin.join("bar").exists());
-        assert!(platform::read_link(&bin.join("foo")).unwrap().starts_with(&v1));
+        assert!(
+            platform::read_link(&bin.join("foo"))
+                .unwrap()
+                .starts_with(&v1)
+        );
 
         let v2 = mk_vdir("v2", &["foo"]);
-        let summary = link_all_executables(&paths, &multi, &spec, &v2, true, AliasMode::No).unwrap();
+        let summary =
+            link_all_executables(&paths, &multi, &spec, &v2, true, AliasMode::No).unwrap();
 
         // foo repointed to v2, no v1 link survives, bar (dropped) removed.
         let foo_target = platform::read_link(&bin.join("foo")).unwrap();
-        assert!(foo_target.starts_with(&v2), "foo still points at: {foo_target:?}");
+        assert!(
+            foo_target.starts_with(&v2),
+            "foo still points at: {foo_target:?}"
+        );
         assert!(!bin.join("bar").exists(), "dropped bar should be gone");
         assert!(summary.primary.contains(&"foo".to_string()));
     }

@@ -88,7 +88,9 @@ fn nonempty_env(key: &str) -> Option<String> {
 fn missing(var: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
-        format!("%{var}% is not set; cannot determine where to install (set %{var}% to a directory)"),
+        format!(
+            "%{var}% is not set; cannot determine where to install (set %{var}% to a directory)"
+        ),
     )
 }
 
@@ -219,29 +221,73 @@ pub fn other_arch_keys() -> &'static [&'static str] {
     #[cfg(target_arch = "x86_64")]
     {
         &[
-            "i386", "i686", "armv6", "armv6l", "armv7", "armv7l", "armhf", "aarch64", "arm64",
-            "ppc64le", "powerpc64le", "riscv64", "s390x",
+            "i386",
+            "i686",
+            "armv6",
+            "armv6l",
+            "armv7",
+            "armv7l",
+            "armhf",
+            "aarch64",
+            "arm64",
+            "ppc64le",
+            "powerpc64le",
+            "riscv64",
+            "s390x",
         ]
     }
     #[cfg(target_arch = "aarch64")]
     {
         &[
-            "i386", "i686", "armv6", "armv6l", "armv7", "armv7l", "armhf", "x86_64", "amd64",
-            "x64", "ppc64le", "powerpc64le", "riscv64", "s390x",
+            "i386",
+            "i686",
+            "armv6",
+            "armv6l",
+            "armv7",
+            "armv7l",
+            "armhf",
+            "x86_64",
+            "amd64",
+            "x64",
+            "ppc64le",
+            "powerpc64le",
+            "riscv64",
+            "s390x",
         ]
     }
     #[cfg(target_arch = "x86")]
     {
         &[
-            "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv6l", "armv7", "armv7l",
-            "armhf", "ppc64le", "powerpc64le", "riscv64", "s390x",
+            "x86_64",
+            "amd64",
+            "x64",
+            "aarch64",
+            "arm64",
+            "armv6",
+            "armv6l",
+            "armv7",
+            "armv7l",
+            "armhf",
+            "ppc64le",
+            "powerpc64le",
+            "riscv64",
+            "s390x",
         ]
     }
     #[cfg(target_arch = "arm")]
     {
         &[
-            "i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "ppc64le", "powerpc64le",
-            "riscv64", "s390x",
+            "i386",
+            "i686",
+            "x86_64",
+            "amd64",
+            "x64",
+            "aarch64",
+            "arm64",
+            "ppc64le",
+            "powerpc64le",
+            "riscv64",
+            "s390x",
         ]
     }
     #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
@@ -254,8 +300,21 @@ pub fn other_arch_keys() -> &'static [&'static str] {
     #[cfg(target_arch = "riscv64")]
     {
         &[
-            "i386", "i686", "x86_64", "amd64", "x64", "aarch64", "arm64", "armv6", "armv6l",
-            "armv7", "armv7l", "armhf", "ppc64le", "powerpc64le", "s390x",
+            "i386",
+            "i686",
+            "x86_64",
+            "amd64",
+            "x64",
+            "aarch64",
+            "arm64",
+            "armv6",
+            "armv6l",
+            "armv7",
+            "armv7l",
+            "armhf",
+            "ppc64le",
+            "powerpc64le",
+            "s390x",
         ]
     }
     #[cfg(not(any(
@@ -575,10 +634,7 @@ pub struct LinksLock {
 /// There is deliberately no timeout: the kernel guarantees a non-stale lock,
 /// so a `WouldBlock` always means a live holder that will release when its
 /// (short) link phase — or its interactive prompt — completes.
-pub fn acquire_links_lock(
-    data_dir: &Path,
-    on_wait: impl FnOnce(),
-) -> Result<LinksLock, String> {
+pub fn acquire_links_lock(data_dir: &Path, on_wait: impl FnOnce()) -> Result<LinksLock, String> {
     fs::create_dir_all(data_dir).map_err(|e| format!("create {}: {e}", data_dir.display()))?;
     let lock_path = data_dir.join(".unpin-links.lock");
     let file = fs::OpenOptions::new()
@@ -827,7 +883,10 @@ mod tests {
         // A second, independent fd must see the lock as held — proving mutual
         // exclusion — without us blocking on it.
         let other = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
-        assert!(matches!(other.try_lock(), Err(fs::TryLockError::WouldBlock)));
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
         drop(other);
 
         // Unlike InstallLock, the file is NOT removed on drop: a blocking

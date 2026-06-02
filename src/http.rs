@@ -74,7 +74,9 @@ mod minreq_backend {
             // malicious/MITM'd endpoint could exhaust memory before we ever
             // look at it. Read at most CAP+1 bytes so an exactly-CAP body
             // still passes while anything larger trips the overflow check.
-            let resp = req.send_lazy().map_err(|e| format!("HTTP GET {url}: {e}"))?;
+            let resp = req
+                .send_lazy()
+                .map_err(|e| format!("HTTP GET {url}: {e}"))?;
             let status = resp.status_code as u16;
             let mut body = Vec::new();
             Read::take(resp, GET_BODY_CAP_BYTES + 1)
@@ -153,8 +155,9 @@ mod tests {
                 // write side doesn't block on a full socket buffer.
                 let mut scratch = [0u8; 2048];
                 let _ = sock.read(&mut scratch);
-                let header =
-                    format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n");
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                );
                 if sock.write_all(header.as_bytes()).is_err() {
                     return;
                 }
