@@ -369,15 +369,41 @@ fn unix_target(bin: &Path) -> Result<(PathBuf, String), String> {
     Ok(unix_profile_for(shell, &home, bin))
 }
 
+/// Whether `bin` already appears as a *PATH list entry* in `contents` (a shell
+/// profile), as opposed to merely occurring as a substring. So
+/// `/home/u/.local/bin` does NOT match `…/bin-old`, `…/binutils`, or a `…/bin/x`
+/// subdir. Comment lines (`#…`) are skipped so a passing mention in prose can't
+/// suppress a needed edit. Pure (no I/O), so it can be unit-tested.
+///
+/// `std::env::split_paths` only splits on the list separator (`:`), but profile
+/// lines are shell *source*, not bare PATH values — the dir is wrapped in
+/// `export PATH="…:$PATH"`, single quotes, or fish's `fish_add_path …`. So we
+/// split on the full set of chars that bound a component in those forms (the
+/// separator, quotes, `=`, whitespace) and compare each token to `bin` with
+/// `Path` equality, which is component-wise: a prefix or subdir can't masquerade
+/// as a match, and a trailing slash is normalised away.
+#[cfg(unix)]
+fn profile_has_path_entry(contents: &str, bin: &Path) -> bool {
+    if bin.as_os_str().is_empty() {
+        return false;
+    }
+    contents
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .flat_map(|l| l.split([':', '"', '\'', '=', ' ', '\t']))
+        .filter(|t| !t.is_empty())
+        .any(|t| Path::new(t) == bin)
+}
+
 #[cfg(unix)]
 fn plan_path_change(bin: &Path) -> Result<PathPlan, String> {
     let (profile, line) = unix_target(bin)?;
 
-    // Idempotent: if the profile already mentions this bin dir, don't prompt or
+    // Idempotent: if the profile already lists this bin dir, don't prompt or
     // append a second entry (e.g. the user edited it before, or re-runs setup
     // in a shell that hasn't been reopened yet).
     let existing = fs::read_to_string(&profile).unwrap_or_default();
-    if existing.contains(&bin.display().to_string()) {
+    if profile_has_path_entry(&existing, bin) {
         return Ok(PathPlan::AlreadyConfigured(format!(
             "{} is already configured in {}. Open a new shell (or `source {}`).",
             bin.display(),
@@ -507,5 +533,59 @@ mod tests {
         let (p, line) = unix_profile_for("nu", home, bin);
         assert_eq!(p, home.join(".profile"));
         assert!(line.starts_with("export PATH="));
+    }
+
+    #[test]
+    fn path_entry_matches_real_list_entries() {
+        let bin = Path::new("/home/u/.local/bin");
+        // The two lines we ourselves write.
+        assert!(profile_has_path_entry(
+            "export PATH=\"/home/u/.local/bin:$PATH\"\n",
+            bin
+        ));
+        assert!(profile_has_path_entry(
+            "fish_add_path /home/u/.local/bin\n",
+            bin
+        ));
+        // In the middle of a list, both neighbours are separators.
+        assert!(profile_has_path_entry(
+            "export PATH=\"/opt/x:/home/u/.local/bin:/usr/bin\"\n",
+            bin
+        ));
+        // Single-quoted, and as the last component (end-of-line boundary).
+        assert!(profile_has_path_entry(
+            "export PATH='/home/u/.local/bin'",
+            bin
+        ));
+        // Path equality normalises a trailing slash away.
+        assert!(profile_has_path_entry(
+            "export PATH=\"/home/u/.local/bin/:$PATH\"",
+            bin
+        ));
+    }
+
+    #[test]
+    fn path_entry_rejects_substring_lookalikes() {
+        let bin = Path::new("/home/u/.local/bin");
+        // Longer dir that merely shares the prefix.
+        assert!(!profile_has_path_entry(
+            "export PATH=\"/home/u/.local/bin-old:$PATH\"\n",
+            bin
+        ));
+        assert!(!profile_has_path_entry(
+            "export PATH=\"/home/u/.local/binutils:$PATH\"\n",
+            bin
+        ));
+        // A subdir of our bin, not the bin itself.
+        assert!(!profile_has_path_entry(
+            "export PATH=\"/home/u/.local/bin/extra:$PATH\"\n",
+            bin
+        ));
+        // A bare mention in a comment must not suppress the edit.
+        assert!(!profile_has_path_entry(
+            "# remember to add /home/u/.local/bin someday\n",
+            bin
+        ));
+        assert!(!profile_has_path_entry("", bin));
     }
 }
