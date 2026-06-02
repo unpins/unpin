@@ -187,11 +187,18 @@ fn janitor_delete(origin: &Path) {
 
 /// Like [`janitor_delete`] but for a whole directory — unpin's repo dir on a
 /// self-uninstall, retried until the just-exited parent's `.exe` is unlocked.
+/// Once the repo dir is gone, prune the now-empty owner dir too, mirroring the
+/// normal uninstall path (which `uninstall_one` skips via an early return on
+/// the self-uninstall branch). `remove_dir` only succeeds on an empty dir, so
+/// an owner that still holds other packages is a harmless no-op.
 #[cfg(windows)]
 fn janitor_delete_dir(dir: &Path) {
     use std::time::Duration;
     for _ in 0..50 {
         if !dir.exists() || fs::remove_dir_all(dir).is_ok() {
+            if let Some(owner) = dir.parent() {
+                let _ = fs::remove_dir(owner);
+            }
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
