@@ -206,7 +206,7 @@ pub(super) fn prompt_yes_no(question: &str) -> bool {
 ///
 /// Hold this for the smallest window that fully covers the destructive
 /// operation: pipeline.rs holds one from preflight through linking; prune
-/// and remove_one each grab one for the duration of their `remove_dir_all`
+/// and uninstall_one each grab one for the duration of their `remove_dir_all`
 /// pass. Reads (info, list) deliberately skip the lock — they tolerate the
 /// occasional racy result instead of paying for serialization.
 ///

@@ -25,11 +25,22 @@ use crate::platform::{self, Paths};
 /// Internal handoff env var. When set, names the original download path that a
 /// freshly relocated Windows copy should delete. A process that sees it acts
 /// purely as a janitor (delete the file, exit) and does nothing else.
+///
+/// Windows-only by construction: it's only ever *set* by [`spawn_janitor`]
+/// (itself `cfg(windows)`), and only ever *honored* on Windows. Gating both
+/// ends keeps `unpin install` from turning an ambient `UNPIN_CLEANUP_ORIGIN`
+/// in some other platform's environment into an unprompted file delete — the
+/// whole mechanism exists for Windows' can't-unlink-a-running-`.exe` problem,
+/// which Unix doesn't have.
+#[cfg(windows)]
 const CLEANUP_ENV: &str = "UNPIN_CLEANUP_ORIGIN";
 
 /// Sibling handoff for self-uninstall on Windows: names a directory (unpin's
 /// own repo dir) a detached janitor copy should `remove_dir_all` once the
-/// running unpin — whose `.exe` lives inside it — has exited.
+/// running unpin — whose `.exe` lives inside it — has exited. Windows-only for
+/// the same reason as [`CLEANUP_ENV`] — and the stakes are higher here
+/// (recursive delete), so it must never be honored where it's never set.
+#[cfg(windows)]
 const CLEANUP_DIR_ENV: &str = "UNPIN_CLEANUP_DIR";
 
 /// On-disk file name for unpin's own binary inside its version dir — the real
@@ -42,12 +53,17 @@ pub fn run(paths: &Paths, assume_yes: bool) -> Result<(), String> {
     // Janitor handoff (Windows copy path): delete the named origin and exit
     // silently. Must be the very first thing — this process exists only to
     // reap the file the parent couldn't delete while it was still running.
+    // Windows-only: these vars are only ever set by the `cfg(windows)` spawners
+    // below, so honoring them anywhere else would just be a footgun (an ambient
+    // env var turning `unpin install` into an unprompted delete).
+    #[cfg(windows)]
     if let Some(origin) = env::var_os(CLEANUP_ENV) {
         janitor_delete(Path::new(&origin));
         return Ok(());
     }
     // Sibling janitor: remove unpin's own repo dir after a self-uninstall (the
     // exe inside it has now exited, so it's finally deletable).
+    #[cfg(windows)]
     if let Some(dir) = env::var_os(CLEANUP_DIR_ENV) {
         janitor_delete_dir(Path::new(&dir));
         return Ok(());
@@ -163,6 +179,7 @@ fn spawn_janitor(dest: &Path, origin: &Path) {
 
 /// Delete `origin`, retrying briefly: the parent that spawned us may not have
 /// exited yet, so on Windows the file can still be locked for a moment.
+#[cfg(windows)]
 fn janitor_delete(origin: &Path) {
     use std::time::Duration;
     for _ in 0..50 {
@@ -175,6 +192,7 @@ fn janitor_delete(origin: &Path) {
 
 /// Like [`janitor_delete`] but for a whole directory — unpin's repo dir on a
 /// self-uninstall, retried until the just-exited parent's `.exe` is unlocked.
+#[cfg(windows)]
 fn janitor_delete_dir(dir: &Path) {
     use std::time::Duration;
     for _ in 0..50 {
