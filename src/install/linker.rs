@@ -45,17 +45,23 @@ pub fn walk_files(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
 /// with +x set that we have no business promoting into the user's PATH.
 /// vim's `share/vim/runtime/tools/*.pl` is the concrete case that motivated
 /// this restriction.
+///
+/// Lone-root fallback: most third-party release tarballs nest everything one
+/// level down under a single root directory named after the asset
+/// (`ripgrep-<ver>-<triple>/rg`, `fd-<ver>-<triple>/fd`). When the vdir itself
+/// yields nothing (no top-level file, no populated `bin/`) and contains
+/// exactly one sub-directory, we treat that sub-directory as the effective
+/// root and apply the *same* top-level+`bin/` rule to it. Descending only one
+/// level and reusing the same rule is deliberate: a `share/` (or `lib/`, …)
+/// subtree under that root is still never walked, so the vim regression stays
+/// fixed. Catalog packages (bare binary or `bin/` at the root) never hit this
+/// branch.
 pub fn walk_binary_candidates(vdir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
-    if let Ok(entries) = fs::read_dir(vdir) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                out.push(entry.path());
-            }
-        }
-    }
-    let bin = vdir.join("bin");
-    if bin.is_dir() {
-        walk_files(&bin, out)?;
+    collect_top_and_bin(vdir, out)?;
+    if out.is_empty()
+        && let Some(root) = sole_subdir(vdir)
+    {
+        collect_top_and_bin(&root, out)?;
     }
     // `read_dir` yields filesystem order, which varies across machines, file
     // systems and extraction runs. Sort by full path so the candidate list —
@@ -63,6 +69,38 @@ pub fn walk_binary_candidates(vdir: &Path, out: &mut Vec<PathBuf>) -> io::Result
     // executable selection — is deterministic and reproducible.
     out.sort();
     Ok(())
+}
+
+/// Push `dir`'s top-level files and the contents of its `bin/` subtree into
+/// `out` — the core "where a PATH-worthy binary can legitimately live" rule,
+/// factored out so the lone-root fallback in [`walk_binary_candidates`] can
+/// reuse it verbatim one level down.
+fn collect_top_and_bin(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                out.push(entry.path());
+            }
+        }
+    }
+    let bin = dir.join("bin");
+    if bin.is_dir() {
+        walk_files(&bin, out)?;
+    }
+    Ok(())
+}
+
+/// If `dir` contains exactly one entry and that entry is a sub-directory,
+/// return its path; otherwise `None`. Any top-level file, zero sub-dirs, or a
+/// second entry all disqualify it — we only see through an *unambiguous* lone
+/// root directory, never guess which of several entries is "the" package dir.
+fn sole_subdir(dir: &Path) -> Option<PathBuf> {
+    let mut entries = fs::read_dir(dir).ok()?.flatten();
+    let first = entries.next()?;
+    if entries.next().is_some() {
+        return None; // more than one entry
+    }
+    first.file_type().ok()?.is_dir().then(|| first.path())
 }
 
 pub fn is_executable(p: &Path) -> bool {
@@ -895,5 +933,122 @@ mod tests {
         let mut expected = out.clone();
         expected.sort();
         assert_eq!(out, expected, "candidate list is not sorted: {out:?}");
+    }
+
+    /// Relative candidate names (slash-normalized) for assertions.
+    fn candidate_names(vdir: &Path, out: &[PathBuf]) -> Vec<String> {
+        out.iter()
+            .map(|p| {
+                p.strip_prefix(vdir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn walk_descends_into_lone_root_dir() {
+        // The third-party tarball layout (ripgrep/fd/eza/…): everything nested
+        // under a single root directory named after the asset. With no
+        // top-level file and no bin/, the walk must see through that lone root
+        // and surface the binary — the bug this fixes left it empty.
+        let tmp = tempfile::tempdir().unwrap();
+        let v = tmp.path();
+        let root = v.join("ripgrep-15.1.0-x86_64-unknown-linux-musl");
+        fs::create_dir_all(root.join("complete")).unwrap();
+        fs::write(root.join("rg"), b"x").unwrap();
+        fs::write(root.join("README.md"), b"x").unwrap();
+        fs::write(root.join("complete/_rg"), b"x").unwrap(); // a subtree, off-limits
+
+        let mut out = Vec::new();
+        walk_binary_candidates(v, &mut out).unwrap();
+        let names = candidate_names(v, &out);
+        assert!(
+            names.iter().any(|n| n.ends_with("/rg")),
+            "nested binary not found: {names:?}"
+        );
+        // A subtree *under* the lone root stays off-limits (same rule, one
+        // level down) — `complete/_rg` must never become a PATH candidate.
+        assert!(
+            !names.iter().any(|n| n.contains("complete")),
+            "subtree under lone root leaked: {names:?}"
+        );
+    }
+
+    #[test]
+    fn walk_lone_root_still_excludes_share_subtree() {
+        // The vim regression must hold one level down too: a lone root holding
+        // bin/ + share/ exposes the bin/ binary but never the +x scripts under
+        // share/ (the original `efm_filter.pl` case).
+        let tmp = tempfile::tempdir().unwrap();
+        let v = tmp.path();
+        let root = v.join("vim-9.2.0-x86_64-linux");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("share/vim/runtime/tools")).unwrap();
+        fs::write(root.join("bin/vim"), b"x").unwrap();
+        fs::write(
+            root.join("share/vim/runtime/tools/efm_filter.pl"),
+            b"#!/usr/bin/perl\n",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        walk_binary_candidates(v, &mut out).unwrap();
+        let names = candidate_names(v, &out);
+        assert!(
+            names.iter().any(|n| n.ends_with("bin/vim")),
+            "bin/ binary under lone root not found: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("share")),
+            "share/ subtree leaked from under lone root: {names:?}"
+        );
+    }
+
+    #[test]
+    fn walk_does_not_descend_when_a_top_level_file_exists() {
+        // A top-level file already makes the vdir a valid candidate source, so
+        // the lone-root fallback must NOT fire and start fishing in a sibling
+        // directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let v = tmp.path();
+        fs::write(v.join("rg"), b"x").unwrap();
+        fs::create_dir_all(v.join("extras")).unwrap();
+        fs::write(v.join("extras/helper"), b"x").unwrap();
+
+        let mut out = Vec::new();
+        walk_binary_candidates(v, &mut out).unwrap();
+        assert_eq!(candidate_names(v, &out), vec!["rg".to_string()]);
+    }
+
+    #[test]
+    fn walk_does_not_descend_with_multiple_subdirs() {
+        // Two sub-dirs and no top-level file is ambiguous; refuse to guess
+        // which one is "the" package root rather than promote the wrong binary.
+        let tmp = tempfile::tempdir().unwrap();
+        let v = tmp.path();
+        fs::create_dir_all(v.join("a")).unwrap();
+        fs::create_dir_all(v.join("b")).unwrap();
+        fs::write(v.join("a/x"), b"x").unwrap();
+
+        let mut out = Vec::new();
+        walk_binary_candidates(v, &mut out).unwrap();
+        assert!(
+            out.is_empty(),
+            "must not descend into ambiguous layout: {out:?}"
+        );
+    }
+
+    #[test]
+    fn sole_subdir_only_matches_a_single_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v = tmp.path();
+        assert!(sole_subdir(v).is_none(), "empty dir → None");
+        fs::create_dir_all(v.join("root")).unwrap();
+        assert_eq!(sole_subdir(v), Some(v.join("root")), "one sub-dir → Some");
+        // A second top-level entry (even a file) disqualifies it.
+        fs::write(v.join("LICENSE"), b"x").unwrap();
+        assert!(sole_subdir(v).is_none(), "dir + file → None");
     }
 }
