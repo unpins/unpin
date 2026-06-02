@@ -62,27 +62,31 @@ pub fn prompt_pick_with_skip(
     })
 }
 
-/// Yes/no prompt with a skip option. `y`/`Y` → `Got(true)`; anything else
-/// non-empty (including `n`, `N`) → `Got(false)`; empty (default) →
-/// `Got(false)`; `s`/`S`/EOF → `Skip`. Wrapped in `multi.suspend()`.
+/// Yes/no prompt defaulting to no. `y`/`Y` → `Got(true)`; any other input,
+/// including `n`/`N` and a bare Enter → `Got(false)`. A non-TTY stdin or EOF
+/// (Ctrl-D) yields `Skip`, so a non-interactive caller skips the package rather
+/// than silently taking the default. Wrapped in `multi.suspend()`.
+///
+/// (The interactive prompt offers only `[y/N]`: every caller treats `Skip` and
+/// `Got(false)` identically, so a separate keystroke for it would advertise a
+/// distinction that doesn't exist. `Skip` survives only for the non-TTY/EOF
+/// path above, where there's no keystroke to read.)
 pub fn prompt_yes_no_with_skip(multi: &MultiProgress, question: &str) -> PromptResult<bool> {
     if !io::stdin().is_terminal() {
         return PromptResult::Skip;
     }
     multi.suspend(|| {
         // Single read: `prompt_yes_no` legacy never retried, and there's
-        // no "invalid" outcome here — any non-y/n input is a valid "no".
+        // no "invalid" outcome here — any non-y input is a valid "no".
         // We only loop if we wanted to require an explicit choice, which
         // the contract doesn't.
-        eprint!("{question} [y/N/s] ");
+        eprint!("{question} [y/N] ");
         io::stderr().flush().ok();
         let mut line = String::new();
         if io::stdin().read_line(&mut line).is_err() || line.is_empty() {
             return PromptResult::Skip;
         }
-        let first = line.trim_start().chars().next();
-        match first {
-            Some('s') | Some('S') => PromptResult::Skip,
+        match line.trim_start().chars().next() {
             Some('y') | Some('Y') => PromptResult::Got(true),
             _ => PromptResult::Got(false),
         }
