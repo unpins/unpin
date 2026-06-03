@@ -670,8 +670,7 @@ pub fn run_pipeline_v2(
     mut errors: Vec<String>,
 ) -> Result<(), String> {
     if requests.is_empty() {
-        // No bars were created, so any inherited errors must be printed here.
-        return finalize_errors(errors, false);
+        return finalize_errors(errors);
     }
 
     let is_tty = io::stderr().is_terminal();
@@ -881,7 +880,7 @@ pub fn run_pipeline_v2(
         }
     });
 
-    finalize_errors(errors, is_tty)
+    finalize_errors(errors)
 }
 
 /// Per-request UI handles threaded into the link phase: the bar to drive
@@ -1383,23 +1382,15 @@ fn mark_failed(pb: &ProgressBar, msg: &str) {
     pb.finish_with_message(msg.to_string());
 }
 
-/// Emit the collected per-package failures and return the aggregate error.
-///
-/// When the bars were visible (`bars_shown`, i.e. a TTY) each one already
-/// finished with its own ✗ line on screen, so re-printing the same
-/// `unpin: <pkg>: <err>` here would just duplicate it — only the aggregate is
-/// returned. With bars hidden (piped/non-TTY) those lines are the sole record
-/// of what failed, so they're printed.
-fn finalize_errors(errors: Vec<String>, bars_shown: bool) -> Result<(), String> {
+fn finalize_errors(errors: Vec<String>) -> Result<(), String> {
     if errors.is_empty() {
-        return Ok(());
-    }
-    if !bars_shown {
+        Ok(())
+    } else {
         for err in &errors {
             eprintln!("{err}");
         }
+        Err(format!("{} operation(s) failed", errors.len()))
     }
-    Err(format!("{} operation(s) failed", errors.len()))
 }
 
 #[cfg(test)]
