@@ -47,17 +47,28 @@ pub trait HttpClient: Send + Sync {
     ) -> Result<Box<dyn HttpStream + Send>, String>;
 }
 
-/// Build the default HTTP client with a timeout (in seconds) baked in. The
-/// timeout covers connect + read; minreq applies it to both
-/// `TcpStream::connect_timeout` and the underlying socket's read-timeout.
-/// Without it, a stuck TCP handshake to api.github.com hangs indefinitely on
-/// `Resolving...`.
+/// Build the default HTTP client with a timeout (in seconds) baked in.
+///
+/// The timeout means different things on the two paths, by design:
+/// - [`HttpClient::get`] (buffered JSON) hands it straight to minreq as a
+///   total request deadline — fine for small bodies, and it still bounds a
+///   stuck TCP handshake that would otherwise hang on `Resolving...`.
+/// - [`HttpClient::get_streaming`] (release-asset downloads) reinterprets it as
+///   an **inactivity / idle** window, not a total cap. minreq's only timeout is
+///   a fixed deadline covering connect + headers + the *entire* body, so a
+///   large or bandwidth-throttled download blows it even while bytes are still
+///   flowing. The streaming path drops minreq's deadline and enforces the idle
+///   window itself (see `minreq_backend`).
 pub fn default_client(timeout_secs: u64) -> Box<dyn HttpClient> {
     Box::new(minreq_backend::MinreqClient { timeout_secs })
 }
 
 mod minreq_backend {
     use super::*;
+    use std::io;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     pub struct MinreqClient {
         pub(super) timeout_secs: u64,
@@ -95,39 +106,167 @@ mod minreq_backend {
             url: &str,
             headers: Headers,
         ) -> Result<Box<dyn HttpStream + Send>, String> {
-            let mut req = minreq::get(url).with_timeout(self.timeout_secs);
-            for (k, v) in headers {
-                req = req.with_header(*k, *v);
-            }
-            let resp = req
-                .send_lazy()
-                .map_err(|e| format!("HTTP GET {url}: {e}"))?;
-            let content_length = resp
-                .headers
-                .get("content-length")
-                .and_then(|s| s.parse::<u64>().ok());
-            let status = resp.status_code as u16;
-            Ok(Box::new(MinreqStream {
-                status,
-                content_length,
-                inner: resp,
-            }))
+            PumpStream::spawn(url, headers, Duration::from_secs(self.timeout_secs.max(1)))
         }
     }
 
-    struct MinreqStream {
+    /// First message from the pump thread: the response head, or a connect/send
+    /// error. Sent once before any body chunk.
+    enum Head {
+        Ready(u16, Option<u64>),
+        Failed(String),
+    }
+
+    /// A streaming response whose body is read on a background **pump** thread
+    /// and handed over a channel, so the consumer can enforce an *inactivity*
+    /// timeout that minreq's fixed total deadline can't express.
+    ///
+    /// The pump runs the request with **no** minreq timeout (blocking reads) and
+    /// forwards fixed-size chunks. The consumer reads with `recv_timeout(window)`:
+    /// steady data — however slow — keeps arriving inside the window, while a
+    /// truly silent socket trips the window and surfaces a `TimedOut` error.
+    ///
+    /// On a stall (or a connect that never answers) the pump thread is left
+    /// blocked in the kernel and detached; it unwinds only when the socket
+    /// finally closes (the peer's RST/FIN — which a well-behaved CDN sends) or
+    /// at process exit. A genuinely black-holed socket (no RST, e.g. a dropped
+    /// route or half-open NAT) keeps the thread + its fd parked until the
+    /// process ends, and a single batch `install a b c …` against a flaky host
+    /// can leak one per stalled asset. We accept that here because interrupting
+    /// a blocked read needs the raw socket, which minreq hides; if it ever
+    /// bites in practice the fix is a generous *total* backstop timeout (a
+    /// multiple of the idle window) to cap a wedged read.
+    struct PumpStream {
+        body_rx: mpsc::Receiver<io::Result<Vec<u8>>>,
+        /// Current chunk being drained and the read cursor into it.
+        buf: Vec<u8>,
+        pos: usize,
         status: u16,
         content_length: Option<u64>,
-        inner: minreq::ResponseLazy,
+        /// Idle window: max time to wait for the next chunk before erroring.
+        window: Duration,
     }
 
-    impl Read for MinreqStream {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.inner.read(buf)
+    impl PumpStream {
+        fn spawn(
+            url: &str,
+            headers: Headers,
+            window: Duration,
+        ) -> Result<Box<dyn HttpStream + Send>, String> {
+            let owned_url = url.to_string();
+            let owned_headers: Vec<(String, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let (head_tx, head_rx) = mpsc::channel::<Head>();
+            // Bounded so the pump can't race ahead and buffer the whole asset in
+            // memory while the consumer extracts; a full buffer just blocks the
+            // pump (backpressure), it never looks like a stall to the consumer.
+            let (body_tx, body_rx) = mpsc::sync_channel::<io::Result<Vec<u8>>>(8);
+
+            thread::spawn(move || {
+                // No `with_timeout`: minreq's timeout is a single deadline over
+                // connect+headers+body, which a slow-but-steady transfer blows.
+                // We bound *inactivity* on the consumer side instead.
+                let mut req = minreq::get(&owned_url);
+                for (k, v) in &owned_headers {
+                    req = req.with_header(k.as_str(), v.as_str());
+                }
+                let mut resp = match req.send_lazy() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = head_tx.send(Head::Failed(format!("HTTP GET {owned_url}: {e}")));
+                        return;
+                    }
+                };
+                let content_length = resp
+                    .headers
+                    .get("content-length")
+                    .and_then(|s| s.parse::<u64>().ok());
+                if head_tx
+                    .send(Head::Ready(resp.status_code as u16, content_length))
+                    .is_err()
+                {
+                    return; // consumer already gave up (connect-idle timeout)
+                }
+                // Body pump. A dropped receiver (consumer error/abort) makes
+                // `send` fail and ends the loop, dropping `resp` and closing the
+                // socket. EOF (`Ok(0)`) drops `body_tx`, which the consumer sees
+                // as `Disconnected`.
+                //
+                // 16 KiB, not a big buffer: minreq fills the whole buffer before
+                // returning from one `read`, so the chunk size *is* the byte-
+                // counter granularity. A large buffer makes `done` jump in big
+                // steps held flat for seconds on a slow link (jumpy rate + jumpy
+                // bar), and lengthens the per-read blocking time toward the idle
+                // window (a false-stall risk with a small `http_timeout`). 16 KiB
+                // ≈ one TLS record — fine-grained progress, negligible overhead.
+                let mut chunk = [0u8; 16 * 1024];
+                loop {
+                    match resp.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if body_tx.send(Ok(chunk[..n].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = body_tx.send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            });
+
+            match head_rx.recv_timeout(window) {
+                Ok(Head::Ready(status, content_length)) => Ok(Box::new(PumpStream {
+                    body_rx,
+                    buf: Vec::new(),
+                    pos: 0,
+                    status,
+                    content_length,
+                    window,
+                })),
+                Ok(Head::Failed(e)) => Err(e),
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                    "HTTP GET {url}: no response within {}s (connection stalled)",
+                    window.as_secs()
+                )),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(format!("HTTP GET {url}: connection closed before response"))
+                }
+            }
         }
     }
 
-    impl HttpStream for MinreqStream {
+    impl Read for PumpStream {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.buf.len() {
+                match self.body_rx.recv_timeout(self.window) {
+                    Ok(Ok(chunk)) => {
+                        self.buf = chunk;
+                        self.pos = 0;
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("download stalled: no data for {}s", self.window.as_secs()),
+                        ));
+                    }
+                    // Pump finished and dropped its sender → end of body.
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+                }
+            }
+            let remaining = &self.buf[self.pos..];
+            let n = remaining.len().min(out.len());
+            out[..n].copy_from_slice(&remaining[..n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    impl HttpStream for PumpStream {
         fn status(&self) -> u16 {
             self.status
         }
@@ -140,6 +279,7 @@ mod minreq_backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::io::Write;
     use std::net::TcpListener;
 
@@ -194,5 +334,73 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body.len(), 1024);
+    }
+
+    #[test]
+    fn streaming_reads_the_whole_body() {
+        // 200 KiB exercises several 64 KiB pump chunks crossing the channel.
+        let body = 200 * 1024;
+        let port = serve_once(body);
+        let client = default_client(30);
+        let mut stream = client
+            .get_streaming(&format!("http://127.0.0.1:{port}/"), &[])
+            .unwrap();
+        assert_eq!(stream.status(), 200);
+        assert_eq!(stream.content_length(), Some(body as u64));
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), body);
+        assert!(buf.iter().all(|&b| b == b'x'));
+    }
+
+    /// Server that sends 200 + a large Content-Length, writes `prefix` real
+    /// body bytes, then goes silent (without closing) for `hang` — modelling a
+    /// transfer that streams a while and then stalls mid-body. Returns the port.
+    fn serve_then_stall(prefix: usize, hang: std::time::Duration) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut scratch = [0u8; 2048];
+                let _ = sock.read(&mut scratch);
+                // Claim far more than we send, so the client keeps waiting.
+                let header =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(&vec![b'x'; prefix]);
+                let _ = sock.flush();
+                // Go quiet. The client's idle window should fire well before this.
+                std::thread::sleep(hang);
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn streaming_times_out_on_an_idle_socket_not_on_total_time() {
+        use std::time::{Duration, Instant};
+        // 1 s idle window; server streams 128 KiB then hangs for 5 s mid-body.
+        let prefix = 128 * 1024;
+        let port = serve_then_stall(prefix, Duration::from_secs(5));
+        let client = default_client(1);
+        let mut stream = client
+            .get_streaming(&format!("http://127.0.0.1:{port}/"), &[])
+            .unwrap();
+        assert_eq!(stream.status(), 200);
+        let start = Instant::now();
+        let mut buf = Vec::new();
+        let err = stream.read_to_end(&mut buf).unwrap_err();
+        // The idle window (≈1 s) trips, not the server's 5 s hang — proving the
+        // bound is inactivity, not total elapsed time.
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "got: {err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "idle timeout should fire near the 1s window, took {:?}",
+            start.elapsed()
+        );
+        // The bytes that streamed before the stall were delivered to the caller
+        // (at least the first full pump chunk), not swallowed by the timeout.
+        assert!(buf.len() >= 64 * 1024, "delivered {} bytes", buf.len());
+        assert!(buf.iter().all(|&b| b == b'x'));
     }
 }
