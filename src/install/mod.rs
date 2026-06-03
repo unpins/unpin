@@ -460,13 +460,14 @@ pub fn uninstall_many(paths: &Paths, names: &[String], assume_yes: bool) -> Resu
         // the command the user is running disappears. Call it out inline and
         // in a dedicated warning so the confirmation isn't a blind "all".
         let me = self_spec();
-        let includes_self = all.iter().any(|(o, r)| *o == me.owner && *r == me.name);
+        let is_self = |o: &str, r: &str| me.owner == o && me.name == r;
+        let includes_self = all.iter().any(|(o, r)| is_self(o, r));
         println!(
             "This will uninstall all {} installed package(s):",
             all.len()
         );
         for (owner, repo) in &all {
-            let mark = if *owner == me.owner && *repo == me.name {
+            let mark = if is_self(owner, repo) {
                 "  (unpin itself)"
             } else {
                 ""

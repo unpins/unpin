@@ -1,13 +1,13 @@
 # unpin
 
-> Install single-binary CLI tools straight from GitHub releases — no root, no distro, no dependencies.
+> Install single-binary programs straight from GitHub releases — no root, no distro, no dependencies.
 
-`unpin` is the bootstrap CLI of the [unpins](https://unpins.org) project. It
+`unpin` is the CLI installer of the [unpins](https://unpins.org) project. It
 fetches a pre-built binary from a GitHub release, verifies its checksum, and
 either runs it on the spot or drops it in your PATH.
 
 ```sh
-# A bare name fetches and runs the tool — nothing is installed (the default):
+# A bare name fetches and runs the program — nothing is installed (the default):
 unpin BurntSushi/ripgrep --version
 
 # Install it onto your PATH instead:
@@ -91,7 +91,7 @@ Common flags:
 | `-y`, `--yes`       | Skip confirmation prompts                                  |
 | `-j N`, `--jobs N`  | Parallel workers for download + extract (default: min(N, 4)) |
 | `--pick`            | Always prompt when multiple release assets match           |
-| `-v`, `--verbose`   | Show filtered-out assets and the reason                    |
+| `-v`, `--verbose`   | Print every HTTP request and the release assets filtered out |
 | `-V`, `--version`   | Print `unpin <version>`                                    |
 
 A `<repo>` is `owner/name[@version]`. When the owner is omitted, `unpins` is
@@ -122,5 +122,5 @@ Start a new shell session to pick up the completion.
 
 ## License
 
-MIT. Packaged tools keep their upstream licenses — see the
+MIT. Packaged programs keep their upstream licenses — see the
 [packages page](https://unpins.org/packages.html).
