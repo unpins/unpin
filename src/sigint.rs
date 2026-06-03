@@ -35,7 +35,16 @@ pub fn install() {
             let _ = std::fs::remove_file(&p);
             let _ = std::fs::remove_dir_all(&p);
         }
-        eprintln!("\nunpin: interrupted");
+        // If a live progress block is on screen, its render thread paints the
+        // final frame (finished rows kept, in-progress cleared) and leaves the
+        // cursor on a fresh line; we then print the message. With no live UI we
+        // add a leading newline to break from whatever was on the line. Either
+        // way "interrupted" is printed exactly once, here.
+        if crate::progress::interrupt_freeze() {
+            eprintln!("unpin: interrupted");
+        } else {
+            eprintln!("\nunpin: interrupted");
+        }
         std::process::exit(130);
     });
 }

@@ -8,12 +8,11 @@
 
 use std::io::{self, IsTerminal};
 
-use indicatif::{MultiProgress, ProgressDrawTarget};
-
-use super::prompt::{PromptResult, prompt_pick_with_skip};
+use super::prompt::{PromptResult, plain_pick};
 use crate::ctx::Ctx;
 use crate::github::{self, Asset};
 use crate::platform;
+use crate::progress::human_bytes;
 
 /// True if `key` occurs in `haystack` as a delimited token — not embedded in a
 /// longer alphanumeric run. Every standard release-naming convention writes the
@@ -234,7 +233,7 @@ pub fn pick_asset<'a>(
 /// suppressed rather than printing a misleading "0 B".
 fn asset_label(a: &Asset) -> String {
     if a.size > 0 {
-        format!("{}  ({})", a.name, indicatif::HumanBytes(a.size))
+        format!("{}  ({})", a.name, human_bytes(a.size))
     } else {
         a.name.clone()
     }
@@ -258,8 +257,7 @@ pub(super) fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, Str
         "Available assets"
     };
     let items: Vec<String> = candidates.iter().map(|a| asset_label(a)).collect();
-    let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
-    match prompt_pick_with_skip(&multi, header, &items) {
+    match plain_pick(header, &items) {
         PromptResult::Got(i) => Ok(candidates[i]),
         PromptResult::Skip => Err("no asset selected".into()),
     }

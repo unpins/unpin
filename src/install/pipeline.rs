@@ -14,13 +14,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
-
 use crate::aliases::AliasMode;
 use crate::archive;
 use crate::ctx::Ctx;
-use crate::github::{self, Asset, Release};
+use crate::github::{self, Asset, ByteSink, Release};
 use crate::platform::{self, Paths};
+use crate::progress::{self, Reporter, Ui};
 
 use super::asset::{
     ambiguous_assets_error, fetch_expected_sha256, find_checksum_url, find_companion,
@@ -28,7 +27,7 @@ use super::asset::{
 };
 use super::job::{PipelineMode, PipelineRequest, PrepareOutcome, PromptKind, ResolutionData};
 use super::linker::{LinkSummary, link_all_executables};
-use super::prompt::{PromptResult, prompt_pick_with_skip, prompt_yes_no_with_skip};
+use super::prompt::PromptResult;
 use super::spec::Spec;
 use super::{RepoLock, active_version, fetch_release, prompt_yes_no};
 
@@ -278,44 +277,30 @@ pub fn preflight_extract(
     })
 }
 
-/// Per-download UI handle: which bar to drive, the shared MultiProgress
-/// (for serialized `println` so log lines don't interleave with bar
-/// renders), and the label/flavor used in messages.
-struct ProgressContext<'a> {
-    bar: &'a ProgressBar,
-    multi: &'a MultiProgress,
-    repo: &'a str,
-    is_companion: bool,
+/// Shared counters for the two concurrent legs of one extract. `companion`
+/// carries the companion row's id (to clear/fail it) alongside its counters.
+pub struct DlSinks {
+    pub primary: Arc<dyn ByteSink>,
+    pub companion: Option<(u64, Arc<dyn ByteSink>)>,
 }
 
 /// Orchestrate one ExtractJob: download+extract primary, and (if present)
 /// data companion **concurrently** via `thread::scope`. They write disjoint
 /// subtrees of the same `.part` staging tree (e.g. `bin/` vs `share/`), so
-/// there's no contention. Bars must be pre-added to `multi` on the main
-/// thread (a tick before `multi.add` writes a ghost row to stderr that
-/// lingers in scrollback).
+/// there's no contention.
 ///
-/// Bar finalization split: the **companion** bar is transient and finalized
-/// here (cleared on Ok, red-abandoned on Err) — callers never need to touch
-/// it. The **primary** bar is intentionally left in whatever state download
-/// finished it (100% with the download style, or stopped mid-progress on
-/// error). The caller decides its final state because primary bars in the
-/// pipeline persist across phases (Resolving → Downloading → Linking →
-/// Installed); the legacy single-package `run` path clears it after this
-/// returns via `finalize_primary_bar`.
+/// The **companion** row is transient and finalized here (cleared on Ok,
+/// frozen red on Err) via `ui.finish_companion`. The **primary** row is left
+/// in its download state; the caller decides its final glyph (the pipeline
+/// morphs it through Linking → Installed; the single-package `run` path calls
+/// `Reporter::done_*` / `download_failed`).
 ///
 /// Per-job cleanup (sigint hook + CleanupGuard) is armed against the
 /// `.part` directory and only disarmed once `fs::rename(.part → vdir)`
 /// succeeds. A failed extract — or a process-wide ctrl-c — leaves only
 /// `.part` on disk, so the next `vdir.is_dir()` cache check correctly
 /// classifies the package as not installed.
-pub fn do_extract(
-    ctx: &Ctx,
-    job: &ExtractJob,
-    primary_bar: &ProgressBar,
-    companion_bar: Option<&ProgressBar>,
-    multi: &MultiProgress,
-) -> Result<(), String> {
+pub fn do_extract(ctx: &Ctx, job: &ExtractJob, ui: &Ui, sinks: &DlSinks) -> Result<(), String> {
     let Some(primary_asset) = job.asset.as_ref() else {
         return Ok(()); // cached
     };
@@ -325,28 +310,24 @@ pub fn do_extract(
     let mut guard = CleanupGuard::arm(job.extract_dir.clone());
 
     let repo = job.spec.repo();
-    let primary_ui = ProgressContext {
-        bar: primary_bar,
-        multi,
-        repo: &repo,
-        is_companion: false,
-    };
-    let result = if let (Some(companion), Some(cbar)) = (job.companion.as_ref(), companion_bar) {
-        let companion_ui = ProgressContext {
-            bar: cbar,
-            multi,
-            repo: &repo,
-            is_companion: true,
-        };
+    let result = if let (Some(companion), Some((cid, csink))) =
+        (job.companion.as_ref(), sinks.companion.as_ref())
+    {
         // Run primary + companion in parallel. They write disjoint subtrees
         // (bin/ vs share/), so there's no contention; the join below
         // propagates the first error. CleanupGuard wipes the .part dir for
-        // a clean retry.
+        // a clean retry. Each leg gets its own `Ui` clone — the live handle's
+        // mpsc sender is `Send` but not `Sync`, so the two scoped threads
+        // can't share a borrow of it.
+        let (ui_p, ui_c) = (ui.clone(), ui.clone());
         let (r_prim, r_comp) = thread::scope(|s| {
             let h_prim = s.spawn(|| {
                 download_extract_verify(
                     ctx,
-                    &primary_ui,
+                    &ui_p,
+                    &repo,
+                    false,
+                    &sinks.primary,
                     primary_asset,
                     job.expected_sha256.as_deref(),
                     &job.extract_dir,
@@ -355,7 +336,10 @@ pub fn do_extract(
             let h_comp = s.spawn(|| {
                 download_extract_verify(
                     ctx,
-                    &companion_ui,
+                    &ui_c,
+                    &repo,
+                    true,
+                    csink,
                     companion,
                     job.companion_expected_sha256.as_deref(),
                     &job.extract_dir,
@@ -363,20 +347,16 @@ pub fn do_extract(
             });
             (h_prim.join().unwrap(), h_comp.join().unwrap())
         });
-        // Companion bar is transient — finalize before returning.
-        match &r_comp {
-            Ok(()) => cbar.finish_and_clear(),
-            Err(e) => {
-                cbar.set_style(github::download_error_style());
-                cbar.set_message(e.clone());
-                cbar.abandon();
-            }
-        }
+        // Companion row is transient — clear on success, freeze red on error.
+        ui.finish_companion(*cid, r_comp.clone());
         r_prim.and(r_comp)
     } else {
         download_extract_verify(
             ctx,
-            &primary_ui,
+            ui,
+            &repo,
+            false,
+            &sinks.primary,
             primary_asset,
             job.expected_sha256.as_deref(),
             &job.extract_dir,
@@ -403,31 +383,31 @@ pub fn do_extract(
     result
 }
 
-/// One download → extract → verify step against a single bar. The caller
-/// pre-adds the bar to a shared `MultiProgress`. **Bar finalization is the
-/// caller's responsibility** — this function only drives byte progress and
-/// returns the result. (`do_extract` finalizes the companion bar; the
-/// primary bar is left for the outer pipeline to morph through Linking →
-/// Installed.) The vdir is shared between primary and companion calls —
-/// both tar streams write disjoint subtrees, so concurrent invocations
-/// are safe.
+/// One download → extract → verify step against one [`ByteSink`]. **Row
+/// finalization is the caller's responsibility** — this only drives byte
+/// progress and returns the result. (`do_extract` finalizes the companion
+/// row; the primary row is left for the outer pipeline to morph through
+/// Linking → Installed.) The vdir is shared between primary and companion
+/// calls — both tar streams write disjoint subtrees, so concurrent
+/// invocations are safe.
+#[allow(clippy::too_many_arguments)]
 fn download_extract_verify(
     ctx: &Ctx,
-    ui: &ProgressContext,
+    ui: &Ui,
+    repo: &str,
+    is_companion: bool,
+    sink: &Arc<dyn ByteSink>,
     asset: &Asset,
     expected_sha256: Option<&str>,
     vdir: &Path,
 ) -> Result<(), String> {
     if ctx.verbose {
-        // multi.println serializes with the bar render loop — avoids
-        // interleaving on a TTY. In non-TTY mode (hidden draw target)
-        // this is a no-op; api_get URLs from Phase A still print via
-        // eprintln, so the user sees what was resolved even when piping.
-        let _ = ui
-            .multi
-            .println(format!("  GET {}", asset.browser_download_url));
+        // ui.log scrolls above the live block. In non-TTY mode the render
+        // thread drops it; api_get URLs from Phase A still print via eprintln,
+        // so the user sees what was resolved even when piping.
+        ui.println(format!("  GET {}", asset.browser_download_url));
     }
-    let stream = github::download_stream_into(ctx, &asset.browser_download_url, ui.bar)?;
+    let stream = github::download_stream_into(ctx, &asset.browser_download_url, sink.clone())?;
     // Capture expected length before wrapping. Server Content-Length is
     // authoritative; fall back to `Asset.size` from the API when the CDN
     // omits the header, so truncation still gets caught even on
@@ -441,7 +421,7 @@ fn download_extract_verify(
     // the byte count and the hash reflect the whole response regardless
     // of which path was taken — cheap insurance for future formats.
     let _ = io::copy(&mut hashing, &mut io::sink());
-    let got_bytes = ui.bar.position();
+    let got_bytes = sink.loaded();
     let got = hashing.finalize_hex();
     if let Some(expected) = expected_sha256 {
         if !got.eq_ignore_ascii_case(expected) {
@@ -450,12 +430,8 @@ fn download_extract_verify(
                 asset.name
             ));
         }
-        let suffix = if ui.is_companion { " (data)" } else { "" };
-        let _ = ui.multi.println(format!(
-            "  verified {}{suffix}  ({})",
-            ui.repo,
-            &expected[..16]
-        ));
+        let suffix = if is_companion { " (data)" } else { "" };
+        ui.println(format!("  verified {repo}{suffix}  ({})", &expected[..16]));
     } else if let Some(total) = content_length
         && got_bytes != total
     {
@@ -471,19 +447,19 @@ fn download_extract_verify(
     Ok(())
 }
 
-/// Apply the legacy "primary bar finalize" policy to one bar based on a
-/// completed extract result: clear-on-success, red-abandon-on-error. Used
-/// by `mod.rs::run` (the single-package exec path); `run_pipeline_v2`
-/// manages the primary bar directly so it can transition into the
-/// Linking/Installed state instead of being cleared.
-pub(super) fn finalize_primary_bar(bar: &ProgressBar, result: &Result<(), String>) {
+/// Finalize the single-package `run` download row from its extract result:
+/// clear on success (the row vanishes; the binary then runs), or freeze it as
+/// a red bar at the failure point on error. The pipeline manages its primary
+/// rows directly so they can transition into Linking/Installed instead.
+pub(super) fn finalize_primary_row(
+    reporter: &Reporter,
+    idx: usize,
+    bytes: Arc<progress::RowBytes>,
+    result: &Result<(), String>,
+) {
     match result {
-        Ok(()) => bar.finish_and_clear(),
-        Err(e) => {
-            bar.set_style(github::download_error_style());
-            bar.set_message(e.clone());
-            bar.abandon();
-        }
+        Ok(()) => reporter.clear(idx),
+        Err(e) => reporter.download_failed(idx, bytes, e.clone()),
     }
 }
 
@@ -603,32 +579,15 @@ pub fn run_pipeline_v2(
     mut errors: Vec<String>,
 ) -> Result<(), String> {
     if requests.is_empty() {
-        return finalize_errors(errors);
+        // No live block ever starts here, so any carried-in errors must be
+        // spelled out.
+        return finalize_errors(errors, false);
     }
 
-    let is_tty = io::stderr().is_terminal();
-    let multi = if is_tty {
-        MultiProgress::new()
-    } else {
-        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
-    };
-
-    // One persistent bar per request. Pre-add on the main thread BEFORE any
-    // styling/messaging — a tick before `multi.add` writes a ghost row to
-    // stderr that lingers in scrollback.
-    let bars: Vec<ProgressBar> = requests
-        .iter()
-        .map(|req| {
-            let pb = multi.add(ProgressBar::new(0));
-            pb.set_style(github::idle_style());
-            pb.set_prefix(req.label.clone());
-            pb.set_message("Queued");
-            // Steady tick so the spinner actually animates during the
-            // network-bound resolving/linking phases.
-            pb.enable_steady_tick(std::time::Duration::from_millis(100));
-            pb
-        })
-        .collect();
+    // One render thread owns the whole live block; every row starts Queued.
+    let prefixes: Vec<String> = requests.iter().map(|r| r.label.clone()).collect();
+    let (reporter, handle) = progress::start(prefixes);
+    let ui = Ui::Live(reporter.clone());
 
     let n_workers = pick_jobs(opts.jobs, requests.len());
 
@@ -655,15 +614,15 @@ pub fn run_pipeline_v2(
         for _ in 0..n_workers {
             let work_rx = Arc::clone(&work_rx);
             let prepared_tx = prepared_tx.clone();
-            let bars = &bars;
             let requests = &requests;
+            let reporter = reporter.clone();
             s.spawn(move || {
                 loop {
                     let idx = match work_rx.lock().unwrap().recv() {
                         Ok(i) => i,
                         Err(_) => break,
                     };
-                    bars[idx].set_message("Resolving release...");
+                    reporter.working(idx, "Resolving release...");
                     let outcome = preflight_resolve(ctx, &requests[idx].spec, mode, opts);
                     let _ = prepared_tx.send((idx, outcome));
                 }
@@ -675,34 +634,35 @@ pub fn run_pipeline_v2(
         for _ in 0..n_workers {
             let extract_rx = Arc::clone(&extract_rx);
             let extract_done_tx = extract_done_tx.clone();
-            let bars = &bars;
-            let multi_ref = &multi;
+            let reporter = reporter.clone();
+            let ui = ui.clone();
             s.spawn(move || {
                 loop {
                     let (idx, job) = match extract_rx.lock().unwrap().recv() {
                         Ok(p) => p,
                         Err(_) => break,
                     };
-                    let pb = &bars[idx];
-                    // Style the persistent bar for the download phase.
-                    if let Some(asset) = job.asset.as_ref() {
-                        pb.set_style(github::download_progress_style());
-                        pb.set_prefix(format!("{} {}", job.spec.name, job.release.tag_name));
-                        pb.set_position(0);
-                        if asset.size > 0 {
-                            pb.set_length(asset.size);
+                    // Switch the row to a live download (+ a transient
+                    // companion row) and hand the shared counters to the
+                    // download. Cached jobs never reach the extract pool.
+                    let sinks = if let Some(asset) = job.asset.as_ref() {
+                        let prefix = format!("{} {}", job.spec.name, job.release.tag_name);
+                        let primary: Arc<dyn ByteSink> =
+                            reporter.start_download(idx, prefix, asset.size);
+                        let companion = job.companion.as_ref().map(|c| {
+                            let cprefix =
+                                format!("{} {} (data)", job.spec.name, job.release.tag_name);
+                            let (cid, csink) = reporter.add_companion(cprefix, c.size);
+                            (cid, csink as Arc<dyn ByteSink>)
+                        });
+                        DlSinks { primary, companion }
+                    } else {
+                        DlSinks {
+                            primary: Arc::new(github::NoopSink),
+                            companion: None,
                         }
-                    }
-                    let cbar = job.companion.as_ref().map(|companion| {
-                        let cb = multi_ref.add(ProgressBar::new(0));
-                        cb.set_style(github::download_progress_style());
-                        cb.set_prefix(format!("{} {} (data)", job.spec.name, job.release.tag_name));
-                        if companion.size > 0 {
-                            cb.set_length(companion.size);
-                        }
-                        cb
-                    });
-                    let result = do_extract(ctx, &job, pb, cbar.as_ref(), multi_ref);
+                    };
+                    let result = do_extract(ctx, &job, &ui, &sinks);
                     let _ = extract_done_tx.send((idx, job, result));
                 }
             });
@@ -710,41 +670,56 @@ pub fn run_pipeline_v2(
         drop(extract_done_tx);
 
         // ---- Dispatcher (main thread) ----
-        // Phase 1: consume preflight outcomes. May prompt (multi.suspend).
-        // Sends Ready jobs to extract pool; cached jobs link inline; up-to-
-        // date / failed packages finalize their bars and skip extract.
+        // Phase 1: consume preflight outcomes. May prompt (rendered below the
+        // bars). Sends Ready jobs to extract pool; cached jobs link inline;
+        // up-to-date / failed packages finalize their rows and skip extract.
         for (idx, outcome) in prepared_rx {
             let request = &requests[idx];
-            let pb = &bars[idx];
             match outcome {
                 Err(e) => {
-                    mark_failed(pb, &e);
+                    reporter.done_fail(idx, e.clone());
                     errors.push(format!("unpin: {}: {e}", request.label));
                 }
                 Ok(outcome) => {
-                    match finalize_resolution(ctx, &request.spec, outcome, opts, mode, &multi, pb) {
+                    match finalize_resolution(
+                        ctx,
+                        &request.spec,
+                        outcome,
+                        opts,
+                        mode,
+                        &ui,
+                        &reporter,
+                        idx,
+                    ) {
                         Ok(Resolved::UpToDate(tag)) => {
-                            pb.set_style(github::done_skip_style());
-                            pb.finish_with_message(format!("Up to date ({tag})"));
+                            reporter.done_skip(idx, format!("Up to date ({tag})"));
                         }
                         Ok(Resolved::Skipped(reason)) => {
                             // User-driven skip (typed `s` or non-TTY at a
-                            // prompt). Non-fatal: bar shows ⊘ but the
-                            // process exit code is unaffected.
-                            pb.set_style(github::done_skip_style());
-                            pb.finish_with_message(format!("Skipped: {reason}"));
+                            // prompt). Non-fatal: row shows ⊘ but the process
+                            // exit code is unaffected.
+                            reporter.done_skip(idx, format!("Skipped: {reason}"));
                         }
                         Ok(Resolved::Cached(job)) => {
                             // No transient "Using cached" message — link_on_main
-                            // immediately morphs the bar to "Linking..." and the
+                            // immediately morphs the row to "Linking..." and the
                             // intermediate state would just flicker.
-                            link_on_main(&ctx.paths, opts, request, pb, &multi, job, &mut errors);
+                            link_on_main(
+                                &ctx.paths,
+                                opts,
+                                request,
+                                &reporter,
+                                idx,
+                                &ui,
+                                job,
+                                &mut errors,
+                            );
                         }
                         Ok(Resolved::Ready(job)) => {
                             let _ = extract_tx.send((idx, job));
                         }
                         Err(e) => {
-                            mark_failed(pb, &e);
+                            reporter.done_fail(idx, e.clone());
                             errors.push(format!("unpin: {}: {e}", request.label));
                         }
                     }
@@ -760,19 +735,29 @@ pub fn run_pipeline_v2(
         // (overwrite confirmations in linker.rs).
         for (idx, job, result) in extract_done_rx {
             let request = &requests[idx];
-            let pb = &bars[idx];
             match result {
-                Ok(()) => link_on_main(&ctx.paths, opts, request, pb, &multi, job, &mut errors),
+                Ok(()) => link_on_main(
+                    &ctx.paths,
+                    opts,
+                    request,
+                    &reporter,
+                    idx,
+                    &ui,
+                    job,
+                    &mut errors,
+                ),
                 Err(e) => {
-                    pb.set_style(github::done_fail_style());
-                    pb.finish_with_message(e.clone());
+                    reporter.done_fail(idx, e.clone());
                     errors.push(format!("unpin: {}: {e}", request.label));
                 }
             }
         }
     });
 
-    finalize_errors(errors)
+    handle.finish();
+    // The live block drew a row per package only on a TTY; there it already
+    // showed each failure, so suppress the redundant trailing dump.
+    finalize_errors(errors, io::stderr().is_terminal())
 }
 
 /// Run the link phase for one job on the main thread. Called both for
@@ -780,29 +765,31 @@ pub fn run_pipeline_v2(
 /// completed via the extract pool. Linker prompts (overwrite-link,
 /// alias-ask) go through `multi.suspend` so the persistent bars don't
 /// tear when the linker reads stdin.
+#[allow(clippy::too_many_arguments)]
 fn link_on_main(
     paths: &Paths,
     opts: &InstallOptions,
     request: &PipelineRequest,
-    pb: &ProgressBar,
-    multi: &MultiProgress,
+    reporter: &Reporter,
+    idx: usize,
+    ui: &Ui,
     job: ExtractJob,
     errors: &mut Vec<String>,
 ) {
-    pb.set_style(github::idle_style());
-    pb.set_prefix(request.label.clone());
-    pb.set_message("Linking...");
+    // Reset the row from the download prefix back to the owner/repo label.
+    reporter.set_prefix(idx, request.label.clone());
+    reporter.working(idx, "Linking...");
     // Serialize all bin_dir writes across processes. The per-repo lock in
     // job._lock only covers this package's repo_dir; bin_dir is shared, so
     // another `unpin` linking a *different* package would otherwise race here.
     // Acquired after the repo lock (held since preflight) — order is always
     // repo → links — so it can't deadlock against another process.
     let _links = match platform::acquire_links_lock(&paths.data, || {
-        let _ = multi.println("Waiting for another unpin process to finish updating links...");
+        ui.println("Waiting for another unpin process to finish updating links...");
     }) {
         Ok(l) => l,
         Err(e) => {
-            mark_failed(pb, &e);
+            mark_failed(reporter, idx, &e);
             errors.push(format!("unpin: {}: {e}", request.label));
             return;
         }
@@ -812,25 +799,34 @@ fn link_on_main(
     // "Updated v1 → v2" instead of just "Installed v2" on an upgrade.
     // A fresh install gets `None` here and falls back to "Installed".
     let previous = active_version(paths, &job.spec.owner, &job.spec.name);
+    // A fresh download (asset present) whose `.sha256` sidecar was absent ran
+    // without integrity verification. Surface that on the row itself — yellow
+    // ⚠ "… (unverified)" — instead of a separate warning line.
+    let unverified = (job.asset.is_some() && job.expected_sha256.is_none())
+        || (job.companion.is_some() && job.companion_expected_sha256.is_none());
     match link_all_executables(
         paths,
-        multi,
+        ui,
         &job.spec,
         &job.vdir,
         opts.assume_yes,
         opts.alias_mode,
     ) {
         Ok(summary) => {
-            pb.set_style(github::done_ok_style());
-            pb.finish_with_message(install_summary_message(
+            let msg = install_summary_message(
                 previous.as_deref(),
                 &job.release.tag_name,
                 &job.spec.name,
                 &summary,
-            ));
+            );
+            if unverified {
+                reporter.done_warn(idx, format!("{msg} (unverified)"));
+            } else {
+                reporter.done_ok(idx, msg);
+            }
         }
         Err(e) => {
-            mark_failed(pb, &e);
+            mark_failed(reporter, idx, &e);
             errors.push(format!("unpin: {}: {e}", request.label));
         }
     }
@@ -943,19 +939,21 @@ fn preflight_resolve(
 /// needed, acquire the lock when transitioning to a real extract, build the
 /// `ExtractJob`. Runs on the main thread (the only place prompts and lock
 /// acquisition are allowed).
+#[allow(clippy::too_many_arguments)]
 fn finalize_resolution(
     ctx: &Ctx,
     spec: &Spec,
     outcome: PrepareOutcome,
     opts: &InstallOptions,
     mode: PipelineMode,
-    multi: &MultiProgress,
-    pb: &ProgressBar,
+    ui: &Ui,
+    reporter: &Reporter,
+    idx: usize,
 ) -> Result<Resolved, String> {
     match outcome {
         PrepareOutcome::UpToDate(release) => Ok(Resolved::UpToDate(release.tag_name)),
         PrepareOutcome::Cached(release) => {
-            match check_replace_active(&ctx.paths, spec, &release.tag_name, mode, opts, multi) {
+            match check_replace_active(&ctx.paths, spec, &release.tag_name, mode, opts, ui) {
                 ReplaceDecision::Proceed => {}
                 ReplaceDecision::Skip(reason) => return Ok(Resolved::Skipped(reason)),
             }
@@ -978,17 +976,16 @@ fn finalize_resolution(
             }))
         }
         PrepareOutcome::Ready(data) => {
-            match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, multi)
-            {
+            match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, ui) {
                 ReplaceDecision::Proceed => {}
                 ReplaceDecision::Skip(reason) => return Ok(Resolved::Skipped(reason)),
             }
-            pb.set_message("Preparing...");
+            reporter.working(idx, "Preparing...");
             let job = into_extract_job(&ctx.paths, spec.clone(), *data)?;
             Ok(Resolved::Ready(job))
         }
         PrepareOutcome::NeedsPrompt(kind, mut data) => {
-            pb.set_message("Waiting for input...");
+            reporter.working(idx, "Waiting for input...");
             match kind {
                 PromptKind::AssetPicker => {
                     let items: Vec<String> = data
@@ -996,7 +993,7 @@ fn finalize_resolution(
                         .iter()
                         .map(|a| {
                             if a.size > 0 {
-                                format!("{} ({})", a.name, indicatif::HumanBytes(a.size))
+                                format!("{} ({})", a.name, progress::human_bytes(a.size))
                             } else {
                                 a.name.clone()
                             }
@@ -1018,7 +1015,7 @@ fn finalize_resolution(
                             data.candidates.iter().map(|a| a.name.clone()).collect();
                         return Err(ambiguous_assets_error(&names));
                     }
-                    let chosen_idx = match prompt_pick_with_skip(multi, header, &items) {
+                    let chosen_idx = match ui.prompt_pick(header, &items) {
                         PromptResult::Got(i) => i,
                         PromptResult::Skip => {
                             return Ok(Resolved::Skipped("asset picker skipped".into()));
@@ -1060,17 +1057,7 @@ fn finalize_resolution(
             // Cascade: handle missing-checksum prompts now (possibly fresh
             // from the picker resolution).
             if data.primary_checksum_missing {
-                let asset_name = data
-                    .asset
-                    .as_ref()
-                    .map(|a| a.name.clone())
-                    .unwrap_or_default();
-                match resolve_missing_checksum_prompt(
-                    multi,
-                    &asset_name,
-                    ChecksumKind::Primary,
-                    opts.assume_yes,
-                ) {
+                match resolve_missing_checksum_prompt(ui, ChecksumKind::Primary, opts.assume_yes) {
                     PromptResult::Got(true) => {}
                     PromptResult::Got(false) => {
                         return Err("aborted: missing checksum".into());
@@ -1082,17 +1069,8 @@ fn finalize_resolution(
                 data.primary_checksum_missing = false;
             }
             if data.companion_checksum_missing {
-                let cname = data
-                    .companion
-                    .as_ref()
-                    .map(|c| c.name.clone())
-                    .unwrap_or_default();
-                match resolve_missing_checksum_prompt(
-                    multi,
-                    &cname,
-                    ChecksumKind::Companion,
-                    opts.assume_yes,
-                ) {
+                match resolve_missing_checksum_prompt(ui, ChecksumKind::Companion, opts.assume_yes)
+                {
                     PromptResult::Got(true) => {}
                     PromptResult::Got(false) => {
                         return Err("aborted: missing companion checksum".into());
@@ -1105,12 +1083,11 @@ fn finalize_resolution(
                 }
                 data.companion_checksum_missing = false;
             }
-            match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, multi)
-            {
+            match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, ui) {
                 ReplaceDecision::Proceed => {}
                 ReplaceDecision::Skip(reason) => return Ok(Resolved::Skipped(reason)),
             }
-            pb.set_message("Preparing...");
+            reporter.working(idx, "Preparing...");
             let job = into_extract_job(&ctx.paths, spec.clone(), *data)?;
             Ok(Resolved::Ready(job))
         }
@@ -1141,7 +1118,7 @@ fn check_replace_active(
     requested_tag: &str,
     mode: PipelineMode,
     opts: &InstallOptions,
-    multi: &MultiProgress,
+    ui: &Ui,
 ) -> ReplaceDecision {
     if mode != PipelineMode::Install || opts.assume_yes {
         return ReplaceDecision::Proceed;
@@ -1157,7 +1134,7 @@ fn check_replace_active(
         "{}/{} {current} is already installed. Replace with {requested_tag}?",
         spec.owner, spec.name
     );
-    match prompt_yes_no_with_skip(multi, &question) {
+    match ui.prompt_yes_no(&question) {
         PromptResult::Got(true) => ReplaceDecision::Proceed,
         PromptResult::Got(false) | PromptResult::Skip => ReplaceDecision::Skip(format!(
             "kept {current} (use --yes to replace with {requested_tag})"
@@ -1191,34 +1168,29 @@ fn into_extract_job(paths: &Paths, spec: Spec, data: ResolutionData) -> Result<E
 /// to abort the install with a hard error, or `Skip` (user typed `s` or
 /// stdin is non-TTY) to mark the package as skipped — non-fatal.
 fn resolve_missing_checksum_prompt(
-    multi: &MultiProgress,
-    asset_name: &str,
+    ui: &Ui,
     kind: ChecksumKind,
     assume_yes: bool,
 ) -> PromptResult<bool> {
-    let (data_tag, question) = match kind {
-        ChecksumKind::Primary => (
-            "",
-            "No SHA-256 checksum found. Continue without verification?",
-        ),
-        ChecksumKind::Companion => (
-            " (data)",
-            "Data companion has no SHA-256 checksum. Continue without verification?",
-        ),
-    };
     if assume_yes {
-        eprintln!(
-            "warning: no SHA-256 checksum published for {asset_name}{data_tag}; downloading without verification"
-        );
+        // No separate warning line under -y: the missing-checksum fact is
+        // folded into the package's final row instead (yellow ⚠
+        // "… (unverified)"), so the live block stays one clean line per package.
         return PromptResult::Got(true);
     }
-    prompt_yes_no_with_skip(multi, question)
+    let question = match kind {
+        ChecksumKind::Primary => "No SHA-256 checksum found. Continue without verification?",
+        ChecksumKind::Companion => {
+            "Data companion has no SHA-256 checksum. Continue without verification?"
+        }
+    };
+    ui.prompt_yes_no(question)
 }
 
 /// Compose the trailing "Installed v1.2.3 (binary names); aliases: ...; note: ..."
-/// message that sits inside the green check-mark bar. Mirrors the multi-line
-/// summary the legacy pipeline printed via `println!`, collapsed onto one
-/// line so it fits an indicatif bar template.
+/// message that sits to the right of the green check-mark. Mirrors the
+/// multi-line summary the legacy pipeline printed via `println!`, collapsed
+/// onto one line so it fits a single progress row.
 ///
 /// `previous` is whatever `active_version` returned just before linking ran
 /// — when it differs from `tag` the verb becomes "Updated prev → tag" so a
@@ -1254,23 +1226,31 @@ fn install_summary_message(
     msg
 }
 
-/// Mark a per-package bar as failed with the given message. Bar is set to
-/// the red ✗ style and finished — it stays on screen so the user sees what
-/// went wrong without scrolling back through the final error summary.
-fn mark_failed(pb: &ProgressBar, msg: &str) {
-    pb.set_style(github::done_fail_style());
-    pb.finish_with_message(msg.to_string());
+/// Mark a per-package row as failed with the given message — the red ✗ state
+/// stays on screen so the user sees what went wrong without scrolling back
+/// through the final error summary.
+fn mark_failed(reporter: &Reporter, idx: usize, msg: &str) {
+    reporter.done_fail(idx, msg.to_string());
 }
 
-fn finalize_errors(errors: Vec<String>) -> Result<(), String> {
+/// Turn the collected per-package failures into the run's exit status.
+///
+/// `rows_shown` is true when the live progress block was on screen (stderr is a
+/// TTY): every failure here was already painted on its own row as a red ✗ with
+/// the same message, so re-dumping them would print each one twice (the bug in
+/// `a.png`). Only spell the errors out when there was no live block — piped
+/// stderr — where the rows were never drawn. Either way `main` prints the
+/// returned `Err` as the single "N operation(s) failed" summary line.
+fn finalize_errors(errors: Vec<String>, rows_shown: bool) -> Result<(), String> {
     if errors.is_empty() {
-        Ok(())
-    } else {
+        return Ok(());
+    }
+    if !rows_shown {
         for err in &errors {
             eprintln!("{err}");
         }
-        Err(format!("{} operation(s) failed", errors.len()))
     }
+    Err(format!("{} operation(s) failed", errors.len()))
 }
 
 #[cfg(test)]

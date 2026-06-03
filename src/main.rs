@@ -13,6 +13,7 @@ mod install;
 mod meta;
 mod panic;
 mod platform;
+mod progress;
 mod setup;
 mod sigint;
 
@@ -361,7 +362,9 @@ fn print_auth_footer(config_path: Option<&std::path::Path>) {
         None => println!("Config file: (unresolved: $HOME not set)"),
     }
     println!("  Flat `key = value` with `#` comments. Recognized keys:");
-    println!("    http_timeout = <seconds>   per-request HTTP timeout (default: 30)");
+    println!(
+        "    http_timeout = <seconds>   API request deadline / download idle timeout (default: 30)"
+    );
     println!("    use_gh_auth  = true|false  shell out to `gh auth token` (default: false)");
     println!("    data         = true|false  download per-release data tarball  (default: true)");
     println!("    aliases      = yes|no|ask  install multi-call aliases declared by");

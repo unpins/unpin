@@ -1,9 +1,39 @@
 use std::io::{self, Read};
+use std::sync::Arc;
 
-use indicatif::{ProgressBar, ProgressStyle};
 use nanoserde::DeJson;
 
 use crate::ctx::Ctx;
+
+/// Sink for streaming-download byte progress. Decouples [`download_stream_into`]
+/// from the UI: the live progress thread backs this with shared atomics
+/// (`progress::RowBytes`), while non-UI callers (`download`) use [`NoopSink`].
+pub trait ByteSink: Send + Sync {
+    /// Pre-seeded total hint (e.g. `Asset.size`), or 0 when none is known.
+    fn hint(&self) -> u64;
+    /// Set the authoritative total once `Content-Length` is in.
+    fn set_total(&self, total: u64);
+    /// Mark the total unknown (no header *and* no hint) → spinner mode.
+    fn set_unknown(&self);
+    /// Account `n` freshly-read bytes.
+    fn add(&self, n: u64);
+    /// Total bytes read so far (used for the truncation check).
+    fn loaded(&self) -> u64;
+}
+
+/// Discards all progress — for the buffered, non-streaming [`download`] path.
+pub struct NoopSink;
+impl ByteSink for NoopSink {
+    fn hint(&self) -> u64 {
+        0
+    }
+    fn set_total(&self, _total: u64) {}
+    fn set_unknown(&self) {}
+    fn add(&self, _n: u64) {}
+    fn loaded(&self) -> u64 {
+        0
+    }
+}
 
 const USER_AGENT: &str = concat!("unpin/", env!("CARGO_PKG_VERSION"));
 
@@ -111,9 +141,8 @@ pub fn download(ctx: &Ctx, url: &str) -> Result<Vec<u8>, String> {
     if ctx.verbose {
         eprintln!("  GET {url}");
     }
-    let bar = ProgressBar::hidden();
     let mut buf = Vec::new();
-    let reader = download_stream_into(ctx, url, &bar)?;
+    let reader = download_stream_into(ctx, url, Arc::new(NoopSink))?;
     // take(N+1) so we can detect the "exceeded the cap" case: if the cap fits
     // exactly, take(N) would also succeed and we'd miss the overflow.
     let mut capped = reader.take(DOWNLOAD_CAP_BYTES + 1);
@@ -126,49 +155,44 @@ pub fn download(ctx: &Ctx, url: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// Streaming download against a caller-provided `ProgressBar`. The bar must
-/// already be registered with a `MultiProgress` (or hidden) before this is
-/// called — otherwise indicatif draws standalone stderr lines that stay in
-/// scrollback when the bar is later attached, producing ghost rows.
+/// Streaming download reporting byte progress to a caller-provided [`ByteSink`].
 ///
-/// Once the HTTP response is in, this only sets the length (or, in the rare
-/// `Content-Length`-missing case, swaps to a spinner style). The style itself
-/// is whatever the caller pre-configured.
+/// Once the HTTP response is in, this only resolves the total: the server's
+/// `Content-Length` wins; absent that, a pre-seeded hint (`Asset.size`) is
+/// kept; absent both, the sink is flagged unknown (the UI shows a spinner
+/// instead of a bar).
 pub fn download_stream_into(
     ctx: &Ctx,
     url: &str,
-    bar: &ProgressBar,
+    sink: Arc<dyn ByteSink>,
 ) -> Result<ProgressStream, String> {
     let headers: Vec<(&str, &str)> = vec![("User-Agent", USER_AGENT)];
     // Verbose URL printing happens at the call site — it has the right
-    // serialization context (`MultiProgress::println` in the parallel-worker
-    // path, plain `eprintln!` in serial helpers like `download()`). Logging
-    // here with `eprintln!` would race with bar rendering on a TTY.
+    // serialization context (`Ui::log` in the parallel-worker path, plain
+    // `eprintln!` in serial helpers like `download()`). Logging here would
+    // race with the render thread on a TTY.
     let stream = ctx.http.get_streaming(url, &headers)?;
     if stream.status() < 200 || stream.status() >= 300 {
         return Err(format!("HTTP {} downloading {url}", stream.status()));
     }
-    match (stream.content_length(), bar.length().unwrap_or(0)) {
-        (Some(total), _) => bar.set_length(total),
+    match (stream.content_length(), sink.hint()) {
+        (Some(total), _) => sink.set_total(total),
         // No Content-Length from the server, but the caller pre-seeded a
         // length hint (typically `Asset.size` from the GitHub API). Keep
         // the hint — it's nearly always accurate and gives a real
         // percentage instead of spinner-only progress.
         (None, hint) if hint > 0 => {}
-        (None, _) => {
-            bar.set_style(download_progress_style_unknown());
-            bar.enable_steady_tick(std::time::Duration::from_millis(120));
-        }
+        (None, _) => sink.set_unknown(),
     }
     Ok(ProgressStream {
         inner: stream,
-        bar: bar.clone(),
+        sink,
     })
 }
 
 pub struct ProgressStream {
     inner: Box<dyn crate::http::HttpStream + Send>,
-    bar: ProgressBar,
+    sink: Arc<dyn ByteSink>,
 }
 
 impl ProgressStream {
@@ -184,67 +208,14 @@ impl Read for ProgressStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n > 0 {
-            self.bar.inc(n as u64);
+            self.sink.add(n as u64);
         }
         Ok(n)
     }
 }
 
-// No Drop impl: the caller decides the bar's final state (clear on success,
-// or swap to error style + abandon on failure). Hidden bars (used by
-// `download()`) don't need explicit clearing.
-
-/// Standard progress style for downloads: thin parallelogram bar.
-/// Callers should pad `prefix` themselves so name/tag align across bars.
-pub fn download_progress_style() -> ProgressStyle {
-    // `progress_chars("▰▰▱")`: fill, transition (same glyph → no sub-cell), empty.
-    ProgressStyle::with_template(
-        "  {prefix:.cyan}  {bar:14.green/blue} {percent:>3}%  {bytes:>9}/{total_bytes:<9}  {bytes_per_sec:>10}",
-    )
-    .unwrap()
-    .progress_chars("▰▰▱")
-}
-
-/// Style used when `Content-Length` was not provided. Spinner + bytes + rate, no bar.
-pub fn download_progress_style_unknown() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.cyan}  {spinner} {bytes:>9}  {bytes_per_sec:>10}")
-        .unwrap()
-}
-
-/// Style for a failed download: prefix + red bar (frozen at the failure point)
-/// + the error reason in red. Caller sets the reason via `bar.set_message(...)`.
-pub fn download_error_style() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.red}  {bar:14.red/red} {percent:>3}%  {wide_msg:.red}")
-        .unwrap()
-        .progress_chars("▰▰▱")
-}
-
-/// Spinner-mode style for a per-package bar between phases (Queued/Resolving/
-/// Linking). The prefix is the owner/repo label; `wide_msg` carries the
-/// current state. Uses a steady-tick spinner so the bar visibly "lives" while
-/// the worker is doing network I/O.
-pub fn idle_style() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.cyan}  {spinner:.green}  {wide_msg}").unwrap()
-}
-
-/// Final style for a package that installed/updated successfully. Green
-/// prefix with check mark and a message (typically "Installed v1.2.3
-/// (binaries)"). Drawn once via `finish_with_message` and stays on screen.
-pub fn done_ok_style() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.green}  ✓  {wide_msg:.green}").unwrap()
-}
-
-/// Final style for a package the user opted to skip (typed `s` at a prompt,
-/// or non-TTY auto-skipped). Yellow, non-fatal.
-pub fn done_skip_style() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.yellow}  ⊘  {wide_msg:.yellow}").unwrap()
-}
-
-/// Final style for a package that failed (network, checksum, lock contention,
-/// link conflict). Red — distinguishes a hard failure from a user skip.
-pub fn done_fail_style() -> ProgressStyle {
-    ProgressStyle::with_template("  {prefix:.red}  ✗  {wide_msg:.red}").unwrap()
-}
+// No Drop impl: the row's final state (done/skip/fail glyph) is decided by the
+// pipeline via the `progress::Reporter`, not here.
 
 #[cfg(test)]
 mod tests {

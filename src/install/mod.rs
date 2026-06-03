@@ -2,18 +2,18 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
+use std::sync::Arc;
 
 use crate::ctx::Ctx;
-use crate::github::{self, Release};
+use crate::github::{self, ByteSink, Release};
 use crate::platform::{self, Paths};
+use crate::progress::{self, Ui};
 
 mod asset;
 mod job;
 mod linker;
 mod pipeline;
-mod prompt;
+pub(crate) mod prompt;
 mod spec;
 
 use asset::pick_asset;
@@ -25,8 +25,8 @@ use linker::{
     walk_binary_candidates,
 };
 pub use pipeline::InstallOptions;
-use pipeline::{do_extract, finalize_primary_bar, preflight_extract, run_pipeline_v2};
-use prompt::{PromptResult, prompt_pick_with_skip};
+use pipeline::{do_extract, finalize_primary_row, preflight_extract, run_pipeline_v2};
+use prompt::{PromptResult, plain_pick};
 use spec::validate_path_component;
 pub use spec::{Spec, parse_spec};
 
@@ -278,9 +278,8 @@ pub fn install_many(ctx: &Ctx, opts: &InstallOptions, inputs: &[String]) -> Resu
 ///
 /// Honors the same "prompt nunca falha" contract as the rest of the
 /// pipeline: invalid input retries, `s` (or EOF / non-TTY) skips the whole
-/// colliding group as non-fatal. A hidden `MultiProgress` is passed only to
-/// reuse the shared prompt helper — no bars are active at this point so the
-/// `suspend()` wrap is a no-op.
+/// colliding group as non-fatal. No live bars are active at this point, so the
+/// prompt goes straight to the plain picker.
 fn resolve_argv_version_collisions(
     parsed: Vec<(String, Spec)>,
     assume_yes: bool,
@@ -297,14 +296,6 @@ fn resolve_argv_version_collisions(
             None => groups.push(vec![i]),
         }
     }
-    let has_conflict = groups.iter().any(|g| g.len() > 1);
-    // Lazily build a hidden MultiProgress only when needed — `prompt_pick_with_skip`
-    // requires a reference even though `suspend()` on a hidden target is a no-op.
-    let hidden_multi = if has_conflict && !assume_yes {
-        Some(MultiProgress::with_draw_target(ProgressDrawTarget::hidden()))
-    } else {
-        None
-    };
     let mut keep = vec![true; parsed.len()];
     for group in &groups {
         if group.len() < 2 {
@@ -327,8 +318,7 @@ fn resolve_argv_version_collisions(
                 group.len()
             );
             let items: Vec<String> = group.iter().map(|&i| parsed[i].0.clone()).collect();
-            // Safe to unwrap: has_conflict is true here, so hidden_multi was built.
-            match prompt_pick_with_skip(hidden_multi.as_ref().unwrap(), &header, &items) {
+            match plain_pick(&header, &items) {
                 PromptResult::Got(n) => Some(group[n]),
                 // Skip drops the entire conflicting group from the run.
                 // Non-fatal: other packages in the argv list keep going.
@@ -447,10 +437,9 @@ pub fn link_installed(
 ) -> Result<(), String> {
     let _repo = RepoLock::acquire(&paths.repo_dir(&spec.owner, &spec.name))?;
     let _links = platform::acquire_links_lock(&paths.data, || {})?;
-    let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
     link_all_executables(
         paths,
-        &multi,
+        &Ui::Plain,
         spec,
         vdir,
         assume_yes,
@@ -930,32 +919,26 @@ pub fn run(
     let vdir = job.vdir.clone();
     let needs_download = job.asset.is_some();
     if needs_download {
-        let multi = if io::stderr().is_terminal() {
-            MultiProgress::new()
-        } else {
-            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
-        };
-        // multi.add before set_style/set_prefix — a tick before `multi.add`
-        // writes a ghost row to stderr that lingers in scrollback.
-        let bar = multi.add(ProgressBar::new(0));
-        bar.set_style(github::download_progress_style());
-        bar.set_prefix(format!("{} {}", spec.name, release.tag_name));
-        if let Some(asset) = job.asset.as_ref()
-            && asset.size > 0
-        {
-            bar.set_length(asset.size);
-        }
-        let cbar = job.companion.as_ref().map(|companion| {
-            let cb = multi.add(ProgressBar::new(0));
-            cb.set_style(github::download_progress_style());
-            cb.set_prefix(format!("{} {} (data)", spec.name, release.tag_name));
-            if companion.size > 0 {
-                cb.set_length(companion.size);
-            }
-            cb
+        // A one-row live block for the single package's download (+ a
+        // transient companion row). Cleared on success — the binary runs
+        // next, so no leftover line; frozen red on failure.
+        let prefix = format!("{} {}", spec.name, release.tag_name);
+        let (reporter, handle) = progress::start(vec![prefix.clone()]);
+        let ui = Ui::Live(reporter.clone());
+        let asset_size = job.asset.as_ref().map(|a| a.size).unwrap_or(0);
+        let primary = reporter.start_download(0, prefix, asset_size);
+        let companion = job.companion.as_ref().map(|c| {
+            let cprefix = format!("{} {} (data)", spec.name, release.tag_name);
+            let (cid, csink) = reporter.add_companion(cprefix, c.size);
+            (cid, csink as Arc<dyn ByteSink>)
         });
-        let result = do_extract(ctx, &job, &bar, cbar.as_ref(), &multi);
-        finalize_primary_bar(&bar, &result);
+        let sinks = pipeline::DlSinks {
+            primary: primary.clone(),
+            companion,
+        };
+        let result = do_extract(ctx, &job, &ui, &sinks);
+        finalize_primary_row(&reporter, 0, primary, &result);
+        handle.finish();
         result?;
     } else {
         let has_links = fs::read_dir(&ctx.paths.bin)
@@ -1081,12 +1064,10 @@ fn run_binary(spec: &Spec, vdir: &Path, args: &[String], assume_yes: bool) -> Re
                                 .to_string()
                         })
                         .collect();
-                    // Hidden target: suspend() is a no-op, the prompt still
-                    // reads/writes stderr. Non-TTY (or `-y`) auto-skips, which
-                    // we turn into a hard error — `run` won't execute a binary
-                    // the user never picked.
-                    let hidden = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
-                    match prompt_pick_with_skip(&hidden, &header, &items) {
+                    // No live bars here — the plain picker reads/writes stderr.
+                    // Non-TTY (or `-y`) auto-skips, which we turn into a hard
+                    // error: `run` won't execute a binary the user never picked.
+                    match plain_pick(&header, &items) {
                         PromptResult::Got(n) => executables[n].clone(),
                         PromptResult::Skip => {
                             return Err(format!(

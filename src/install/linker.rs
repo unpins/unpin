@@ -14,13 +14,12 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
-use indicatif::MultiProgress;
-
 use crate::aliases::{self, AliasMode};
 use crate::meta;
 use crate::platform::{self, Paths};
+use crate::progress::Ui;
 
-use super::prompt::{PromptResult, prompt_yes_no_with_skip};
+use super::prompt::PromptResult;
 use super::spec::{CATALOG_OWNER, Spec};
 
 pub fn walk_files(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -191,7 +190,7 @@ fn link_owner_repo(data: &Path, target: &Path) -> Option<String> {
 ///   - foreign unmanaged file → the long-standing overwrite prompt.
 fn classify_slot(
     paths: &Paths,
-    multi: &MultiProgress,
+    ui: &Ui,
     rdir: &Path,
     claimed: &[PathBuf],
     link: &Path,
@@ -231,7 +230,7 @@ fn classify_slot(
                     "{} is provided by {owner}. Replace it with this package?",
                     link.display()
                 );
-                match prompt_yes_no_with_skip(multi, &q) {
+                match ui.prompt_yes_no(&q) {
                     PromptResult::Got(true) => {
                         SlotDecision::Write(Some(format!("replaced {owner}'s `{name}`")))
                     }
@@ -250,10 +249,10 @@ fn classify_slot(
                 "{} already exists and was not installed by unpin. Overwrite?",
                 link.display()
             );
-            match prompt_yes_no_with_skip(multi, &q) {
+            match ui.prompt_yes_no(&q) {
                 PromptResult::Got(true) => SlotDecision::Write(None),
                 PromptResult::Got(false) | PromptResult::Skip => {
-                    let _ = multi.println(format!("Skipped {name}"));
+                    ui.println(format!("Skipped {name}"));
                     SlotDecision::Keep(None)
                 }
             }
@@ -263,7 +262,7 @@ fn classify_slot(
 
 fn link_binary(
     paths: &Paths,
-    multi: &MultiProgress,
+    ui: &Ui,
     rdir: &Path,
     claimed: &[PathBuf],
     target: &Path,
@@ -273,7 +272,7 @@ fn link_binary(
     let parent = link.parent().ok_or("link has no parent")?;
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
 
-    match classify_slot(paths, multi, rdir, claimed, link, assume_yes) {
+    match classify_slot(paths, ui, rdir, claimed, link, assume_yes) {
         SlotDecision::Keep(note) => Ok(LinkResult {
             linked: false,
             note,
@@ -302,7 +301,7 @@ pub struct LinkSummary {
 
 pub fn link_all_executables(
     paths: &Paths,
-    multi: &MultiProgress,
+    ui: &Ui,
     spec: &Spec,
     vdir: &Path,
     assume_yes: bool,
@@ -379,7 +378,7 @@ pub fn link_all_executables(
         let link = bin.join(platform::link_filename(short));
         // `refreshed` doubles as the "claimed this run" set — passing it in
         // lets a second binary detect a name an earlier one already took.
-        let r = link_binary(paths, multi, &rdir, &refreshed, target, &link, assume_yes)?;
+        let r = link_binary(paths, ui, &rdir, &refreshed, target, &link, assume_yes)?;
         if r.linked {
             refreshed.push(link.clone());
             summary.primary.push(short.to_owned());
@@ -393,7 +392,7 @@ pub fn link_all_executables(
         // alias-bearing primaries would just contribute both lists. The
         // catalog-only gate is enforced inside `link_aliases_for`.
         let alias_outcome = link_aliases_for(
-            paths, multi, &rdir, &refreshed, target, spec, alias_mode, assume_yes,
+            paths, ui, &rdir, &refreshed, target, spec, alias_mode, assume_yes,
         )?;
         for a in &alias_outcome.linked {
             refreshed.push(bin.join(platform::alias_link_filename(a)));
@@ -499,7 +498,7 @@ struct AliasOutcome {
 #[allow(clippy::too_many_arguments)]
 fn link_aliases_for(
     paths: &Paths,
-    multi: &MultiProgress,
+    ui: &Ui,
     rdir: &Path,
     claimed: &[PathBuf],
     primary: &Path,
@@ -541,7 +540,7 @@ fn link_aliases_for(
                 spec.repo(),
                 declared.join(", ")
             );
-            match prompt_yes_no_with_skip(multi, &q) {
+            match ui.prompt_yes_no(&q) {
                 PromptResult::Got(true) => true,
                 PromptResult::Got(false) | PromptResult::Skip => false,
             }
@@ -578,7 +577,7 @@ fn link_aliases_for(
     let mut declined: Vec<String> = Vec::new();
     for name in &declared {
         let link_path = bin.join(platform::alias_link_filename(name));
-        let r = link_alias(paths, multi, rdir, claimed, primary, &link_path, assume_yes)?;
+        let r = link_alias(paths, ui, rdir, claimed, primary, &link_path, assume_yes)?;
         if r.linked {
             linked.push(name.clone());
         } else if r.note.is_none() {
@@ -621,7 +620,7 @@ fn link_aliases_for(
 /// clobber).
 fn link_alias(
     paths: &Paths,
-    multi: &MultiProgress,
+    ui: &Ui,
     rdir: &Path,
     claimed: &[PathBuf],
     target: &Path,
@@ -631,7 +630,7 @@ fn link_alias(
     let parent = link.parent().ok_or("alias link has no parent")?;
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
 
-    match classify_slot(paths, multi, rdir, claimed, link, assume_yes) {
+    match classify_slot(paths, ui, rdir, claimed, link, assume_yes) {
         SlotDecision::Keep(note) => Ok(LinkResult {
             linked: false,
             note,
@@ -725,7 +724,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn classify_slot_covers_the_four_cases() {
-        use indicatif::ProgressDrawTarget;
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -738,7 +736,7 @@ mod tests {
             bin: bin.clone(),
             config: tmp.path().join("config"),
         };
-        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let ui = Ui::Plain;
         let rdir = paths.repo_dir("me", "tool");
         let link = bin.join("x");
 
@@ -753,34 +751,27 @@ mod tests {
 
         // 1. Free slot → write.
         assert!(matches!(
-            classify_slot(&paths, &multi, &rdir, &[], &link, true),
+            classify_slot(&paths, &ui, &rdir, &[], &link, true),
             SlotDecision::Write(None)
         ));
 
         // 2. Already claimed this run → keep first, with a note.
         assert!(matches!(
-            classify_slot(
-                &paths,
-                &multi,
-                &rdir,
-                std::slice::from_ref(&link),
-                &link,
-                true
-            ),
+            classify_slot(&paths, &ui, &rdir, std::slice::from_ref(&link), &link, true),
             SlotDecision::Keep(Some(_))
         ));
 
         // 3. Our own previous version → silent overwrite.
         symlink(mk_target("me", "tool"), &link).unwrap();
         assert!(matches!(
-            classify_slot(&paths, &multi, &rdir, &[], &link, true),
+            classify_slot(&paths, &ui, &rdir, &[], &link, true),
             SlotDecision::Write(None)
         ));
         fs::remove_file(&link).unwrap();
 
         // 4. Another package owns it; -y lets the explicit install win + note.
         symlink(mk_target("them", "other"), &link).unwrap();
-        match classify_slot(&paths, &multi, &rdir, &[], &link, true) {
+        match classify_slot(&paths, &ui, &rdir, &[], &link, true) {
             SlotDecision::Write(Some(n)) => assert!(n.contains("them/other"), "note: {n}"),
             d => panic!(
                 "expected cross-package Write(Some), got {:?}",
@@ -792,7 +783,7 @@ mod tests {
         // 5. Foreign file; -y overwrites without a shadow note.
         fs::write(&link, b"foreign").unwrap();
         assert!(matches!(
-            classify_slot(&paths, &multi, &rdir, &[], &link, true),
+            classify_slot(&paths, &ui, &rdir, &[], &link, true),
             SlotDecision::Write(None)
         ));
     }
@@ -804,7 +795,6 @@ mod tests {
         // foo+bar), then v2 which drops bar. After the v2 run every surviving
         // link must point at v2 (no v1 leftover → active_version stays
         // deterministic), and the dropped `bar` must be gone.
-        use indicatif::ProgressDrawTarget;
 
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
@@ -815,7 +805,7 @@ mod tests {
             bin: bin.clone(),
             config: tmp.path().join("config"),
         };
-        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let ui = Ui::Plain;
         let spec = Spec {
             owner: "me".into(),
             name: "tool".into(),
@@ -837,7 +827,7 @@ mod tests {
         };
 
         let v1 = mk_vdir("v1", &["foo", "bar"]);
-        link_all_executables(&paths, &multi, &spec, &v1, true, AliasMode::No).unwrap();
+        link_all_executables(&paths, &ui, &spec, &v1, true, AliasMode::No).unwrap();
         assert!(bin.join("foo").exists() && bin.join("bar").exists());
         assert!(
             platform::read_link(&bin.join("foo"))
@@ -846,8 +836,7 @@ mod tests {
         );
 
         let v2 = mk_vdir("v2", &["foo"]);
-        let summary =
-            link_all_executables(&paths, &multi, &spec, &v2, true, AliasMode::No).unwrap();
+        let summary = link_all_executables(&paths, &ui, &spec, &v2, true, AliasMode::No).unwrap();
 
         // foo repointed to v2, no v1 link survives, bar (dropped) removed.
         let foo_target = platform::read_link(&bin.join("foo")).unwrap();
