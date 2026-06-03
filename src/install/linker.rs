@@ -111,10 +111,14 @@ pub fn ensure_executable(p: &Path) -> Result<(), String> {
     platform::ensure_executable(p)
 }
 
-/// Strip trailing target-triple markers from a binary filename. Useful when
-/// projects ship `tool-x86_64-linux-musl` and we want the link to be `tool`.
-/// On Windows the `.exe` suffix is stripped first.
-fn short_binary_name(name: &str) -> &str {
+/// Reduce a release binary's on-disk filename to the command name to put on
+/// PATH: drop the platform triple, then the release version that the common
+/// `<name>-<version>-<arch>-<os>` bare-binary asset convention bakes in.
+/// `version` is the release tag (a leading `v` is ignored); pass `""` to skip
+/// version stripping.
+///
+/// `htop-3.4.1-1-x86_64-linux` + version `v3.4.1-1` → `htop`.
+fn short_binary_name<'a>(name: &'a str, version: &str) -> &'a str {
     #[cfg(windows)]
     let name = name.strip_suffix(".exe").unwrap_or(name);
     const MARKERS: &[&str] = &[
@@ -129,10 +133,22 @@ fn short_binary_name(name: &str) -> &str {
             earliest = Some(earliest.map_or(i, |e| e.min(i)));
         }
     }
-    match earliest {
+    let base = match earliest {
         Some(i) if i > 0 => &name[..i],
         _ => name,
+    };
+    // After the triple is gone the version may still trail (`htop-3.4.1-1`).
+    // Strip it only when it's exactly the release tag — no semver guessing, so
+    // an unrelated trailing number is left alone.
+    let version = version.strip_prefix('v').unwrap_or(version);
+    if !version.is_empty()
+        && let Some(head) = base.strip_suffix(version)
+        && let Some(stripped) = head.strip_suffix(['-', '_'])
+        && !stripped.is_empty()
+    {
+        return stripped;
     }
+    base
 }
 
 /// Outcome of a single link/alias create attempt. `note`, when set, is a
@@ -345,6 +361,9 @@ pub fn link_all_executables(
     }
 
     let mut summary = LinkSummary::default();
+    // The version dir's name is the release tag — used to peel a baked-in
+    // version off bare-binary asset names (`htop-3.4.1-1-...` → `htop`).
+    let version = vdir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let mut refreshed: Vec<PathBuf> = Vec::new();
     // Names the new version declared and attempted to link, across all
     // primaries. The Windows alias sweep below consults this so it never
@@ -356,7 +375,7 @@ pub fn link_all_executables(
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or("non-utf8 binary name")?;
-        let short = short_binary_name(basename);
+        let short = short_binary_name(basename, version);
         let link = bin.join(platform::link_filename(short));
         // `refreshed` doubles as the "claimed this run" set — passing it in
         // lets a second binary detect a name an earlier one already took.
@@ -842,35 +861,56 @@ mod tests {
 
     #[test]
     fn short_name_strips_target_triple_suffix() {
-        assert_eq!(short_binary_name("rg-x86_64-linux-musl"), "rg");
-        assert_eq!(short_binary_name("tool_x86_64-linux"), "tool");
-        assert_eq!(short_binary_name("fd-aarch64-apple-darwin"), "fd");
+        assert_eq!(short_binary_name("rg-x86_64-linux-musl", ""), "rg");
+        assert_eq!(short_binary_name("tool_x86_64-linux", ""), "tool");
+        assert_eq!(short_binary_name("fd-aarch64-apple-darwin", ""), "fd");
     }
 
     #[test]
     fn short_name_strips_pc_marker() {
-        assert_eq!(short_binary_name("rg-x86_64-pc-linux-gnu"), "rg");
+        assert_eq!(short_binary_name("rg-x86_64-pc-linux-gnu", ""), "rg");
     }
 
     #[test]
     fn short_name_keeps_simple_names() {
-        assert_eq!(short_binary_name("rg"), "rg");
-        assert_eq!(short_binary_name("jq"), "jq");
+        assert_eq!(short_binary_name("rg", ""), "rg");
+        assert_eq!(short_binary_name("jq", ""), "jq");
     }
 
     #[test]
     fn short_name_strips_exe_on_windows_first() {
         #[cfg(unix)]
-        assert_eq!(short_binary_name("rg.exe"), "rg.exe");
+        assert_eq!(short_binary_name("rg.exe", ""), "rg.exe");
         #[cfg(windows)]
-        assert_eq!(short_binary_name("rg.exe"), "rg");
+        assert_eq!(short_binary_name("rg.exe", ""), "rg");
         #[cfg(windows)]
-        assert_eq!(short_binary_name("rg-x86_64-pc-windows-gnu.exe"), "rg");
+        assert_eq!(short_binary_name("rg-x86_64-pc-windows-gnu.exe", ""), "rg");
     }
 
     #[test]
     fn short_name_first_marker_wins() {
-        assert_eq!(short_binary_name("rg-linux-amd64"), "rg");
+        assert_eq!(short_binary_name("rg-linux-amd64", ""), "rg");
+    }
+
+    #[test]
+    fn short_name_strips_release_version_after_triple() {
+        // Bare-binary assets bake the version in: <name>-<version>-<arch>-<os>.
+        assert_eq!(
+            short_binary_name("htop-3.4.1-1-x86_64-linux", "v3.4.1-1"),
+            "htop"
+        );
+        // The leading `v` on the tag is optional.
+        assert_eq!(
+            short_binary_name("htop-3.4.1-1-x86_64-linux", "3.4.1-1"),
+            "htop"
+        );
+        // Only the exact tag is stripped — an unrelated trailing number stays.
+        assert_eq!(
+            short_binary_name("tool-1.2-x86_64-linux", "9.9"),
+            "tool-1.2"
+        );
+        // No version embedded (tarball ships `bin/htop`) → unchanged.
+        assert_eq!(short_binary_name("htop", "3.4.1-1"), "htop");
     }
 
     #[test]

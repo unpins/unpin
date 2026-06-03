@@ -946,6 +946,7 @@ fn link_on_main(
             pb.finish_with_message(install_summary_message(
                 previous.as_deref(),
                 &job.release.tag_name,
+                &job.spec.name,
                 &summary,
             ));
         }
@@ -1345,12 +1346,22 @@ fn resolve_missing_checksum_prompt(
 /// version bump shows the upgrade direction inline on the bar. Same-tag
 /// (cached or replace-active no-op) and fresh installs (`previous == None`)
 /// keep reading as "Installed tag".
-fn install_summary_message(previous: Option<&str>, tag: &str, summary: &LinkSummary) -> String {
+fn install_summary_message(
+    previous: Option<&str>,
+    tag: &str,
+    name: &str,
+    summary: &LinkSummary,
+) -> String {
     let verb_phrase = match previous {
         Some(prev) if prev != tag => format!("Updated {prev} → {tag}"),
         _ => format!("Installed {tag}"),
     };
-    let mut msg = if summary.primary.is_empty() {
+    // The `(binaries)` tail tells the user which commands landed on PATH — worth
+    // showing when they differ from the package name (`coreutils` → `ls, cat`),
+    // but pure noise when the lone binary *is* the package name (already in the
+    // bar's prefix). Drop it in that case.
+    let redundant = summary.primary == [name];
+    let mut msg = if summary.primary.is_empty() || redundant {
         verb_phrase
     } else {
         format!("{verb_phrase} ({})", summary.primary.join(", "))
