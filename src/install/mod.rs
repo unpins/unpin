@@ -455,14 +455,33 @@ pub fn uninstall_many(paths: &Paths, names: &[String], assume_yes: bool) -> Resu
             println!("No packages installed");
             return Ok(());
         }
+        // unpin self-installs as a managed package, so a bare `uninstall`
+        // sweeps it up with everything else — and that's the surprising bit:
+        // the command the user is running disappears. Call it out inline and
+        // in a dedicated warning so the confirmation isn't a blind "all".
+        let me = self_spec();
+        let includes_self = all.iter().any(|(o, r)| *o == me.owner && *r == me.name);
         println!(
             "This will uninstall all {} installed package(s):",
             all.len()
         );
         for (owner, repo) in &all {
-            println!("  {owner}/{repo}");
+            let mark = if *owner == me.owner && *repo == me.name {
+                "  (unpin itself)"
+            } else {
+                ""
+            };
+            println!("  {owner}/{repo}{mark}");
         }
-        if !assume_yes && !prompt_yes_no("Continue?") {
+        if includes_self {
+            println!("This includes unpin itself — the `unpin` command will be removed.");
+        }
+        let question = if includes_self {
+            "Continue? This will remove unpin itself."
+        } else {
+            "Continue?"
+        };
+        if !assume_yes && !prompt_yes_no(question) {
             return Err("aborted".into());
         }
         all.into_iter().map(|(o, r)| format!("{o}/{r}")).collect()
@@ -904,7 +923,10 @@ pub fn run(
         return run_binary(&spec, &vdir, args, assume_yes);
     }
 
-    println!("Resolving {}...", spec.repo());
+    // Status goes to stderr: stdout belongs to the program we're about to
+    // exec, and the download bar + prompts already live on stderr. A plain
+    // `println!` here would splice "Resolving..." into the child's piped output.
+    eprintln!("Resolving {}...", spec.repo());
     let release = fetch_release(ctx, &spec)?;
     // `run` always includes data — bypassing it could leave the binary
     // non-functional (gvim/vim need share/), and `run` is the "just try it"
@@ -951,7 +973,8 @@ pub fn run(
             })
             .unwrap_or(false);
         if !has_links {
-            println!("Using {} {} (cached)", spec.repo(), release.tag_name);
+            // stderr, same reasoning as the "Resolving..." line above.
+            eprintln!("Using {} {} (cached)", spec.repo(), release.tag_name);
         }
     }
 

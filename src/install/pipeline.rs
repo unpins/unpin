@@ -284,6 +284,16 @@ pub struct DlSinks {
     pub companion: Option<(u64, Arc<dyn ByteSink>)>,
 }
 
+/// Join a scoped worker, re-raising its panic *as the original panic* rather
+/// than the misleading "called `Result::unwrap()` on an `Err` value: Any { .. }"
+/// that a plain `.join().unwrap()` produces. Under `panic = "abort"` (release)
+/// a worker panic aborts before we get here; this only shapes the dev/unwind
+/// build, but a real bug should surface its true message and location, not a
+/// raw `Result::Err` dump.
+fn join_or_resume<T>(h: thread::ScopedJoinHandle<'_, T>) -> T {
+    h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
 /// Orchestrate one ExtractJob: download+extract primary, and (if present)
 /// data companion **concurrently** via `thread::scope`. They write disjoint
 /// subtrees of the same `.part` staging tree (e.g. `bin/` vs `share/`), so
@@ -345,7 +355,7 @@ pub fn do_extract(ctx: &Ctx, job: &ExtractJob, ui: &Ui, sinks: &DlSinks) -> Resu
                     &job.extract_dir,
                 )
             });
-            (h_prim.join().unwrap(), h_comp.join().unwrap())
+            (join_or_resume(h_prim), join_or_resume(h_comp))
         });
         // Companion row is transient — clear on success, freeze red on error.
         ui.finish_companion(*cid, r_comp.clone());
@@ -430,8 +440,14 @@ fn download_extract_verify(
                 asset.name
             ));
         }
-        let suffix = if is_companion { " (data)" } else { "" };
-        ui.println(format!("  verified {repo}{suffix}  ({})", &expected[..16]));
+        if ctx.verbose {
+            // The green ✓ already tells the user the download verified; a
+            // standalone line would just be noise above the live block. Keep
+            // the digest under -v, paired with the `GET` line above, for
+            // anyone debugging *which* checksum was matched.
+            let suffix = if is_companion { " (data)" } else { "" };
+            ui.println(format!("  verified {repo}{suffix}  ({})", &expected[..16]));
+        }
     } else if let Some(total) = content_length
         && got_bytes != total
     {
@@ -1256,6 +1272,28 @@ fn finalize_errors(errors: Vec<String>, rows_shown: bool) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_or_resume_reraises_the_original_panic_not_an_err_dump() {
+        // A plain `.join().unwrap()` would surface the worker panic as
+        // "called `Result::unwrap()` on an `Err` value: Any { .. }". This
+        // helper must instead re-raise the *original* payload verbatim.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the test-run stderr
+        let caught = std::panic::catch_unwind(|| {
+            thread::scope(|s| {
+                let h = s.spawn(|| -> i32 { panic!("boom-original") });
+                join_or_resume(h)
+            })
+        });
+        std::panic::set_hook(prev);
+        let payload = caught.expect_err("worker panic should propagate");
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .expect("payload is the original &str panic message");
+        assert_eq!(msg, "boom-original");
+    }
 
     #[test]
     fn pick_jobs_defaults_to_min_of_4_and_inputs() {
