@@ -1,8 +1,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+use indicatif::{MultiProgress, ProgressDrawTarget};
+
 // Vec, not Option<PathBuf>: parallel installs each register their own vdir.
 static CLEANUP: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+// The progress UI currently on screen, if any. The interrupt handler wipes it
+// through indicatif (rather than letting a raw `eprintln` race the steady-tick
+// redraw thread, which leaves stale/duplicated bar lines behind).
+static PROGRESS: Mutex<Option<MultiProgress>> = Mutex::new(None);
+
+fn lock_progress() -> MutexGuard<'static, Option<MultiProgress>> {
+    PROGRESS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Lock `CLEANUP`, recovering the guard if the mutex was poisoned.
 ///
@@ -27,6 +38,13 @@ pub fn install() {
     // thread. Do not "harden" this into a signal-safe form; that would break
     // the cleanup it exists to do.
     let _ = ctrlc::set_handler(|| {
+        // Tear the live bars down through indicatif first: clear what's on
+        // screen, then hide the draw target so the steady-tick threads can't
+        // repaint a stale frame in the window before exit.
+        if let Some(m) = lock_progress().take() {
+            let _ = m.clear();
+            m.set_draw_target(ProgressDrawTarget::hidden());
+        }
         for p in lock_cleanup().drain(..) {
             // Cleanup list mixes vdirs (directories) and lock files
             // (regular files). Try both — one errors silently, the
@@ -38,6 +56,23 @@ pub fn install() {
         eprintln!("\nunpin: interrupted");
         std::process::exit(130);
     });
+}
+
+/// Register the progress UI so the interrupt handler can wipe it cleanly.
+/// The returned guard unregisters on drop, so a normal return (or a panic)
+/// leaves no dangling handle for a later, unrelated Ctrl-C to clear.
+#[must_use]
+pub fn show_progress(multi: &MultiProgress) -> ProgressGuard {
+    *lock_progress() = Some(multi.clone());
+    ProgressGuard
+}
+
+pub struct ProgressGuard;
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        *lock_progress() = None;
+    }
 }
 
 pub fn push_cleanup(path: &Path) {

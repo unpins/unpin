@@ -935,6 +935,8 @@ pub fn run(
         } else {
             MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
         };
+        // Let an interrupt wipe the bar cleanly instead of freezing it mid-redraw.
+        let _progress_guard = crate::sigint::show_progress(&multi);
         // multi.add before set_style/set_prefix — a tick before `multi.add`
         // writes a ghost row to stderr that lingers in scrollback.
         let bar = multi.add(ProgressBar::new(0));

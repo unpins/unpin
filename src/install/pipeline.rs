@@ -680,6 +680,8 @@ pub fn run_pipeline_v2(
     } else {
         MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
     };
+    // Let an interrupt wipe these bars cleanly instead of freezing them mid-redraw.
+    let _progress_guard = crate::sigint::show_progress(&multi);
 
     // One persistent bar per request. Pre-add on the main thread BEFORE any
     // styling/messaging — a tick before `multi.add` writes a ghost row to
