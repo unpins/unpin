@@ -345,7 +345,7 @@ impl Shell {
 
 fn print_banner() {
     println!(
-        "unpin {} — install binaries from GitHub releases",
+        "unpin {} — install programs from GitHub releases",
         env!("CARGO_PKG_VERSION")
     );
     println!("https://unpins.org");

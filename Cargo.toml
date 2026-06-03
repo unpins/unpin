@@ -2,7 +2,7 @@
 name = "unpin"
 version = "0.3.0"
 edition = "2024"
-description = "Install single-binary CLI tools straight from GitHub releases — no root, no distro, no dependencies."
+description = "Install single-binary programs straight from GitHub releases — no root, no distro, no dependencies."
 license = "MIT"
 repository = "https://github.com/unpins/unpin"
 homepage = "https://unpins.org"
