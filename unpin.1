@@ -53,15 +53,19 @@ runs the
 package (a patched mandoc) on coreutils' embedded manual.
 .SH COMMANDS
 .TP
-.BI install " PKG..."
+.BI install " [PKG...]"
 Install one or more packages from GitHub releases onto
+.BR PATH .
+With no
+.IR PKG ,
+unpin installs itself: it moves the running binary into place and adds it to
 .BR PATH .
 .TP
 .BI update " [NAME...]"
 Update one, several, or (with no arguments) all installed packages.
 .TP
-.BI remove " [NAME...]"
-Remove one, several, or (with no arguments, after confirmation) all
+.BI uninstall " [NAME...]"
+Uninstall one, several, or (with no arguments, after confirmation) all
 installed packages.
 .TP
 .B list
@@ -81,10 +85,19 @@ This is the default command, so the
 keyword may be omitted. Arguments after
 .B \-\-
 are forwarded to the binary.
+A cached version is run directly without contacting GitHub; pass
+.B \-\-refresh
+to re-resolve the latest release.
 .TP
 .BI completion " SHELL"
 Print a shell completion script for
 .IR bash ", " zsh ", " fish ", or " elvish .
+.TP
+.BI bundle " list|dump PKG " [ \fIENTRY\fR ]
+Inspect a package's embedded metadata bundle \(em its
+.I unpin/*
+entries. A stable interface used by helper packages such as
+.IR man .
 .SH OPTIONS
 These apply to
 .B install
@@ -94,6 +107,16 @@ unless noted.
 .TP
 .BR \-y ", " \-\-yes
 Skip prompts (assume yes).
+.TP
+.BR \-f ", " \-\-force
+Re-download and re-link even when the latest cached version is already
+installed. On self-install this just refreshes the placed binary and its
+.B PATH
+link.
+.TP
+.B \-\-refresh
+Re-resolve the latest release from GitHub instead of running a cached version
+.RB ( run " only)."
 .TP
 .BR \-j ", " \-\-jobs " \fIN\fR"
 Number of parallel downloads (default: min(N, 4)).
