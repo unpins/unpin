@@ -595,73 +595,6 @@ enum Resolved {
 /// `pre_errors` carries non-fatal failures the caller already collected
 /// (e.g. "name not installed" from `update`) so the final aggregated error
 /// summary lists everything in one place.
-/// Right-pad `s` with spaces to a display width of at least `w`.
-fn pad_to(s: &str, w: usize) -> String {
-    let cur = console::measure_text_width(s);
-    if cur >= w {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + (w - cur));
-    out.push_str(s);
-    out.extend(std::iter::repeat_n(' ', w - cur));
-    out
-}
-
-/// Keeps every bar's `{prefix}` padded to the same display width so the bar
-/// column lines up across rows, *without* a hard-coded size. The widest prefix
-/// seen so far is the target; the prefix text is variable (`label` while
-/// queued, `name tag` while downloading) and is only known incrementally — the
-/// pipeline has no resolve barrier — so when a wider prefix arrives we re-pad
-/// the bars that are still live and the column self-corrects on the next tick.
-/// Bars that already finished keep their last padding (indicatif freezes a
-/// finished line); in practice the widest prefix appears during download, well
-/// before any bar finishes, so the residual is rare and small.
-struct PrefixAligner {
-    state: Mutex<AlignState>,
-}
-
-struct AlignState {
-    width: usize,
-    /// Unpadded prefix per bar index; empty string means "not set yet".
-    raw: Vec<String>,
-}
-
-impl PrefixAligner {
-    fn new(n: usize) -> Self {
-        PrefixAligner {
-            state: Mutex::new(AlignState {
-                width: 0,
-                raw: vec![String::new(); n],
-            }),
-        }
-    }
-
-    /// Record bar `idx`'s unpadded prefix and apply the shared padding. A new
-    /// maximum re-pads the other live bars; otherwise only this bar is touched.
-    fn set(&self, bars: &[ProgressBar], idx: usize, raw: String) {
-        let mut s = self.state.lock().unwrap();
-        let w = console::measure_text_width(&raw);
-        s.raw[idx] = raw;
-        if w > s.width {
-            s.width = w;
-            let width = s.width;
-            for (i, r) in s.raw.iter().enumerate() {
-                if !r.is_empty() {
-                    bars[i].set_prefix(pad_to(r, width));
-                }
-            }
-        } else {
-            bars[idx].set_prefix(pad_to(&s.raw[idx], s.width));
-        }
-    }
-
-    /// Current alignment width — for transient bars (the data companion) that
-    /// must sit no further left than the primaries but must not widen them.
-    fn width(&self) -> usize {
-        self.state.lock().unwrap().width
-    }
-}
-
 pub fn run_pipeline_v2(
     ctx: &Ctx,
     opts: &InstallOptions,
@@ -685,9 +618,10 @@ pub fn run_pipeline_v2(
     // stderr that lingers in scrollback.
     let bars: Vec<ProgressBar> = requests
         .iter()
-        .map(|_req| {
+        .map(|req| {
             let pb = multi.add(ProgressBar::new(0));
             pb.set_style(github::idle_style());
+            pb.set_prefix(req.label.clone());
             pb.set_message("Queued");
             // Steady tick so the spinner actually animates during the
             // network-bound resolving/linking phases.
@@ -695,14 +629,6 @@ pub fn run_pipeline_v2(
             pb
         })
         .collect();
-
-    // Pads every bar's `{prefix}` to a common width so the bar column lines up.
-    // Seeded with the labels (known up front); download/link phases re-`set`
-    // through it as the prefix changes to `name tag`.
-    let aligner = PrefixAligner::new(requests.len());
-    for (i, req) in requests.iter().enumerate() {
-        aligner.set(&bars, i, req.label.clone());
-    }
 
     let n_workers = pick_jobs(opts.jobs, requests.len());
 
@@ -750,7 +676,6 @@ pub fn run_pipeline_v2(
             let extract_rx = Arc::clone(&extract_rx);
             let extract_done_tx = extract_done_tx.clone();
             let bars = &bars;
-            let aligner = &aligner;
             let multi_ref = &multi;
             s.spawn(move || {
                 loop {
@@ -762,11 +687,7 @@ pub fn run_pipeline_v2(
                     // Style the persistent bar for the download phase.
                     if let Some(asset) = job.asset.as_ref() {
                         pb.set_style(github::download_progress_style());
-                        aligner.set(
-                            bars,
-                            idx,
-                            format!("{} {}", job.spec.name, job.release.tag_name),
-                        );
+                        pb.set_prefix(format!("{} {}", job.spec.name, job.release.tag_name));
                         pb.set_position(0);
                         if asset.size > 0 {
                             pb.set_length(asset.size);
@@ -775,12 +696,7 @@ pub fn run_pipeline_v2(
                     let cbar = job.companion.as_ref().map(|companion| {
                         let cb = multi_ref.add(ProgressBar::new(0));
                         cb.set_style(github::download_progress_style());
-                        // Pad to the primaries' width but don't widen them: the
-                        // " (data)" suffix already makes this the longest prefix.
-                        cb.set_prefix(pad_to(
-                            &format!("{} {} (data)", job.spec.name, job.release.tag_name),
-                            aligner.width(),
-                        ));
+                        cb.set_prefix(format!("{} {} (data)", job.spec.name, job.release.tag_name));
                         if companion.size > 0 {
                             cb.set_length(companion.size);
                         }
@@ -822,19 +738,7 @@ pub fn run_pipeline_v2(
                             // No transient "Using cached" message — link_on_main
                             // immediately morphs the bar to "Linking..." and the
                             // intermediate state would just flicker.
-                            link_on_main(
-                                &ctx.paths,
-                                opts,
-                                request,
-                                &LinkUi {
-                                    bars: &bars,
-                                    idx,
-                                    aligner: &aligner,
-                                    multi: &multi,
-                                },
-                                job,
-                                &mut errors,
-                            );
+                            link_on_main(&ctx.paths, opts, request, pb, &multi, job, &mut errors);
                         }
                         Ok(Resolved::Ready(job)) => {
                             let _ = extract_tx.send((idx, job));
@@ -858,19 +762,7 @@ pub fn run_pipeline_v2(
             let request = &requests[idx];
             let pb = &bars[idx];
             match result {
-                Ok(()) => link_on_main(
-                    &ctx.paths,
-                    opts,
-                    request,
-                    &LinkUi {
-                        bars: &bars,
-                        idx,
-                        aligner: &aligner,
-                        multi: &multi,
-                    },
-                    job,
-                    &mut errors,
-                ),
+                Ok(()) => link_on_main(&ctx.paths, opts, request, pb, &multi, job, &mut errors),
                 Err(e) => {
                     pb.set_style(github::done_fail_style());
                     pb.finish_with_message(e.clone());
@@ -883,16 +775,6 @@ pub fn run_pipeline_v2(
     finalize_errors(errors)
 }
 
-/// Per-request UI handles threaded into the link phase: the bar to drive
-/// (`bars[idx]`), the shared `aligner` so a `set_prefix` keeps the column
-/// aligned, and the `multi` for serialized `println`.
-struct LinkUi<'a> {
-    bars: &'a [ProgressBar],
-    idx: usize,
-    aligner: &'a PrefixAligner,
-    multi: &'a MultiProgress,
-}
-
 /// Run the link phase for one job on the main thread. Called both for
 /// cached jobs (no extract happened) and for jobs whose extract just
 /// completed via the extract pool. Linker prompts (overwrite-link,
@@ -902,15 +784,13 @@ fn link_on_main(
     paths: &Paths,
     opts: &InstallOptions,
     request: &PipelineRequest,
-    ui: &LinkUi,
+    pb: &ProgressBar,
+    multi: &MultiProgress,
     job: ExtractJob,
     errors: &mut Vec<String>,
 ) {
-    let pb = &ui.bars[ui.idx];
-    let multi = ui.multi;
     pb.set_style(github::idle_style());
-    // Back to the label for the final line (kept aligned via the shared width).
-    ui.aligner.set(ui.bars, ui.idx, request.label.clone());
+    pb.set_prefix(request.label.clone());
     pb.set_message("Linking...");
     // Serialize all bin_dir writes across processes. The per-repo lock in
     // job._lock only covers this package's repo_dir; bin_dir is shared, so
@@ -1434,30 +1314,5 @@ mod tests {
         // `.part` to the whole file_name, not to the stem.
         let v = PathBuf::from("/data/o/r/14.1.0");
         assert_eq!(part_dir_for(&v).file_name().unwrap(), "14.1.0.part");
-    }
-
-    #[test]
-    fn pad_to_right_pads_to_width_and_never_truncates() {
-        assert_eq!(pad_to("jq", 5), "jq   ");
-        assert_eq!(pad_to("htop", 4), "htop"); // exact width: untouched
-        assert_eq!(pad_to("findutils", 5), "findutils"); // wider than target: untouched
-        assert_eq!(pad_to("", 3), "   ");
-    }
-
-    #[test]
-    fn prefix_aligner_width_grows_but_never_shrinks() {
-        // The shared column tracks the widest prefix seen so far. It must only
-        // grow: a later, narrower prefix (e.g. a bar reverting to its label
-        // after download) can't pull the already-aligned column back left.
-        let bars: Vec<ProgressBar> = (0..3).map(|_| ProgressBar::hidden()).collect();
-        let a = PrefixAligner::new(3);
-        a.set(&bars, 0, "jq".into());
-        assert_eq!(a.width(), 2);
-        a.set(&bars, 1, "findutils".into());
-        assert_eq!(a.width(), 9);
-        a.set(&bars, 2, "htop v3.4.1-1".into());
-        assert_eq!(a.width(), 13);
-        a.set(&bars, 0, "htop".into()); // narrower than the current max
-        assert_eq!(a.width(), 13);
     }
 }
