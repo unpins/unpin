@@ -899,19 +899,20 @@ pub fn run(
     // An explicit `@version` matches that tag; a bare spec uses the most
     // recently fetched version. `--refresh` forces a re-resolve; `--pick` needs
     // the live asset list, so it can't short-circuit here.
-    if !refresh && !pick {
-        if let Some(vdir) = cached_run_target(&ctx.paths, &spec) {
-            // Quiet by default — a cache hit should feel like running any local
-            // binary. `-v` still surfaces which version ran, for debugging.
-            if ctx.verbose {
-                let tag = vdir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
-                eprintln!("Using {} {} (cached)", spec.repo(), tag);
-            }
-            return run_binary(&spec, &vdir, args, assume_yes);
+    if !refresh
+        && !pick
+        && let Some(vdir) = cached_run_target(&ctx.paths, &spec)
+    {
+        // Quiet by default — a cache hit should feel like running any local
+        // binary. `-v` still surfaces which version ran, for debugging.
+        if ctx.verbose {
+            let tag = vdir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            eprintln!("Using {} {} (cached)", spec.repo(), tag);
         }
+        return run_binary(&spec, &vdir, args, assume_yes);
     }
 
     println!("Resolving {}...", spec.repo());
