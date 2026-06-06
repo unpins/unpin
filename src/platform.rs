@@ -528,22 +528,50 @@ pub fn create_link(target: &Path, link_path: &Path) -> io::Result<()> {
     }
 }
 
-/// Create a multi-call **alias** link. Aliases need argv[0] to carry the
+/// Create a multi-call **alias** link named `name` inside the trusted
+/// directory `dir`, pointing at `target`. Aliases need argv[0] to carry the
 /// alias name (so the binary's argv[0] dispatch picks the right code path);
-/// `.cmd` wrappers can't do that — they invoke the target with its own
-/// path. So:
-///   - Unix: symlink (kernel preserves the symlink name in argv[0]).
-///   - Windows: NTFS hardlink (same inode, different name; needs no admin
-///     and no Developer Mode, only that `target` and `link_path` live on
-///     the same NTFS volume — they always do for unpin's layout).
-pub fn create_alias_link(target: &Path, link_path: &Path) -> io::Result<()> {
+/// `.cmd` wrappers can't do that — they invoke the target with its own path.
+/// So:
+///   - Unix: symlink (kernel preserves the symlink name in argv[0]). The
+///     symlink is created through a cap-std `Dir` opened on `dir`, so `name`
+///     is confined to `dir` at the syscall layer — `openat2(RESOLVE_BENEATH)`
+///     on Linux (emulated elsewhere) refuses a name carrying `..` or a
+///     separator even if `validate_alias` upstream were somehow bypassed. This
+///     mirrors the archive-extraction path (see `archive.rs`); the alias name
+///     is the attacker-influenced half (it comes baked into the release
+///     binary), so it gets the same kernel-level treatment as tar entry names.
+///   - Windows: NTFS hardlink (same inode, different name; needs no admin and
+///     no Developer Mode, only that `target` and the link live on the same
+///     NTFS volume — they always do for unpin's layout). `target` lives
+///     outside `dir` (under the data dir), so it can't share a single cap-std
+///     capability with `dir`; the link name is confined by `validate_alias`
+///     (which rejects path separators) instead.
+///
+/// Any existing entry at the slot is cleared first — neither `symlink` nor
+/// `hard_link` replaces in place — so callers that decided to (re)write the
+/// slot don't need a separate unlink step.
+pub fn create_alias_link(dir: &Path, name: &str, target: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(target, link_path)
+        let capdir = cap_std::fs::Dir::open_ambient_dir(dir, cap_std::ambient_authority())?;
+        // symlink_contents (not symlink): the alias points at the package
+        // binary, which lives *outside* `dir` under the data tree, so `target`
+        // must be stored verbatim — cap-std's `symlink` rejects an absolute
+        // (escaping) target. `symlink_contents` leaves the target unresolved
+        // while still confining the link *name* to `dir` (RESOLVE_BENEATH).
+        // It won't overwrite, so clear our slot first; a missing entry (or a
+        // non-file we can't unlink) is fine — the create then surfaces it.
+        let _ = capdir.remove_file(name);
+        capdir.symlink_contents(target, name)
     }
     #[cfg(windows)]
     {
-        fs::hard_link(target, link_path)
+        let link_path = dir.join(alias_link_filename(name));
+        if fs::symlink_metadata(&link_path).is_ok() {
+            let _ = fs::remove_file(&link_path);
+        }
+        fs::hard_link(target, &link_path)
     }
 }
 
@@ -796,6 +824,58 @@ mod tests {
                 "round-trip failed for {target:?}"
             );
         }
+    }
+
+    // ---- create_alias_link ----
+
+    #[cfg(unix)]
+    #[test]
+    fn create_alias_link_makes_symlink_with_punctuation_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let target = tmp.path().join("coreutils");
+        fs::write(&target, b"x").unwrap();
+
+        // `[` is a real coreutils applet name — must link cleanly now.
+        create_alias_link(&bin, "[", &target).unwrap();
+        let link = bin.join("[");
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_alias_link_replaces_existing_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let old = tmp.path().join("old");
+        let new = tmp.path().join("new");
+        fs::write(&old, b"o").unwrap();
+        fs::write(&new, b"n").unwrap();
+
+        create_alias_link(&bin, "ll", &old).unwrap();
+        // A second write to the same name must clobber, not error: symlink()
+        // alone won't replace, so the helper's pre-clear is what makes this work.
+        create_alias_link(&bin, "ll", &new).unwrap();
+        assert_eq!(fs::read_link(bin.join("ll")).unwrap(), new);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_alias_link_refuses_traversal_name() {
+        // Kernel-level backstop: even if a `..`-bearing name reached here
+        // (it can't — validate_alias rejects separators first), cap-std's
+        // RESOLVE_BENEATH refuses it and nothing lands outside `bin`.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let target = tmp.path().join("target");
+        fs::write(&target, b"x").unwrap();
+
+        assert!(create_alias_link(&bin, "../escapee", &target).is_err());
+        // The escape path one level up must NOT exist.
+        assert!(!tmp.path().join("escapee").exists());
     }
 
     // ---- OS / arch key tables ----

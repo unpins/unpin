@@ -10,7 +10,10 @@
 //! Security boundary: aliases create `PATH` links, so a malicious name could
 //! shadow `sudo`/`ssh`/`git`. Two layers guard this, both upstream of the ZIP
 //! reader — the catalog-owner gate in `install/linker.rs` (aliases honored only
-//! for `unpins/<repo>`), and the blocklist + `validate_alias` here.
+//! for `unpins/<repo>`), and, here, the structural `validate_alias` plus a
+//! per-name confirmation (`alias_needs_confirmation`) for the small set of
+//! credential/privilege-escalation names where silent shadowing is acutely
+//! dangerous.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AliasMode {
@@ -34,76 +37,68 @@ impl AliasMode {
 pub const MAX_ALIASES: usize = 512;
 pub const MAX_ALIAS_LEN: usize = 64;
 
-/// Names we refuse to shadow even from a catalog package: shadowing `sudo`
-/// or `ssh` would let a compromised release intercept credentials or
-/// privilege escalation. The owner check (catalog-only) blocks this for
-/// `<owner>/<repo>` installs entirely; the blocklist is the second layer
-/// in case a curated package gets compromised in CI.
-pub const BLOCKED_ALIAS_NAMES: &[&str] = &[
-    // privilege escalation / remote shells
-    "sudo",
-    "su",
-    "doas",
-    "ssh",
-    "scp",
-    "sftp",
-    "ssh-add",
-    "ssh-agent",
-    "ssh-keygen",
-    // SCM / package upload
-    "git",
-    "gh",
-    "hg",
-    "svn",
-    // crypto agents
-    "gpg",
-    "gpg2",
-    "pinentry",
-    "age",
-    "rage",
-    // language runtimes (shadowing them swaps the user's interpreter)
-    "python",
-    "python2",
-    "python3",
-    "node",
-    "nodejs",
-    "deno",
-    "npm",
-    "npx",
-    "yarn",
-    "pnpm",
-    "cargo",
-    "rustc",
-    "rustup",
-    "go",
-    "java",
-    "javac",
-    "ruby",
-    "gem",
-    "bundle",
-    "perl",
-    "php",
-    "lua",
-    // shells (shadowing breaks login + scripts)
-    "bash",
-    "sh",
-    "zsh",
-    "fish",
-    "ksh",
-    "dash",
-    "csh",
-    "tcsh",
-    "cmd",
-    "powershell",
-    "pwsh",
-    // unpin itself
-    "unpin",
+/// Names that, when shadowed, hand a hostile binary the user's secrets or a
+/// root prompt: `sudo`/`su`/`doas` capture the login/sudo password, `ssh`
+/// captures remote credentials, `gpg`/`gpg2` capture signing/encryption
+/// passphrases. We don't *refuse* these — a legitimate catalog package may
+/// genuinely own such a name — but linking an alias for one is gated behind an
+/// explicit per-name confirmation (see [`alias_needs_confirmation`] and its use
+/// in `install/linker.rs`).
+///
+/// The list is deliberately tiny: it covers only silent secret/credential theft
+/// and privilege escalation. It intentionally does *not* list footguns like
+/// `git`, `cargo`, `node`, or the shells — mis-shadowing those breaks things but
+/// doesn't harvest credentials, and the catalog-owner gate (aliases honored only
+/// for `unpins/<repo>`) is the real boundary. This confirmation is the second
+/// layer for the handful of names where silent shadowing is acutely dangerous.
+pub const CONFIRM_ALIAS_NAMES: &[&str] = &[
+    // privilege escalation — capture the password
+    "sudo", "su", "doas", //
+    // remote shell / credentials
+    "ssh", //
+    // signing / encryption passphrases
+    "gpg", "gpg2",
 ];
 
-/// Validate one declared alias name. Catches empty/overlong names, chars
-/// outside `[a-z0-9._-]` (no path separators or whitespace), leading dot
-/// or dash (POSIX hidden-file / option-flag confusion), Windows reserved
-/// device names, and the credential/runtime blocklist.
+/// True when `name` would shadow a credential-bearing or privilege-escalation
+/// command and so warrants explicit confirmation before its alias is linked.
+/// Case-insensitive — on a case-insensitive filesystem `SUDO` would still
+/// shadow `sudo`. See [`CONFIRM_ALIAS_NAMES`].
+pub fn alias_needs_confirmation(name: &str) -> bool {
+    CONFIRM_ALIAS_NAMES
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Chars we refuse anywhere in an alias name: path separators and the
+/// Windows-invalid filename set. A name carrying any of these is not a single
+/// PATH-entry filename — `/`/`\` would address another directory, the rest
+/// (`: * ? " < > |`) are rejected by NTFS and double as shell glob/redirect
+/// metacharacters. Rejecting them cross-platform keeps a binary's baked-in
+/// alias list installable identically everywhere.
+const FORBIDDEN_ALIAS_CHARS: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Validate one declared alias name. We accept any printable-ASCII name so
+/// multi-call applets with punctuation names link cleanly — coreutils ships
+/// `[` (the `test` applet), and busybox-class binaries have similar oddities.
+/// What we still hard-reject is the bytes that make a name *unsafe* as a PATH
+/// entry rather than merely unusual:
+///   - path separators / Windows-invalid chars ([`FORBIDDEN_ALIAS_CHARS`]) —
+///     traversal and cross-directory writes;
+///   - anything outside printable ASCII (control, whitespace, non-ASCII) —
+///     terminal/PATH confusion and unicode-homoglyph shadowing of real commands;
+///   - a leading `-` (option-flag confusion) or `.` (hidden file, and the
+///     `.`/`..` traversal names);
+///   - Windows reserved device names.
+///
+/// What this does *not* do is reject credential/privilege names like `sudo` or
+/// `ssh` — those are structurally valid and a catalog package may own them;
+/// they're instead gated by [`alias_needs_confirmation`] at link time.
+///
+/// Traversal is additionally refused at the syscall layer when the link is
+/// created (`platform::create_alias_link` routes Unix symlinks through cap-std
+/// `RESOLVE_BENEATH`), so the separator rule here is the first of two layers,
+/// not the only one.
 pub fn validate_alias(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("empty alias name".into());
@@ -114,29 +109,23 @@ pub fn validate_alias(name: &str) -> Result<(), String> {
             name.len()
         ));
     }
-    let mut chars = name.chars();
-    let first = chars.next().unwrap();
-    if !matches!(first, 'a'..='z' | '0'..='9') {
-        return Err(format!(
-            "alias `{name}`: first char must be lowercase letter or digit"
-        ));
+    let first = name.chars().next().unwrap();
+    if first == '-' || first == '.' {
+        return Err(format!("alias `{name}`: first char must not be `-` or `.`"));
     }
-    for c in chars {
-        if !matches!(c, 'a'..='z' | '0'..='9' | '.' | '_' | '-') {
-            return Err(format!("alias `{name}`: char `{c}` not in [a-z0-9._-]"));
+    for c in name.chars() {
+        if !c.is_ascii_graphic() {
+            return Err(format!(
+                "alias `{name}`: char must be printable ASCII (no whitespace, control, or non-ASCII)"
+            ));
+        }
+        if FORBIDDEN_ALIAS_CHARS.contains(&c) {
+            return Err(format!("alias `{name}`: char `{c}` not allowed"));
         }
     }
     if is_windows_reserved(name) {
         return Err(format!(
             "alias `{name}`: matches a Windows reserved device name"
-        ));
-    }
-    if BLOCKED_ALIAS_NAMES
-        .iter()
-        .any(|b| b.eq_ignore_ascii_case(name))
-    {
-        return Err(format!(
-            "alias `{name}`: blocked (would shadow a sensitive command)"
         ));
     }
     Ok(())
@@ -186,38 +175,88 @@ mod tests {
             "py.test",
             "cmake_build",
             "x",
+            // Removed from the blocklist so the catalog `python` package can
+            // claim its interpreter names.
+            "python",
+            "python3",
         ] {
             assert!(validate_alias(n).is_ok(), "{n} should be valid");
         }
     }
 
     #[test]
-    fn validate_rejects_uppercase_and_path_chars() {
+    fn validate_accepts_punctuation_applet_names() {
+        // The whole point of the relaxed charset: real multi-call binaries ship
+        // applets whose names aren't `[a-z0-9._-]`. coreutils' `[` is the
+        // canonical case; uppercase and a leading underscore are now fine too.
+        for n in ["[", "]", "@reboot", "v2.0+git", "FOO", "_internal", "g++"] {
+            assert!(validate_alias(n).is_ok(), "{n} should be valid");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_separators_and_windows_invalid_chars() {
+        // Path separators (traversal) plus the NTFS-invalid set, which also
+        // covers shell glob/redirect metacharacters.
         for n in [
-            "XZcat",
             "../etc/passwd",
             "foo/bar",
             "foo\\bar",
-            "foo bar",
-            "foo\tbar",
+            "a:b",
+            "a*b",
+            "a?b",
+            "a\"b",
+            "a<b",
+            "a>b",
+            "a|b",
         ] {
             assert!(validate_alias(n).is_err(), "{n} should be invalid");
         }
     }
 
     #[test]
-    fn validate_rejects_leading_dot_or_dash_or_underscore() {
-        for n in [".hidden", "-flag", "_under"] {
-            assert!(validate_alias(n).is_err(), "{n} should be rejected");
+    fn validate_rejects_non_printable_and_non_ascii() {
+        for n in ["foo bar", "foo\tbar", "foo\nbar", "café", "naïve", "emoji😀"] {
+            assert!(validate_alias(n).is_err(), "{n} should be invalid");
         }
     }
 
     #[test]
-    fn validate_rejects_blocklist() {
+    fn validate_rejects_leading_dot_or_dash() {
+        // Leading `-` (option-flag confusion) and `.` (hidden file / the
+        // `.`/`..` traversal names) stay rejected; a leading `_` does not.
+        for n in [".hidden", "-flag", ".", ".."] {
+            assert!(validate_alias(n).is_err(), "{n} should be rejected");
+        }
+        assert!(validate_alias("_under").is_ok(), "_under should be valid");
+    }
+
+    #[test]
+    fn validate_no_longer_rejects_sensitive_or_footgun_names() {
+        // These are structurally fine now — the credential/privilege ones are
+        // gated by `alias_needs_confirmation` at link time, not refused here,
+        // and the footgun names (git/cargo/node/bash) carry no special gate.
         for n in [
-            "sudo", "git", "ssh", "python", "cargo", "bash", "unpin", "SSH",
+            "sudo", "ssh", "gpg", "git", "node", "cargo", "bash", "unpin", "SSH",
         ] {
-            assert!(validate_alias(n).is_err(), "{n} should be blocked");
+            assert!(validate_alias(n).is_ok(), "{n} should pass validation");
+        }
+    }
+
+    #[test]
+    fn confirmation_flags_only_credential_and_privesc_names() {
+        // Gated (credential theft / privilege escalation), case-insensitive.
+        for n in ["sudo", "su", "doas", "ssh", "gpg", "gpg2", "SUDO", "Gpg"] {
+            assert!(alias_needs_confirmation(n), "{n} should need confirmation");
+        }
+        // Footguns and ordinary applets are NOT gated — the owner gate covers them.
+        for n in [
+            "git", "cargo", "node", "bash", "sh", "scp", "ssh-add", "xzcat", "[",
+        ] {
+            assert!(
+                !alias_needs_confirmation(n),
+                "{n} should not need confirmation"
+            );
         }
     }
 

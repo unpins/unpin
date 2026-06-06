@@ -563,21 +563,39 @@ fn link_aliases_for(
 
     // Validate every name BEFORE creating any link. If one is bad we want a
     // clean failure, not half a manifest on disk that the user has to clean
-    // up by hand. The validator catches blocklisted names (sudo, ssh, ...),
-    // path traversal, Windows reserved names, and length/charset violations.
+    // up by hand. The validator catches path traversal, Windows reserved
+    // names, and length/charset violations (credential names like `sudo` are
+    // not refused here — they're confirmed per-name below).
     for name in &declared {
         aliases::validate_alias(name)?;
     }
 
-    let bin = &paths.bin;
     let mut linked = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     // Foreign-file declines collapse into one summary line; collision notes
     // (cross-package / intra-package) carry their own per-name text.
     let mut declined: Vec<String> = Vec::new();
+    // Names skipped because the user declined the credential/privesc prompt.
+    let mut sensitive_declined: Vec<String> = Vec::new();
     for name in &declared {
-        let link_path = bin.join(platform::alias_link_filename(name));
-        let r = link_alias(paths, ui, rdir, claimed, primary, &link_path, assume_yes)?;
+        // Security gate, independent of `alias_mode`: a name that would shadow
+        // `sudo`/`ssh`/`gpg`/... gets an explicit per-name confirmation even
+        // under the default `yes`, since silent shadowing of those is how a
+        // compromised release would harvest credentials. `--yes` auto-confirms
+        // (the user opted into non-interactive); a non-tty prompt returns Skip,
+        // which we treat as "don't link" — the safe default.
+        if aliases::alias_needs_confirmation(name) && !assume_yes {
+            let q =
+                format!("Alias `{name}` would shadow the system `{name}` command — install it?");
+            match ui.prompt_yes_no(&q) {
+                PromptResult::Got(true) => {}
+                PromptResult::Got(false) | PromptResult::Skip => {
+                    sensitive_declined.push(name.clone());
+                    continue;
+                }
+            }
+        }
+        let r = link_alias(paths, ui, rdir, claimed, primary, name, assume_yes)?;
         if r.linked {
             linked.push(name.clone());
         } else if r.note.is_none() {
@@ -589,6 +607,13 @@ fn link_aliases_for(
         if let Some(n) = r.note {
             notes.push(n);
         }
+    }
+    if !sensitive_declined.is_empty() {
+        notes.push(format!(
+            "{} sensitive alias(es) skipped (declined): {}",
+            sensitive_declined.len(),
+            sensitive_declined.join(", ")
+        ));
     }
 
     // No sidecar manifest written — the binary itself is the authoritative
@@ -624,22 +649,23 @@ fn link_alias(
     rdir: &Path,
     claimed: &[PathBuf],
     target: &Path,
-    link: &Path,
+    name: &str,
     assume_yes: bool,
 ) -> Result<LinkResult, String> {
-    let parent = link.parent().ok_or("alias link has no parent")?;
-    fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    let bin = &paths.bin;
+    let link = bin.join(platform::alias_link_filename(name));
+    fs::create_dir_all(bin).map_err(|e| format!("mkdir {}: {e}", bin.display()))?;
 
-    match classify_slot(paths, ui, rdir, claimed, link, assume_yes) {
+    match classify_slot(paths, ui, rdir, claimed, &link, assume_yes) {
         SlotDecision::Keep(note) => Ok(LinkResult {
             linked: false,
             note,
         }),
         SlotDecision::Write(note) => {
-            if link.exists() || fs::symlink_metadata(link).is_ok() {
-                let _ = fs::remove_file(link);
-            }
-            platform::create_alias_link(target, link)
+            // The mutation (slot clear + link) goes through `create_alias_link`,
+            // which on Unix routes via cap-std confined to `bin` — `name` can't
+            // escape it even though `link` itself was built by a plain join.
+            platform::create_alias_link(bin, name, target)
                 .map_err(|e| format!("alias {} -> {}: {e}", link.display(), target.display()))?;
             Ok(LinkResult { linked: true, note })
         }
@@ -846,6 +872,89 @@ mod tests {
         );
         assert!(!bin.join("bar").exists(), "dropped bar should be gone");
         assert!(summary.primary.contains(&"foo".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliases_gate_credential_names_behind_confirmation() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let paths = Paths {
+            data,
+            bin: bin.clone(),
+            config: tmp.path().join("config"),
+        };
+        let spec = Spec {
+            owner: CATALOG_OWNER.into(),
+            name: "tool".into(),
+            version: None,
+        };
+        let rdir = paths.repo_dir(CATALOG_OWNER, "tool");
+
+        // A primary binary carrying an embedded `unpin/aliases` listing one
+        // credential name (gated) and one ordinary applet (ungated).
+        let vbin = paths.version_dir(CATALOG_OWNER, "tool", "v1").join("bin");
+        fs::create_dir_all(&vbin).unwrap();
+        let primary = vbin.join("tool");
+        let mut bytes = b"\x7fELF not-really-an-elf ".to_vec();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("unpin/aliases", opts).unwrap();
+            zw.write_all(b"sudo\nxzcat\n").unwrap();
+            bytes.extend_from_slice(&zw.finish().unwrap().into_inner());
+        }
+        fs::write(&primary, &bytes).unwrap();
+        ensure_executable(&primary).unwrap();
+        assert_eq!(
+            meta::read(&primary).unwrap().unwrap().aliases(),
+            vec!["sudo".to_string(), "xzcat".to_string()]
+        );
+
+        // `--yes` auto-confirms the gate: both names link.
+        let out = link_aliases_for(
+            &paths,
+            &Ui::Plain,
+            &rdir,
+            &[],
+            &primary,
+            &spec,
+            AliasMode::Yes,
+            true,
+        )
+        .unwrap();
+        assert!(out.linked.contains(&"sudo".to_string()));
+        assert!(out.linked.contains(&"xzcat".to_string()));
+        assert!(bin.join("sudo").exists() && bin.join("xzcat").exists());
+
+        fs::remove_file(bin.join("sudo")).unwrap();
+        fs::remove_file(bin.join("xzcat")).unwrap();
+
+        // Without `--yes` and with no tty, the credential prompt resolves to
+        // Skip: `sudo` is withheld, the ordinary `xzcat` still links.
+        let out = link_aliases_for(
+            &paths,
+            &Ui::Plain,
+            &rdir,
+            &[],
+            &primary,
+            &spec,
+            AliasMode::Yes,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !out.linked.contains(&"sudo".to_string()),
+            "sudo must be gated behind confirmation"
+        );
+        assert!(out.linked.contains(&"xzcat".to_string()));
+        assert!(!bin.join("sudo").exists(), "sudo link must not be created");
+        assert!(bin.join("xzcat").exists());
     }
 
     #[test]
