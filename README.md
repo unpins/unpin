@@ -1,6 +1,6 @@
 # unpin
 
-> Install single-binary programs straight from GitHub releases — no root, no distro, no dependencies.
+> Install single-binary programs straight from GitHub releases — no root, no distro packages, no dependencies.
 
 `unpin` is the CLI installer of the [unpins](https://unpins.org) project. It
 fetches a pre-built binary from a GitHub release, verifies its checksum, and
@@ -15,19 +15,29 @@ either runs it on the spot or drops it in your PATH.
 </div>
 
 ```sh
-# A bare name fetches and runs the program — nothing is installed (the default):
-unpin BurntSushi/ripgrep --version
+# Running without a subcommand fetches and runs the program — nothing is installed (the default):
+unpin ffmpeg -version
 
-# Install it onto your PATH instead:
+# Install from the curated catalog (a name with no owner resolves to unpins/<name>):
+unpin install htop
+
+# Or install from any GitHub release:
 unpin install BurntSushi/ripgrep
-rg --version
 ```
+
+## The unpins catalog
+
+A name with no owner installs from the [unpins catalog](https://unpins.org/packages.html) —
+a curated set of programs we build as self-contained binaries, the same way on
+every OS. `unpin install jq` resolves to [`unpins/jq`](https://github.com/unpins/jq)
+and works the same on Linux, macOS, and Windows. You're not limited to it: give
+`unpin` any `owner/repo[@version]` and it installs from that GitHub release.
 
 ## Install
 
-The official builds are at **<https://unpins.org>**. They are statically linked.
-Download the binary, then run `unpin install` — it moves the binary into place
-and offers to add that directory to your `PATH`:
+The official builds are at **<https://unpins.org>**. They are self-contained, with
+no runtime dependencies. Download the binary, then run `unpin install` — it moves
+the binary into place and offers to add that directory to your `PATH`:
 
 ```sh
 # Linux
@@ -70,7 +80,7 @@ nix build github:unpins/unpin
 ./result/bin/unpin --version
 ```
 
-The flake outputs static binaries for Linux/macOS and a cross-built `.exe` for
+The flake outputs self-contained binaries for Linux/macOS and a cross-built `.exe` for
 Windows. See `flake.nix` for the build matrix.
 
 ## Usage
@@ -87,7 +97,7 @@ unpin prune                  Drop old versions, keep the active one
 unpin completion <shell>     Print a shell completion script
 ```
 
-A bare name with no command runs the package; installing onto `PATH` is the
+Running without a subcommand runs the program; installing onto `PATH` is the
 explicit `unpin install`. Helper verbs dispatch the same way — `unpin man
 coreutils ls` runs the [`man`](https://github.com/unpins/man) package (a
 patched mandoc) on coreutils' embedded manual.
