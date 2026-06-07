@@ -57,9 +57,9 @@ curl.exe -fsSLo unpin.exe https://unpins.org/unpin-x86_64-windows.exe
 .\unpin.exe install
 ```
 
-`unpin install` drops the binary in `~/.local/bin` (Linux/macOS) or
-`%LOCALAPPDATA%\unpin` (Windows). After it edits your `PATH`, open a new shell
-for the change to take effect.
+`unpin install` needs no root: it drops the binary in `~/.local/bin`
+(Linux/macOS) or `%LOCALAPPDATA%\unpin` (Windows) — a user directory — and only
+edits your `PATH` after asking. Open a new shell for the change to take effect.
 
 ### From source via Cargo
 
