@@ -6,6 +6,14 @@
 fetches a pre-built binary from a GitHub release, verifies its checksum, and
 either runs it on the spot or drops it in your PATH.
 
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/unpins/unpin/releases/download/v0.3.0/unpin-demo-dark.gif">
+    <source media="(prefers-color-scheme: light)" srcset="https://github.com/unpins/unpin/releases/download/v0.3.0/unpin-demo-light.gif">
+    <img alt="unpin demo — run a program straight from a GitHub release, then install several from the curated catalog in parallel" src="https://github.com/unpins/unpin/releases/download/v0.3.0/unpin-demo-dark.gif">
+  </picture>
+</div>
+
 ```sh
 # A bare name fetches and runs the program — nothing is installed (the default):
 unpin BurntSushi/ripgrep --version
