@@ -72,6 +72,16 @@
         let cross = nixpkgsFor.aarch64-darwin.pkgsCross.x86_64-darwin; in
         (mkUnpin { rustPlatform = cross.rustPlatform; }).overrideAttrs (old: {
           buildInputs = [ cross.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
+          # buildInputs above only covers the target (x86_64) link. In this
+          # arm→x86 cross the proc-macros are compiled for the BUILD host
+          # (aarch64) and rustc links each as a `.dylib` with `-liconv`; the
+          # build→build cc-wrapper has no libiconv in its path, so that link
+          # fails on a cold cache. This build normally escapes it because the
+          # proc-macro dylibs are already on cachix — but that's luck, not
+          # correctness (proven by unpins/unpin-readme, a fresh crate with the
+          # same flake, failing here). Feed build-platform libiconv to the
+          # build→build linker so it holds without the cache.
+          NIX_LDFLAGS_FOR_BUILD = "-L${cross.buildPackages.libiconv}/lib";
         });
 
       # Rustup-distributed toolchain with every cross target we ship. rustup
