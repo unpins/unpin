@@ -79,11 +79,12 @@
           # fails on a cold cache. This build normally escapes it because the
           # proc-macro dylibs are already on cachix — but that's luck, not
           # correctness (proven by unpins/unpin-readme, a fresh crate with the
-          # same flake, failing here). depsBuildBuild puts the build-platform
-          # (aarch64) libiconv on that wrapper's search path; the arch must be
-          # the build one (`cross.buildPackages.libiconv`), not the x86_64
-          # target libiconv, or the arm64 `-liconv` still won't resolve.
-          depsBuildBuild = [ cross.buildPackages.libiconv ] ++ (old.depsBuildBuild or [ ]);
+          # same flake, failing here until this flag landed). `depsBuildBuild`
+          # does NOT populate the flag under buildRustPackage; push the `-L`
+          # straight onto the var the build→build wrapper reads,
+          # `NIX_LDFLAGS_<suffixSalt>` (salt = arm64_apple_darwin), with the
+          # build-arch (aarch64) libiconv, not the x86_64 target one.
+          NIX_LDFLAGS_arm64_apple_darwin = "-L${cross.buildPackages.libiconv}/lib";
         });
 
       # Rustup-distributed toolchain with every cross target we ship. rustup
