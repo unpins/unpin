@@ -235,6 +235,14 @@ impl Drop for RepoLock {
 }
 
 pub(super) fn fetch_release(ctx: &Ctx, spec: &Spec) -> Result<Release, String> {
+    fetch_release_typed(ctx, spec).map_err(Into::into)
+}
+
+/// Like [`fetch_release`] but preserves the typed [`github::FetchError`] so a
+/// genuine 404 is distinguishable from a transient failure. `run`'s verb
+/// dispatch keys on this: only a real "no such release" licenses retrying the
+/// `unpins/unpin-<name>` helper package (see `docs/helper-verbs.md`).
+fn fetch_release_typed(ctx: &Ctx, spec: &Spec) -> Result<Release, github::FetchError> {
     let repo = spec.repo();
     let release = match &spec.version {
         Some(tag) => github::fetch_tag(ctx, &repo, tag)?,
@@ -243,7 +251,8 @@ pub(super) fn fetch_release(ctx: &Ctx, spec: &Spec) -> Result<Release, String> {
     // tag_name is published by the upstream repo and goes straight into a
     // filesystem path via `version_dir`. A malicious release with a tag like
     // `../../tmp/x` would otherwise let the upstream escape `data_dir/`.
-    validate_path_component(&release.tag_name, "tag from upstream release")?;
+    validate_path_component(&release.tag_name, "tag from upstream release")
+        .map_err(github::FetchError::Other)?;
     Ok(release)
 }
 
@@ -892,6 +901,22 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
 /// failure, 128+signal on Unix when the child died from a signal). The caller
 /// is expected to map this to its own process exit so destructors at this
 /// level still run — calling `std::process::exit` here skipped them.
+/// The `unpins/unpin-<name>` helper package a bare catalog name falls back to
+/// when it isn't a published program (a candidate, used only on a genuine 404),
+/// or `None` when the verb fallback doesn't apply: an explicit `owner/repo` (a
+/// direct program run) or an already-`unpin-`prefixed name (no `unpin-unpin-…`).
+/// Detects bareness from the raw input — the version-stripped part has no `/` —
+/// so an explicit `unpins/man` is excluded even though it resolves to the same
+/// owner. See docs/helper-verbs.md.
+fn verb_fallback_spec(input: &str, spec: &Spec) -> Option<Spec> {
+    let bare = !input.split('@').next().unwrap_or(input).contains('/');
+    (bare && !spec.name.starts_with("unpin-")).then(|| Spec {
+        owner: spec::CATALOG_OWNER.to_owned(),
+        name: format!("unpin-{}", spec.name),
+        version: spec.version.clone(),
+    })
+}
+
 pub fn run(
     ctx: &Ctx,
     input: &str,
@@ -902,33 +927,53 @@ pub fn run(
 ) -> Result<i32, String> {
     let spec = parse_spec(input)?;
 
+    // Verb-dispatch fallback (docs/helper-verbs.md): a *bare* catalog name that
+    // isn't a published program is retried as the `unpins/unpin-<name>` helper
+    // package, so `unpin man coreutils` resolves the `man` verb.
+    let verb_spec = verb_fallback_spec(input, &spec);
+
     // Cache-first: if a suitable version is already on disk, run it without
     // touching GitHub. `run` is the ephemeral "just execute it" path — keeping
     // up with the latest release is `update`/`install`'s job, not every run's.
     // An explicit `@version` matches that tag; a bare spec uses the most
     // recently fetched version. `--refresh` forces a re-resolve; `--pick` needs
-    // the live asset list, so it can't short-circuit here.
-    if !refresh
-        && !pick
-        && let Some(vdir) = cached_run_target(&ctx.paths, &spec)
-    {
-        // Quiet by default — a cache hit should feel like running any local
-        // binary. `-v` still surfaces which version ran, for debugging.
-        if ctx.verbose {
-            let tag = vdir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            eprintln!("Using {} {} (cached)", spec.repo(), tag);
+    // the live asset list, so it can't short-circuit here. Program before verb,
+    // matching the network precedence below.
+    if !refresh && !pick {
+        for cand in std::iter::once(&spec).chain(verb_spec.iter()) {
+            if let Some(vdir) = cached_run_target(&ctx.paths, cand) {
+                // Quiet by default — a cache hit should feel like running any
+                // local binary. `-v` still surfaces which version ran.
+                if ctx.verbose {
+                    let tag = vdir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    eprintln!("Using {} {} (cached)", cand.repo(), tag);
+                }
+                return run_binary(cand, &vdir, args, assume_yes);
+            }
         }
-        return run_binary(&spec, &vdir, args, assume_yes);
     }
 
     // Status goes to stderr: stdout belongs to the program we're about to
     // exec, and the download bar + prompts already live on stderr. A plain
     // `println!` here would splice "Resolving..." into the child's piped output.
+    //
+    // Resolve the program first; on a *genuine* 404 (not a transient error like
+    // a rate-limit) retry the verb package. Whichever resolves wins, and the
+    // rest of the function runs against that spec.
     eprintln!("Resolving {}...", spec.repo());
-    let release = fetch_release(ctx, &spec)?;
+    let (spec, release) = match fetch_release_typed(ctx, &spec) {
+        Ok(r) => (spec, r),
+        Err(github::FetchError::NotFound) if verb_spec.is_some() => {
+            let vspec = verb_spec.unwrap();
+            eprintln!("Resolving {}...", vspec.repo());
+            let release = fetch_release(ctx, &vspec)?;
+            (vspec, release)
+        }
+        Err(e) => return Err(e.into()),
+    };
     // `run` always includes data — bypassing it could leave the binary
     // non-functional (gvim/vim need share/), and `run` is the "just try it"
     // path where surprises are worst. Use `install --no-data` if you need a
@@ -1144,6 +1189,49 @@ fn run_binary(spec: &Spec, vdir: &Path, args: &[String], assume_yes: bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `(owner, name, version)` of the verb fallback for `input`, or `None`.
+    fn fallback(input: &str) -> Option<(String, String, Option<String>)> {
+        let spec = parse_spec(input).unwrap();
+        verb_fallback_spec(input, &spec).map(|s| (s.owner, s.name, s.version))
+    }
+
+    #[test]
+    fn verb_fallback_prefixes_a_bare_catalog_name() {
+        assert_eq!(
+            fallback("man"),
+            Some(("unpins".into(), "unpin-man".into(), None))
+        );
+        // The candidate is built regardless of whether the program exists —
+        // program-first network resolution is what keeps it from being used
+        // when the bare program does resolve.
+        assert_eq!(
+            fallback("htop"),
+            Some(("unpins".into(), "unpin-htop".into(), None))
+        );
+    }
+
+    #[test]
+    fn verb_fallback_carries_the_version_through() {
+        assert_eq!(
+            fallback("man@1.14.6-1"),
+            Some(("unpins".into(), "unpin-man".into(), Some("1.14.6-1".into())))
+        );
+    }
+
+    #[test]
+    fn verb_fallback_skips_explicit_owner_repo() {
+        // An explicit owner/repo is always a direct program run, even when the
+        // owner happens to be the catalog.
+        assert_eq!(fallback("unpins/man"), None);
+        assert_eq!(fallback("BurntSushi/ripgrep"), None);
+    }
+
+    #[test]
+    fn verb_fallback_skips_already_prefixed_names() {
+        // `unpin man` → `unpins/unpin-man` resolves directly; no `unpin-unpin-…`.
+        assert_eq!(fallback("unpin-man"), None);
+    }
 
     #[test]
     fn dedup_keep_first_preserves_order_and_removes_later_dups() {

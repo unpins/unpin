@@ -307,6 +307,23 @@ pub fn link_all_executables(
     assume_yes: bool,
     alias_mode: AliasMode,
 ) -> Result<LinkSummary, String> {
+    // Helper verbs — catalog `unpins/unpin-<verb>` packages — are reached only
+    // via `unpin <verb>` and must never land on PATH: installing one keeps it
+    // resident (offline/fast) without shadowing an OS command of the same bare
+    // name. This is the *only* way a helper is treated differently from any
+    // other package. See docs/helper-verbs.md. (Foreign `owner/unpin-*` is a
+    // normal program and still links.)
+    if spec.owner == CATALOG_OWNER && spec.name.starts_with("unpin-") {
+        let verb = spec.name.strip_prefix("unpin-").unwrap_or(&spec.name);
+        return Ok(LinkSummary {
+            notes: vec![format!(
+                "`{}` is a helper verb — kept resident, not linked on PATH (run it with `unpin {verb}`)",
+                spec.name
+            )],
+            ..LinkSummary::default()
+        });
+    }
+
     let mut files = Vec::new();
     walk_binary_candidates(vdir, &mut files)
         .map_err(|e| format!("walk {}: {e}", vdir.display()))?;
@@ -872,6 +889,66 @@ mod tests {
         );
         assert!(!bin.join("bar").exists(), "dropped bar should be gone");
         assert!(summary.primary.contains(&"foo".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_helper_verb_is_kept_resident_not_linked() {
+        // A catalog `unpins/unpin-<verb>` package installs (the vdir stays) but
+        // never lands on PATH — that is the whole "doesn't shadow the OS `man`"
+        // guarantee. A foreign `owner/unpin-*` is a normal program and links.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let paths = Paths {
+            data: tmp.path().join("data"),
+            bin: bin.clone(),
+            config: tmp.path().join("config"),
+        };
+        let ui = Ui::Plain;
+
+        let mk_vdir = |owner: &str, name: &str| -> PathBuf {
+            let vdir = paths.version_dir(owner, name, "v1");
+            let vbin = vdir.join("bin");
+            fs::create_dir_all(&vbin).unwrap();
+            let p = vbin.join("man");
+            fs::write(&p, b"#!/bin/sh\n").unwrap();
+            ensure_executable(&p).unwrap();
+            vdir
+        };
+
+        // Catalog helper verb → no PATH link, an explanatory note instead.
+        let verb = Spec {
+            owner: CATALOG_OWNER.into(),
+            name: "unpin-man".into(),
+            version: None,
+        };
+        let vdir = mk_vdir(CATALOG_OWNER, "unpin-man");
+        let summary = link_all_executables(&paths, &ui, &verb, &vdir, true, AliasMode::No).unwrap();
+        assert!(
+            !bin.join("man").exists(),
+            "helper verb must not link on PATH"
+        );
+        assert!(summary.primary.is_empty());
+        assert_eq!(summary.notes.len(), 1);
+        assert!(
+            summary.notes[0].contains("helper verb") && summary.notes[0].contains("unpin man"),
+            "note: {}",
+            summary.notes[0]
+        );
+
+        // Same `unpin-`prefixed name under a foreign owner is a normal program.
+        let foreign = Spec {
+            owner: "someone".into(),
+            name: "unpin-man".into(),
+            version: None,
+        };
+        let fvdir = mk_vdir("someone", "unpin-man");
+        link_all_executables(&paths, &ui, &foreign, &fvdir, true, AliasMode::No).unwrap();
+        assert!(
+            bin.join("man").exists(),
+            "foreign unpin-* should link normally"
+        );
     }
 
     #[cfg(unix)]

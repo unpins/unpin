@@ -58,22 +58,49 @@ pub struct Asset {
     pub size: u64,
 }
 
-pub fn fetch_latest(ctx: &Ctx, repo: &str) -> Result<Release, String> {
+/// Distinguishes a genuine "no such release/repo" (HTTP 404) from every other
+/// failure (network error, rate-limit, parse). The verb-dispatch fallback keys
+/// on this: only a true 404 on `unpins/<name>` licenses retrying the
+/// `unpins/unpin-<name>` helper package; a transient error must surface as
+/// itself rather than silently re-routing to a different package. See
+/// `docs/helper-verbs.md`.
+pub enum FetchError {
+    NotFound,
+    Other(String),
+}
+
+impl From<String> for FetchError {
+    fn from(s: String) -> Self {
+        FetchError::Other(s)
+    }
+}
+
+impl From<FetchError> for String {
+    fn from(e: FetchError) -> Self {
+        match e {
+            FetchError::NotFound => "not found (check package name or version)".into(),
+            FetchError::Other(s) => s,
+        }
+    }
+}
+
+pub fn fetch_latest(ctx: &Ctx, repo: &str) -> Result<Release, FetchError> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     fetch_release_url(ctx, &url)
 }
 
-pub fn fetch_tag(ctx: &Ctx, repo: &str, tag: &str) -> Result<Release, String> {
+pub fn fetch_tag(ctx: &Ctx, repo: &str, tag: &str) -> Result<Release, FetchError> {
     let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
     fetch_release_url(ctx, &url)
 }
 
-fn fetch_release_url(ctx: &Ctx, url: &str) -> Result<Release, String> {
+fn fetch_release_url(ctx: &Ctx, url: &str) -> Result<Release, FetchError> {
     let body = api_get(ctx, url)?;
-    DeJson::deserialize_json(&body).map_err(|e| format!("parse release JSON: {e}"))
+    DeJson::deserialize_json(&body)
+        .map_err(|e| FetchError::Other(format!("parse release JSON: {e}")))
 }
 
-fn api_get(ctx: &Ctx, url: &str) -> Result<String, String> {
+fn api_get(ctx: &Ctx, url: &str) -> Result<String, FetchError> {
     let mut headers: Vec<(&str, &str)> = vec![
         ("User-Agent", USER_AGENT),
         ("Accept", "application/vnd.github+json"),
@@ -90,7 +117,7 @@ fn api_get(ctx: &Ctx, url: &str) -> Result<String, String> {
     }
     if resp.status < 200 || resp.status >= 300 {
         if resp.status == 404 {
-            return Err("not found (check package name or version)".into());
+            return Err(FetchError::NotFound);
         }
         let msg = github_error_message(&resp.body).unwrap_or_else(|| "request failed".to_string());
         let mut out = format!("HTTP {}: {msg}", resp.status);
@@ -107,9 +134,10 @@ fn api_get(ctx: &Ctx, url: &str) -> Result<String, String> {
                  to raise the limit to 5000/hour.",
             );
         }
-        return Err(out);
+        return Err(FetchError::Other(out));
     }
-    String::from_utf8(resp.body).map_err(|e| format!("decode body for {url}: {e}"))
+    String::from_utf8(resp.body)
+        .map_err(|e| FetchError::Other(format!("decode body for {url}: {e}")))
 }
 
 #[derive(DeJson)]
@@ -268,7 +296,9 @@ mod tests {
     #[test]
     fn rate_limit_403_unauthenticated_suggests_a_token() {
         let ctx = ctx_with(403, RATE_LIMIT, None);
-        let err = api_get(&ctx, "https://api.github.com/x").unwrap_err();
+        let err: String = api_get(&ctx, "https://api.github.com/x")
+            .unwrap_err()
+            .into();
         assert!(err.contains("403"), "got: {err}");
         assert!(err.contains("GITHUB_TOKEN"), "missing token hint: {err}");
         assert!(
@@ -282,7 +312,9 @@ mod tests {
         // A logged-in user hitting 403 has a different problem (bad/insufficient
         // token); the GITHUB_TOKEN hint would be misleading.
         let ctx = ctx_with(403, RATE_LIMIT, Some("Bearer x".into()));
-        let err = api_get(&ctx, "https://api.github.com/x").unwrap_err();
+        let err: String = api_get(&ctx, "https://api.github.com/x")
+            .unwrap_err()
+            .into();
         assert!(
             !err.contains("GITHUB_TOKEN"),
             "unexpected token hint: {err}"
@@ -290,9 +322,14 @@ mod tests {
     }
 
     #[test]
-    fn not_found_404_stays_a_plain_message() {
+    fn not_found_404_is_typed_not_found() {
         let ctx = ctx_with(404, r#"{"message":"Not Found"}"#, None);
         let err = api_get(&ctx, "https://api.github.com/x").unwrap_err();
+        assert!(
+            matches!(err, FetchError::NotFound),
+            "expected NotFound variant"
+        );
+        let err: String = err.into();
         assert!(err.contains("not found"), "got: {err}");
         assert!(
             !err.contains("GITHUB_TOKEN"),
