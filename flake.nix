@@ -79,9 +79,11 @@
           # fails on a cold cache. This build normally escapes it because the
           # proc-macro dylibs are already on cachix — but that's luck, not
           # correctness (proven by unpins/unpin-readme, a fresh crate with the
-          # same flake, failing here). Feed build-platform libiconv to the
-          # build→build linker so it holds without the cache.
-          NIX_LDFLAGS_FOR_BUILD = "-L${cross.buildPackages.libiconv}/lib";
+          # same flake, failing here). depsBuildBuild puts the build-platform
+          # (aarch64) libiconv on that wrapper's search path; the arch must be
+          # the build one (`cross.buildPackages.libiconv`), not the x86_64
+          # target libiconv, or the arm64 `-liconv` still won't resolve.
+          depsBuildBuild = [ cross.buildPackages.libiconv ] ++ (old.depsBuildBuild or [ ]);
         });
 
       # Rustup-distributed toolchain with every cross target we ship. rustup
