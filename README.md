@@ -1,9 +1,9 @@
 # unpin
 
-> Install single-binary programs straight from GitHub releases — no root, no distro packages, no dependencies.
+> Install programs straight from GitHub releases — no root, no distro packages.
 
 `unpin` is the CLI installer of the [unpins](https://unpins.org) project. It
-fetches a pre-built binary from a GitHub release, verifies its checksum, and
+fetches a single self-contained binary from a GitHub release, verifies its checksum, and
 either runs it on the spot or drops it in your PATH.
 
 <div align="center">
@@ -28,15 +28,14 @@ unpin install BurntSushi/ripgrep
 ## The unpins catalog
 
 A name with no owner installs from the [unpins catalog](https://unpins.org/packages.html) —
-a curated set of programs we build as self-contained binaries, the same way on
-every OS. `unpin install jq` resolves to [`unpins/jq`](https://github.com/unpins/jq)
+a curated set of common programs we build as single self-contained binaries,
+built natively for Linux, macOS, and Windows. `unpin install jq` resolves to [`unpins/jq`](https://github.com/unpins/jq)
 and works the same on Linux, macOS, and Windows. You're not limited to it: give
 `unpin` any `owner/repo[@version]` and it installs from that GitHub release.
 
 ## Install
 
-The official builds are at **<https://unpins.org>**. They are self-contained, with
-no runtime dependencies. Download the binary, then run `unpin install` — it moves
+The official builds are at **<https://unpins.org>**. Each is a single self-contained binary. Download it, then run `unpin install` — it moves
 the binary into place and offers to add that directory to your `PATH`:
 
 ```sh
