@@ -45,11 +45,22 @@
           doCheck = false;
         }).overrideAttrs (_: { stripAllList = [ "bin" ]; });
 
+      # withDnsFallback links the __wrap_getaddrinfo archive into the
+      # linux-static binary so it resolves names where /etc/resolv.conf is
+      # absent (Android, minimal containers) — the same fix the C catalog gets
+      # via mkStandaloneFlake. Rust's std::net resolution emits the libc
+      # getaddrinfo symbol, so the `--wrap` at the final (cc-driven) link
+      # reroutes it just like in C. No-op on darwin/windows (the helper gates
+      # on isLinux+isStatic). The rustup-driven cross targets below get the same
+      # treatment via mkCross: the unsalted NIX_LDFLAGS is promoted to the cross
+      # host-role cc-wrapper (NIX_LDFLAGS_<triple>), so the wrap reaches their
+      # final link too — verified end-to-end on i686 and aarch64 (the Android
+      # arch) with no /etc/resolv.conf.
       nativeUnpin = system:
-        mkUnpin {
+        ulib.withDnsFallback nixpkgsFor.${system}.pkgsStatic (mkUnpin {
           rustPlatform = nixpkgsFor.${system}.pkgsStatic.rustPlatform;
           env.RUSTFLAGS = "-C relocation-model=static";
-        };
+        });
 
       # auditable=false: rustc 1.91 + LTO + cargo-auditable overflows mingw's
       # 32-bit relocation limit. Plain `cargo build --target` skips auditable.
@@ -116,7 +127,7 @@
       # override threads rust-overlay's native binary through unchanged.
       mkCross = crossPkgs:
         let rust = rustToolchain crossPkgs.buildPackages; in
-        mkUnpin {
+        ulib.withDnsFallback crossPkgs.pkgsStatic (mkUnpin {
           rustPlatform = crossPkgs.makeRustPlatform { cargo = rust; rustc = rust; };
           auditable = false;
           # rust-overlay's musl target specs default to `crt-static = false`
@@ -125,7 +136,7 @@
           # dynamic-link interpreter and action-build's portability check
           # rejects it.
           env.RUSTFLAGS = "-C target-feature=+crt-static";
-        };
+        });
 
       linuxI686Unpin   = mkCross nixpkgsFor.x86_64-linux.pkgsCross.musl32;
       linuxPpc64leUnpin = mkCross nixpkgsFor.x86_64-linux.pkgsCross.musl-power;
