@@ -40,12 +40,12 @@ the binary into place and offers to add that directory to your `PATH`:
 
 ```sh
 # Linux
-curl -sLo unpin "https://unpins.org/unpin-$(uname -m)-linux"
+curl -fsSLo unpin "https://unpins.org/unpin-$(uname -m)-linux"
 chmod +x unpin
 ./unpin install
 
 # macOS
-curl -sLo unpin "https://unpins.org/unpin-$(uname -m)-darwin"
+curl -fsSLo unpin "https://unpins.org/unpin-$(uname -m)-darwin"
 chmod +x unpin
 ./unpin install
 ```
