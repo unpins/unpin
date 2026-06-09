@@ -356,11 +356,17 @@ fn print_banner() {
     println!("https://unpins.org");
 }
 
-fn print_auth_footer(config_path: Option<&std::path::Path>) {
+fn print_help_footer(config_path: Option<&std::path::Path>) {
     println!();
     println!("Auth (optional, raises GitHub API rate limit from 60/h to 5000/h):");
     println!("  GITHUB_TOKEN | GH_TOKEN          token from env var");
     println!("  use_gh_auth = true (in config)   use `gh auth token`");
+    println!();
+    println!("Networking:");
+    println!("  UNPIN_DNS=\"ip ...\"               DNS servers for the built-in resolver, used");
+    println!("                                   when the host has no /etc/resolv.conf (e.g.");
+    println!("                                   Android). Space-separated IPv4; replaces the");
+    println!("                                   1.1.1.1 / 8.8.8.8 defaults.");
     println!();
     match config_path {
         Some(p) => println!("Config file: {}", p.display()),
@@ -517,7 +523,7 @@ fn main() -> ExitCode {
             let code = err.exit_code() as u8;
             err.print().ok();
             if matches!(help_kind, HelpKind::TopLevel) {
-                print_auth_footer(paths.as_ref().ok().map(|p| p.config.as_path()));
+                print_help_footer(paths.as_ref().ok().map(|p| p.config.as_path()));
             }
             return ExitCode::from(code);
         }
