@@ -3,7 +3,7 @@
 Notable changes to `unpin`. This project follows [Semantic
 Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.4.0] — 2026-06-10
 
 ### Added
 - **Opt-in DNS fallback for hosts where the system resolver is unreachable.**

@@ -1,6 +1,6 @@
 [package]
 name = "unpin"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Install single-binary programs straight from GitHub releases — no root, no distro, no dependencies."
 license = "MIT"
