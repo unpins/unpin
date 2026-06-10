@@ -123,6 +123,31 @@ A `<repo>` is `owner/name[@version]`. When the owner is omitted, `unpins` is
 assumed — so `unpin install htop` resolves to `unpins/htop`. When `@version`
 is omitted, the latest release is used.
 
+## No DNS? (Android, minimal containers)
+
+On a host that can't reach any DNS server — Android has no `/etc/resolv.conf`,
+a barebones container may ship none, a nameserver may be dead or blocked —
+downloads fail with a resolver error. unpin and every program from the catalog
+can resolve through a public DNS server instead, but that fallback is **off by
+default**: it never second-guesses a working resolver, and even when enabled it
+only kicks in when the system resolver can't be reached at all. On such a
+failure unpin explains this and, interactively, offers to turn it on. To do it
+yourself:
+
+```sh
+# one run:
+UNPIN_DNS="1.1.1.1 8.8.8.8" unpin install htop
+
+# always — add to unpin's config file (~/.config/unpin/config on Linux/macOS,
+# %APPDATA%\unpin\config on Windows); every unpins program honours it, not
+# just unpin:
+dns = 1.1.1.1 8.8.8.8
+```
+
+The value is a space-separated list of IPv4 literals, tried in order over
+UDP/53 and then DNS-over-HTTPS for networks that also block port 53.
+`UNPIN_DNS` overrides the config for a single run.
+
 ## Shell completion
 
 `unpin completion <shell>` prints a script that hooks the binary into your

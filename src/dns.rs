@@ -83,7 +83,9 @@ pub fn offer_fallback(paths: &Paths) -> bool {
 
     // Non-interactive (piped/CI): we can't ask. The teaching above stands; the
     // caller surfaces the original error and exits non-zero.
-    match plain_yes_no("\nTry resolving through 1.1.1.1 now?") {
+    // Name both servers: saying yes opts into sending lookups to Cloudflare
+    // AND Google, and that consent should be informed.
+    match plain_yes_no(&format!("\nTry resolving through {SUGGESTED} now?")) {
         PromptResult::Got(true) => {}
         PromptResult::Got(false) | PromptResult::Skip => return false,
     }
