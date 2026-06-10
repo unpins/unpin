@@ -22,8 +22,8 @@ use crate::platform::Paths;
 /// then Google — the well-known anycast pair, both carrying the IP-SAN certs the
 /// DoH leg validates against. Only ever a *suggestion* the user accepts; never a
 /// silently-applied default (that opt-in choice is the whole point of the
-/// redesign).
-const SUGGESTED: &str = "1.1.1.1 8.8.8.8";
+/// redesign). `pub` for main's relaunch-with-`UNPIN_DNS` retry.
+pub const SUGGESTED: &str = "1.1.1.1 8.8.8.8";
 
 /// Set by [`unpin_dns_note_unreachable`] when the C shim reports a lookup that
 /// needed the fallback but found no opt-in resolver configured.
@@ -52,8 +52,17 @@ pub fn was_resolver_unreachable() -> bool {
 /// After a command failed on a host whose resolver couldn't be reached, teach
 /// the user about the opt-in DNS fallback. On an interactive terminal, offer to
 /// turn it on for this run — and optionally save it to the config so every
-/// unpins program uses it. Returns `true` when a resolver was enabled for this
-/// process and the caller should retry the command once.
+/// unpins program uses it. Returns `true` when the user opted in and the caller
+/// should relaunch the command once with `UNPIN_DNS=`[`SUGGESTED`] in the *new*
+/// process' environment (see main's `relaunch_with_dns`).
+///
+/// Deliberately NO `env::set_var` here: the failed command can leave detached
+/// HTTP pump threads behind (see `http::PumpStream` — a worker that hits its
+/// idle window abandons its pump mid-request), and on this exact failure path
+/// a stray pump may still be inside `getaddrinfo`, where the C shim calls
+/// `getenv("UNPIN_DNS")`. Mutating our own environment under a possible
+/// concurrent `getenv` is UB; building the child's environment via
+/// `Command::env` never touches ours.
 pub fn offer_fallback(paths: &Paths) -> bool {
     // We were latched as "no usable resolver". Usually that means none is
     // configured — but it also fires when a `dns` *is* set to something that
@@ -90,18 +99,9 @@ pub fn offer_fallback(paths: &Paths) -> bool {
         PromptResult::Got(false) | PromptResult::Skip => return false,
     }
 
-    // Turn it on for this process so the retry's `getaddrinfo` sees it: the shim
-    // reads `$UNPIN_DNS` fresh on every call, so the retry picks it up at once.
-    //
-    // SAFETY: we are single-threaded here — the failed command has fully
-    // returned and its worker threads are joined/dropped — so there is no other
-    // thread reading the environment concurrently with this `set_var`.
-    unsafe {
-        std::env::set_var("UNPIN_DNS", SUGGESTED);
-    }
-
-    // Offer to persist it. A bare "no" or non-TTY just skips saving; the env var
-    // still applies to this run.
+    // Offer to persist it. A bare "no" or non-TTY just skips saving; the
+    // relaunch (with `UNPIN_DNS` in the child's environment) still covers this
+    // run either way.
     if let PromptResult::Got(true) =
         plain_yes_no("Save this to your config so every unpins program uses it?")
     {

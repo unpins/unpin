@@ -570,24 +570,58 @@ fn main() -> ExitCode {
     match cli.command.run(&paths) {
         // The failure was "system resolver unreachable, no opt-in DNS" (the C
         // shim latched it). Teach the user about the opt-in fallback; if they
-        // enable a resolver interactively, retry the whole command once with
-        // `$UNPIN_DNS` now set (the shim re-reads it per call). The retry re-
-        // parses argv — pure, and it already parsed once, so this can't fail.
+        // enable a resolver interactively, run the whole command once more in
+        // a RELAUNCHED process with `UNPIN_DNS` in its environment.
         Err(e) if dns::was_resolver_unreachable() => {
             if dns::offer_fallback(&paths) {
-                match parse_args(&raw) {
-                    Ok(retry) => exit(retry.command.run(&paths)),
-                    Err(_) => {
-                        eprintln!("unpin: {e}");
-                        ExitCode::FAILURE
-                    }
-                }
+                relaunch_with_dns(&raw)
             } else {
                 eprintln!("unpin: {e}");
                 ExitCode::FAILURE
             }
         }
         other => exit(other),
+    }
+}
+
+/// Run this same command line again with `UNPIN_DNS=`[`dns::SUGGESTED`] in the
+/// new process' environment — the DNS-fallback retry after the user opted in.
+///
+/// A relaunch, not an in-process retry with `env::set_var`: the failed run can
+/// leave detached HTTP pump threads behind (`http::PumpStream` — a worker that
+/// hits its idle window abandons its pump mid-request), and on this exact
+/// failure path a stray pump may still sit inside `getaddrinfo`, where the C
+/// shim calls `getenv("UNPIN_DNS")`. `set_var` under a possibly concurrent
+/// `getenv` is UB; `Command::env` builds the child's environment privately and
+/// never touches ours. No re-prompt loop is possible: with `UNPIN_DNS` set the
+/// shim has resolvers, so its no-opt-in hook (the latch gating this path)
+/// can't fire in the new process.
+///
+/// On unix this `exec`s — the process image is replaced, stray threads and
+/// all, and the command keeps our pid/TTY/signal disposition. On windows it
+/// spawns the child and forwards its exit code.
+fn relaunch_with_dns(raw: &[String]) -> ExitCode {
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&raw[0]));
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&raw[1..]).env("UNPIN_DNS", dns::SUGGESTED);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let e = cmd.exec(); // replaces the process; returns only on failure
+        eprintln!("unpin: couldn't relaunch for the DNS retry ({e})");
+        ExitCode::FAILURE
+    }
+    #[cfg(not(unix))]
+    {
+        match cmd.status() {
+            // None = terminated by signal (unix-only) — call it plain failure.
+            Ok(st) => ExitCode::from((st.code().unwrap_or(1) & 0xff) as u8),
+            Err(e) => {
+                eprintln!("unpin: couldn't relaunch for the DNS retry ({e})");
+                ExitCode::FAILURE
+            }
+        }
     }
 }
 
