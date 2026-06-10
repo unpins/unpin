@@ -363,10 +363,10 @@ fn print_help_footer(config_path: Option<&std::path::Path>) {
     println!("  use_gh_auth = true (in config)   use `gh auth token`");
     println!();
     println!("Networking:");
-    println!("  UNPIN_DNS=\"ip ...\"               DNS servers for the built-in resolver, used");
-    println!("                                   when the host has no /etc/resolv.conf (e.g.");
-    println!("                                   Android). Space-separated IPv4; replaces the");
-    println!("                                   1.1.1.1 / 8.8.8.8 defaults.");
+    println!("  UNPIN_DNS=\"ip ...\"               DNS servers for the built-in fallback resolver,");
+    println!("                                   used when the OS resolver can't reach a server");
+    println!("                                   (e.g. Android, a captive portal). Space-separated");
+    println!("                                   IPv4; replaces the 1.1.1.1 / 8.8.8.8 defaults.");
     println!();
     match config_path {
         Some(p) => println!("Config file: {}", p.display()),

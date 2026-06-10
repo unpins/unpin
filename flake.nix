@@ -64,10 +64,14 @@
 
       # auditable=false: rustc 1.91 + LTO + cargo-auditable overflows mingw's
       # 32-bit relocation limit. Plain `cargo build --target` skips auditable.
-      windowsUnpin = mkUnpin {
+      # withDnsFallback links the same fallback archive here as on linux — on
+      # windows it rides --wrap (GNU ld, mingw) + the COFF-compiled archive, so
+      # Rust's std::net resolution falls back to UDP/DoH when the OS resolver
+      # can't be reached (proven on a real Win10 VM).
+      windowsUnpin = ulib.withDnsFallback nixpkgsFor.x86_64-linux.pkgsCross.mingwW64 (mkUnpin {
         rustPlatform = nixpkgsFor.x86_64-linux.pkgsCross.mingwW64.rustPlatform;
         auditable = false;
-      };
+      });
 
       # rustc injects `-liconv` on darwin targets. The default cross stdenv
       # ships libiconv as a dylib → the binary carries an LC_LOAD_DYLIB for
@@ -79,9 +83,14 @@
       # of the cross stays non-static so the cctools/xar-static cascade
       # (broken upstream for cross-darwin, see fake-cross-darwin-blocked memory)
       # never gets pulled in.
+      # withDnsFallback on the non-static `cross` scope: darwin needs only a .a
+      # of objects (ld64 -force_load), not a fully static toolchain, so this
+      # sidesteps the broken cross-darwin pkgsStatic cascade. Native aarch64/
+      # x86_64-darwin builds get the fallback through nativeUnpin's pkgsStatic.
       darwinX86Unpin =
         let cross = nixpkgsFor.aarch64-darwin.pkgsCross.x86_64-darwin; in
-        (mkUnpin { rustPlatform = cross.rustPlatform; }).overrideAttrs (old: {
+        ulib.withDnsFallback cross
+        ((mkUnpin { rustPlatform = cross.rustPlatform; }).overrideAttrs (old: {
           buildInputs = [ cross.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
           # buildInputs above only covers the target (x86_64) link. In this
           # arm→x86 cross the proc-macros are compiled for the BUILD host
@@ -96,7 +105,7 @@
           # `NIX_LDFLAGS_<suffixSalt>` (salt = arm64_apple_darwin), with the
           # build-arch (aarch64) libiconv, not the x86_64 target one.
           NIX_LDFLAGS_arm64_apple_darwin = "-L${cross.buildPackages.libiconv}/lib";
-        });
+        }));
 
       # Rustup-distributed toolchain with every cross target we ship. rustup
       # supplies `rust-std-<triple>` as a precompiled tarball, so adding a
