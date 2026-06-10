@@ -17,7 +17,7 @@
 //! kept: two distinct ZIPs both carrying `unpin/aliases` is a fatal ambiguity.
 
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::path::Path;
 
 /// Plant unpin's own metadata ZIP (its `unpin.1`, built by `build.rs`) in the
@@ -37,7 +37,12 @@ const MAX_META_TOTAL: u64 = 64 * 1024 * 1024;
 
 const EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06]; // PK\x05\x06
 const CDH_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02]; // PK\x01\x02
+const LFH_SIG: [u8; 4] = [0x50, 0x4b, 0x03, 0x04]; // PK\x03\x04 (local file header)
 const ALIASES_PATH: &str = "unpin/aliases";
+/// Reserved STORED entry holding the shared zstd dictionary a large man overlay
+/// was packed against (written by `unpin-vfs-pack --dict`). Outside the served
+/// `unpin/` namespace (leading dot) so it's never mistaken for a payload entry.
+const ZDICT_PATH: &str = ".unpin/zdict";
 
 /// One materialized `unpin/*` entry.
 #[derive(Debug)]
@@ -77,50 +82,69 @@ fn read_bytes(data: &[u8]) -> Result<Option<Meta>, String> {
     let mut total: u64 = 0;
     let mut alias_bearing_zips = 0usize;
 
-    for (start, end) in locate_zips(data) {
+    for (start, end, eocd) in locate_zips(data) {
         let slice = &data[start..end];
-        // A validated EOCD can still front a ZIP the crate rejects (e.g. an
-        // encrypted or otherwise unsupported member). Skip it rather than fail
-        // the whole read — another ZIP may hold our `unpin/*`.
-        let mut archive = match zip::ZipArchive::new(Cursor::new(slice)) {
-            Ok(a) => a,
-            Err(_) => continue,
+        // Parse the central directory ourselves rather than via the `zip` crate
+        // so method 93 (Zstandard) entries decode through the pure-Rust `ruzstd`
+        // already used for release assets — the reader stays portable to every
+        // cross target (mingw, i686/riscv64-musl) without a C zstd. A slice we
+        // can't parse cleanly is skipped: another ZIP may hold our `unpin/*`.
+        let Some(cd) = parse_central_dir(slice, eocd - start) else {
+            continue;
         };
+        // A large man overlay ships a shared zstd dictionary (the reserved STORED
+        // `.unpin/zdict` entry) that every method-93 entry was trained against;
+        // load it once and reuse the decoder across this overlay. A plain
+        // (no-dict) or non-zstd overlay yields `None` and decodes directly.
+        let mut dict_dec = overlay_dict(&cd)?;
         let mut has_aliases_here = false;
-        for i in 0..archive.len() {
-            let mut f = archive
-                .by_index(i)
-                .map_err(|e| format!("read zip entry: {e}"))?;
-            let name = f.name();
-            if !name.starts_with("unpin/") || name.ends_with('/') {
+        for ent in &cd {
+            if !ent.name.starts_with("unpin/") || ent.name.ends_with('/') {
                 continue;
             }
-            let name = name.to_string();
-            let sz = f.size();
+            let sz = ent.usize as u64;
             if sz > MAX_META_ENTRY {
                 return Err(format!(
-                    "embedded `{name}` is {sz} bytes (max {MAX_META_ENTRY})"
+                    "embedded `{}` is {sz} bytes (max {MAX_META_ENTRY})",
+                    ent.name
                 ));
             }
             total = total.saturating_add(sz);
             if total > MAX_META_TOTAL {
-                return Err(format!(
-                    "embedded meta exceeds {MAX_META_TOTAL} bytes total"
-                ));
+                return Err(format!("embedded meta exceeds {MAX_META_TOTAL} bytes total"));
             }
             if entries.len() >= MAX_META_ENTRIES {
                 return Err(format!("embedded meta exceeds {MAX_META_ENTRIES} entries"));
             }
-            let is_symlink = f.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000);
-            let mut buf = Vec::with_capacity(sz.min(MAX_META_ENTRY) as usize);
-            f.read_to_end(&mut buf)
-                .map_err(|e| format!("read embedded `{name}`: {e}"))?;
-            if name == ALIASES_PATH {
+            let buf = match decompress(ent.method, ent.payload, dict_dec.as_mut()) {
+                None => {
+                    return Err(format!(
+                        "embedded `{}`: unsupported compression method {}",
+                        ent.name, ent.method
+                    ));
+                }
+                Some(Err(e)) => return Err(format!("read embedded `{}`: {e}", ent.name)),
+                Some(Ok(b)) => b,
+            };
+            // The declared sizes and CRC are the integrity check the `zip` crate
+            // used to give us for free; keep it now that we decode by hand.
+            if buf.len() != ent.usize {
+                return Err(format!(
+                    "embedded `{}`: decoded {} bytes, header declares {}",
+                    ent.name,
+                    buf.len(),
+                    ent.usize
+                ));
+            }
+            if crc32(&buf) != ent.crc {
+                return Err(format!("embedded `{}`: CRC mismatch", ent.name));
+            }
+            if ent.name == ALIASES_PATH {
                 has_aliases_here = true;
             }
             entries.push(Entry {
-                path: name,
-                is_symlink,
+                path: ent.name.clone(),
+                is_symlink: ent.is_symlink,
                 data: buf,
             });
         }
@@ -143,9 +167,10 @@ fn read_bytes(data: &[u8]) -> Result<Option<Meta>, String> {
     }
 }
 
-/// Scan `data` for every validated ZIP, returning `(zip_start, zip_end)` byte
-/// ranges. Each range is a clean, zero-prefix ZIP slice (doc §2).
-fn locate_zips(data: &[u8]) -> Vec<(usize, usize)> {
+/// Scan `data` for every validated ZIP, returning `(zip_start, zip_end, eocd)`
+/// byte offsets. Each `[start, end)` is a clean, zero-prefix ZIP slice (doc §2);
+/// `eocd` is the absolute offset of its End Of Central Directory record.
+fn locate_zips(data: &[u8]) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
     if data.len() < 22 {
         return out;
@@ -157,13 +182,150 @@ fn locate_zips(data: &[u8]) -> Vec<(usize, usize)> {
         if data[i..i + 4] == EOCD_SIG
             && let Some((start, end)) = validate_eocd(data, i)
         {
-            out.push((start, end));
+            out.push((start, end, i));
             i = end; // a validated ZIP can't overlap the next; skip past it
             continue;
         }
         i += 1;
     }
     out
+}
+
+/// One entry harvested from a ZIP's central directory, with its raw (still
+/// compressed) payload sliced out of the archive.
+struct CdEntry<'a> {
+    name: String,
+    method: u16,
+    crc: u32,
+    usize: usize,
+    payload: &'a [u8],
+    is_symlink: bool,
+}
+
+/// Walk the central directory of the ZIP `slice` (whose EOCD sits at offset
+/// `eocd`), returning every entry. `None` on any structural inconsistency — the
+/// caller treats that as "not one of ours" and moves on. Does not decompress.
+fn parse_central_dir(slice: &[u8], eocd: usize) -> Option<Vec<CdEntry<'_>>> {
+    let hdr = slice.get(eocd..eocd + 22)?;
+    let n_entries = u16::from_le_bytes([hdr[10], hdr[11]]) as usize;
+    let cd_size = u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]) as usize;
+    let cd_offset = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]) as usize;
+    if cd_offset.checked_add(cd_size)? > slice.len() {
+        return None;
+    }
+    let mut p = cd_offset;
+    let mut out = Vec::new();
+    for _ in 0..n_entries {
+        let h = slice.get(p..p + 46)?;
+        if h[0..4] != CDH_SIG {
+            return None;
+        }
+        let made_by = u16::from_le_bytes([h[4], h[5]]);
+        let method = u16::from_le_bytes([h[10], h[11]]);
+        let crc = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
+        let csize = u32::from_le_bytes([h[20], h[21], h[22], h[23]]) as usize;
+        let usize_ = u32::from_le_bytes([h[24], h[25], h[26], h[27]]) as usize;
+        let nlen = u16::from_le_bytes([h[28], h[29]]) as usize;
+        let elen = u16::from_le_bytes([h[30], h[31]]) as usize;
+        let clen = u16::from_le_bytes([h[32], h[33]]) as usize;
+        let ext_attr = u32::from_le_bytes([h[38], h[39], h[40], h[41]]);
+        let loff = u32::from_le_bytes([h[42], h[43], h[44], h[45]]) as usize;
+        let name = std::str::from_utf8(slice.get(p + 46..p + 46 + nlen)?)
+            .ok()?
+            .to_string();
+        // Follow the local file header to where this entry's payload begins —
+        // the central dir's stored offset is only the LFH, whose name/extra
+        // lengths can differ from the central record's.
+        let lh = slice.get(loff..loff + 30)?;
+        if lh[0..4] != LFH_SIG {
+            return None;
+        }
+        let lh_nlen = u16::from_le_bytes([lh[26], lh[27]]) as usize;
+        let lh_elen = u16::from_le_bytes([lh[28], lh[29]]) as usize;
+        let data_start = loff.checked_add(30)?.checked_add(lh_nlen)?.checked_add(lh_elen)?;
+        let payload = slice.get(data_start..data_start.checked_add(csize)?)?;
+        // Unix symlink: external attrs carry the mode only when "made by" Unix.
+        let unix_mode = if made_by >> 8 == 3 { ext_attr >> 16 } else { 0 };
+        out.push(CdEntry {
+            name,
+            method,
+            crc,
+            usize: usize_,
+            payload,
+            is_symlink: unix_mode & 0o170000 == 0o120000,
+        });
+        p = p
+            .checked_add(46)?
+            .checked_add(nlen)?
+            .checked_add(elen)?
+            .checked_add(clen)?;
+    }
+    Some(out)
+}
+
+/// Decompress one ZIP payload by method: `0` stored, `8` raw deflate (via
+/// `flate2`), `93` Zstandard (via the pure-Rust `ruzstd`). `None` = a method we
+/// don't implement. When `dict` is `Some`, method-93 frames decode against that
+/// shared dictionary (large man overlays); the same decoder is reused across the
+/// overlay's entries. The output is bounded at `MAX_META_ENTRY + 1` so a crafted
+/// entry can't drive an unbounded allocation; the caller's size/CRC check then
+/// rejects anything that didn't decode to exactly its declared length.
+fn decompress(
+    method: u16,
+    payload: &[u8],
+    dict: Option<&mut ruzstd::FrameDecoder>,
+) -> Option<Result<Vec<u8>, String>> {
+    fn capped<R: Read>(r: R) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        r.take(MAX_META_ENTRY + 1)
+            .read_to_end(&mut out)
+            .map(|_| out)
+            .map_err(|e| e.to_string())
+    }
+    match method {
+        0 => Some(Ok(payload.to_vec())),
+        8 => Some(capped(flate2::read::DeflateDecoder::new(payload))),
+        93 => match dict {
+            Some(fd) => match ruzstd::StreamingDecoder::new_with_decoder(payload, fd) {
+                Ok(z) => Some(capped(z)),
+                Err(e) => Some(Err(e.to_string())),
+            },
+            None => match ruzstd::StreamingDecoder::new(payload) {
+                Ok(z) => Some(capped(z)),
+                Err(e) => Some(Err(e.to_string())),
+            },
+        },
+        _ => None,
+    }
+}
+
+/// Build the shared-dictionary decoder for one overlay, if it needs one: present
+/// only when the overlay has zstd `unpin/*` entries AND carries the reserved
+/// STORED `.unpin/zdict`. Returns `Ok(None)` for plain/non-zstd overlays. The
+/// dict entry is STORED, so its payload is the raw dictionary bytes.
+fn overlay_dict(cd: &[CdEntry]) -> Result<Option<ruzstd::FrameDecoder>, String> {
+    let needs_dict = cd
+        .iter()
+        .any(|e| e.method == 93 && e.name.starts_with("unpin/") && !e.name.ends_with('/'));
+    if !needs_dict {
+        return Ok(None);
+    }
+    let Some(zd) = cd.iter().find(|e| e.name == ZDICT_PATH && e.method == 0) else {
+        return Ok(None); // plain zstd overlay (small man set, no dict)
+    };
+    let dict = ruzstd::decoding::dictionary::Dictionary::decode_dict(zd.payload)
+        .map_err(|e| format!("embedded `{ZDICT_PATH}`: {e}"))?;
+    let mut fd = ruzstd::FrameDecoder::new();
+    fd.add_dict(dict)
+        .map_err(|e| format!("embedded `{ZDICT_PATH}`: {e}"))?;
+    Ok(Some(fd))
+}
+
+/// CRC-32 (ISO-HDLC, the ZIP variant) — reuses `flate2`'s, already a dependency.
+fn crc32(data: &[u8]) -> u32 {
+    let mut h = flate2::Crc::new();
+    h.update(data);
+    h.sum()
 }
 
 /// Validate the EOCD at `e` and return the enclosing `(zip_start, zip_end)`.
@@ -239,6 +401,11 @@ mod tests {
     enum M {
         Stored,
         Deflate,
+        /// Zstandard, ZIP method 93 — what `withMan` now emits for man pages.
+        Zstd,
+        /// Method 93 with the payload supplied verbatim (a pre-built zstd frame),
+        /// for the dictionary fixture whose frame was trained against `.unpin/zdict`.
+        ZstdRaw(Vec<u8>),
         /// Stored, but flagged as a unix symlink (external attr S_IFLNK).
         Symlink,
     }
@@ -255,6 +422,12 @@ mod tests {
         e.finish().unwrap()
     }
 
+    /// A standard single-frame zstd stream (the C `zstd` crate, dev-only) — the
+    /// reader must decode it with the pure-Rust `ruzstd`.
+    fn raw_zstd(data: &[u8]) -> Vec<u8> {
+        zstd::encode_all(data, 3).unwrap()
+    }
+
     /// Build a standard ZIP from `(name, data, method)` triples.
     fn build_zip(entries: &[(&str, &[u8], M)]) -> Vec<u8> {
         const DOS_DATE: u16 = 0x0021;
@@ -268,6 +441,8 @@ mod tests {
             let (m, payload): (u16, Vec<u8>) = match method {
                 M::Stored | M::Symlink => (0, data.to_vec()),
                 M::Deflate => (8, raw_deflate(data)),
+                M::Zstd => (93, raw_zstd(data)),
+                M::ZstdRaw(frame) => (93, frame.clone()),
             };
             let ext_attr = match method {
                 M::Symlink => (0o120777u32) << 16,
@@ -351,6 +526,58 @@ mod tests {
         assert_eq!(man.len(), 1);
         assert_eq!(man[0].path, "unpin/man/xz.1");
         assert_eq!(man[0].data, b".TH XZ 1\nbody");
+    }
+
+    #[test]
+    fn reads_zstd_man_pages() {
+        // What `withMan` now ships: aliases stored, man pages as zstd (method
+        // 93). The reader must decode them via ruzstd, with the CRC/size checks
+        // passing. Body is repetitive so zstd actually shrinks it.
+        let body = b".TH PERL 1\n".repeat(400);
+        let zip = build_zip(&[
+            ("unpin/aliases", b"perldoc\nperlbug\n", M::Stored),
+            ("unpin/man/perl.1", &body, M::Zstd),
+            ("unpin/man/perlfunc.1", b".TH PERLFUNC 1\nshort", M::Zstd),
+        ]);
+        let meta = read_bytes(&embed(&zip)).unwrap().unwrap();
+        assert_eq!(meta.aliases(), vec!["perldoc", "perlbug"]);
+        let mut man: Vec<_> = meta.entries_under("unpin/man/").collect();
+        man.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(man.len(), 2);
+        assert_eq!(man[0].path, "unpin/man/perl.1");
+        assert_eq!(man[0].data, body);
+        assert_eq!(man[1].data, b".TH PERLFUNC 1\nshort");
+    }
+
+    #[test]
+    fn reads_dict_compressed_man_page() {
+        // The large-man-set path: a shared zstd dictionary stored as `.unpin/zdict`
+        // and a page compressed against it (fixtures built with the real `zstd`
+        // CLI: `--train` then `-D`). The reader must load the dict and decode the
+        // method-93 frame through ruzstd — and must NOT surface the dict as an entry.
+        let dict: &[u8] = include_bytes!("testdata/man.zdict");
+        let plain: &[u8] = include_bytes!("testdata/man_page.1");
+        let frame = include_bytes!("testdata/man_page.1.zst").to_vec();
+        let zip = build_zip(&[
+            (ZDICT_PATH, dict, M::Stored),
+            ("unpin/man/tool42.1", plain, M::ZstdRaw(frame)),
+        ]);
+        let meta = read_bytes(&embed(&zip)).unwrap().unwrap();
+        assert!(meta.entry(ZDICT_PATH).is_none(), "dict must not be served");
+        let page = meta.entry("unpin/man/tool42.1").expect("man page entry");
+        assert_eq!(page.data, plain, "dict-decoded page must match the original");
+    }
+
+    #[test]
+    fn corrupt_zstd_payload_is_rejected() {
+        // A method-93 entry whose CRC won't match its (mangled) bytes must error,
+        // not silently yield garbage.
+        let mut zip = build_zip(&[("unpin/man/x.1", b"hello world hello world", M::Zstd)]);
+        // Corrupt the first byte of the zstd payload (the frame magic) — past the
+        // 30-byte local header + the entry name — so the decode itself fails.
+        let payload_start = 30 + "unpin/man/x.1".len();
+        zip[payload_start] ^= 0xff;
+        assert!(read_bytes(&embed(&zip)).is_err());
     }
 
     #[test]
