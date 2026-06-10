@@ -59,6 +59,19 @@ pub fn run(paths: &Paths, assume_yes: bool, force: bool) -> Result<(), String> {
             println!("unpin {tag} is already installed ({}).", link.display());
         }
     } else {
+        // Windows: replacing the registered binary in place (same-version
+        // re-bootstrap from a fresh download) severs the bin hardlink's
+        // introspectability — once `relocate` removes `dest`'s name, the bin
+        // entry is a sole-name file that the linker's sweep can no longer
+        // map to this package and would treat as foreign (prompting, or
+        // skipping the refresh entirely without a tty). Drop the link now,
+        // while `read_link` still resolves it; the linker recreates it right
+        // after. Best-effort: on failure the linker's foreign-file prompt is
+        // the (pre-existing) fallback.
+        #[cfg(windows)]
+        if dest.exists() && platform::read_link(&link).is_some_and(|t| t.starts_with(&vdir)) {
+            let _ = fs::remove_file(&link);
+        }
         let reloc = relocate(&current, &dest)?;
         install::link_installed(paths, &spec, &vdir, assume_yes)?;
         println!("Installed unpin {tag} ({}).", link.display());

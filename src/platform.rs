@@ -476,6 +476,21 @@ pub fn alias_link_filename(name: &str) -> String {
 #[cfg(windows)]
 const SIDELINED_MARKER: &str = ".unpin-old-";
 
+/// Whether a file name is a [`sideline_busy_link`] tombstone: anything,
+/// then the marker, then the sidelining process's PID. Requiring the digit
+/// tail (rather than a bare substring test) keeps a hypothetical package or
+/// alias whose *own* name contains the marker from being swept or hidden.
+#[cfg(windows)]
+fn is_sidelined_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    match name.rsplit_once(SIDELINED_MARKER) {
+        Some((head, pid)) => {
+            !head.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// Rename a bin entry we cannot delete — it is the executing image of a live
 /// process — out of the link slot. Returns the tombstone path so callers (the
 /// self-uninstall janitor) can finish the delete after this process exits.
@@ -495,11 +510,7 @@ pub fn sideline_busy_link(link: &Path) -> io::Result<PathBuf> {
 pub fn sweep_sidelined(bin: &Path) {
     if let Ok(entries) = fs::read_dir(bin) {
         for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .contains(SIDELINED_MARKER)
-            {
+            if is_sidelined_name(&entry.file_name()) {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -730,7 +741,7 @@ pub fn read_link(p: &Path) -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
-        if p.file_name()?.to_string_lossy().contains(SIDELINED_MARKER) {
+        if is_sidelined_name(p.file_name()?) {
             return None;
         }
         let names = hardlink_names(p)?;
