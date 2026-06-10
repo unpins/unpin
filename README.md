@@ -82,6 +82,10 @@ Native TLS uses an embedded `mbedtls` build, so `cmake`, `perl`, `python3`,
 and `libclang` need to be available — install them through your package
 manager if `cargo install` complains.
 
+One caveat: the opt-in [DNS fallback](#no-dns-android-minimal-containers) is
+linked into the official binaries by the Nix build — a Cargo build doesn't
+include it, so `UNPIN_DNS` and the `dns` config key have no effect there.
+
 ### From source via Nix
 
 ```sh
