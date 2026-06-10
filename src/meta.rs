@@ -111,7 +111,9 @@ fn read_bytes(data: &[u8]) -> Result<Option<Meta>, String> {
             }
             total = total.saturating_add(sz);
             if total > MAX_META_TOTAL {
-                return Err(format!("embedded meta exceeds {MAX_META_TOTAL} bytes total"));
+                return Err(format!(
+                    "embedded meta exceeds {MAX_META_TOTAL} bytes total"
+                ));
             }
             if entries.len() >= MAX_META_ENTRIES {
                 return Err(format!("embedded meta exceeds {MAX_META_ENTRIES} entries"));
@@ -242,7 +244,10 @@ fn parse_central_dir(slice: &[u8], eocd: usize) -> Option<Vec<CdEntry<'_>>> {
         }
         let lh_nlen = u16::from_le_bytes([lh[26], lh[27]]) as usize;
         let lh_elen = u16::from_le_bytes([lh[28], lh[29]]) as usize;
-        let data_start = loff.checked_add(30)?.checked_add(lh_nlen)?.checked_add(lh_elen)?;
+        let data_start = loff
+            .checked_add(30)?
+            .checked_add(lh_nlen)?
+            .checked_add(lh_elen)?;
         let payload = slice.get(data_start..data_start.checked_add(csize)?)?;
         // Unix symlink: external attrs carry the mode only when "made by" Unix.
         let unix_mode = if made_by >> 8 == 3 { ext_attr >> 16 } else { 0 };
@@ -565,7 +570,10 @@ mod tests {
         let meta = read_bytes(&embed(&zip)).unwrap().unwrap();
         assert!(meta.entry(ZDICT_PATH).is_none(), "dict must not be served");
         let page = meta.entry("unpin/man/tool42.1").expect("man page entry");
-        assert_eq!(page.data, plain, "dict-decoded page must match the original");
+        assert_eq!(
+            page.data, plain,
+            "dict-decoded page must match the original"
+        );
     }
 
     #[test]

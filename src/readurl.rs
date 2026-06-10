@@ -17,7 +17,7 @@
 //! carry (an all-digit host fails DNS-name validation, so rustls treats it as
 //! an `IpAddress` and checks the certificate's iPAddress SAN, not a dNSName).
 
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{CStr, c_char, c_int};
 use std::{ptr, slice};
 
 /// Generic HTTP fetch invoked by the C DNS-fallback shim — see the module docs
@@ -81,7 +81,9 @@ fn fetch(url: &str, body: &[u8], content_type: Option<&str>) -> Option<Vec<u8>> 
         minreq::post(url).with_body(body.to_vec())
     };
     if let Some(ct) = content_type {
-        req = req.with_header("Content-Type", ct).with_header("Accept", ct);
+        req = req
+            .with_header("Content-Type", ct)
+            .with_header("Accept", ct);
     }
     let resp = req.with_timeout(5).send().ok()?;
     if resp.status_code != 200 {

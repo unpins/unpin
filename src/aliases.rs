@@ -216,7 +216,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_printable_and_non_ascii() {
-        for n in ["foo bar", "foo\tbar", "foo\nbar", "café", "naïve", "emoji😀"] {
+        for n in [
+            "foo bar",
+            "foo\tbar",
+            "foo\nbar",
+            "café",
+            "naïve",
+            "emoji😀",
+        ] {
             assert!(validate_alias(n).is_err(), "{n} should be invalid");
         }
     }
