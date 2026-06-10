@@ -1,5 +1,5 @@
 {
-  description = "Standalone build of unpin";
+  description = "unpin — install programs straight from GitHub releases";
 
   nixConfig = {
     extra-substituters = [ "https://unpins.cachix.org" ];
@@ -185,5 +185,17 @@
           program = "${self.packages.${system}.default}/bin/unpin";
         };
       });
+
+      # CI manifest read by unpins/action-build (`nix eval .#manifest`). The
+      # `smoke` opt-in makes every build runner that can execute the artifact
+      # actually run it — notably macos-14 (Apple Silicon), where exec proves
+      # the appended metadata ZIP coexists with the ad-hoc linker signature,
+      # and the windows runner via action-build's smoke_windows job. The
+      # workflow `with:` inputs (package_name, bootstrap_naming) still win
+      # over manifest keys, so only the smoke fields live here.
+      manifest = {
+        smoke = [ "--version" ];
+        smoke_pattern = "^unpin [0-9]";
+      };
     };
 }

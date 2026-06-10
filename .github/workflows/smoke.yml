@@ -1,0 +1,66 @@
+# Extended smoke: a real unpin session (install jq, run it, `unpin man`,
+# bundle, update, uninstall — see ../smoke-scenario.sh) on all three OSes,
+# using only the standard GitHub runners. The .exe is cross-built on ubuntu
+# and executed on windows-latest, the same pattern as action-build's
+# smoke_windows job; macos-14 is Apple Silicon, so the darwin job also
+# proves the appended metadata ZIP coexists with the ad-hoc code signature
+# at exec time. The quick `--version` smoke after every build lives in
+# action-build via the flake's `manifest.smoke`; this workflow is the deep
+# pass, run by hand before a release:
+#
+#   gh workflow run "Extended smoke"
+name: Extended smoke
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: extended-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  posix:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Build
+        run: nix build . --print-build-logs
+      - name: Scenario
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash .github/smoke-scenario.sh "$(pwd)/result/bin/unpin"
+
+  build-exe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Cross-build windows binary
+        run: nix build '.#packages.x86_64-linux."windows-x86_64"' --print-build-logs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unpin-exe
+          path: result/bin/unpin.exe
+
+  windows:
+    needs: build-exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: unpin-exe
+      - name: Scenario
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash .github/smoke-scenario.sh "$(pwd)/unpin.exe"
