@@ -60,6 +60,10 @@ curl.exe -fsSLo unpin.exe https://unpins.org/unpin-x86_64-windows.exe
 (Linux/macOS) or `%LOCALAPPDATA%\unpin` (Windows) — a user directory — and only
 edits your `PATH` after asking. Open a new shell for the change to take effect.
 
+Every build has a `.sha256` file at the same URL with `.sha256` appended —
+compare it against `sha256sum unpin` (Linux), `shasum -a 256 unpin` (macOS),
+or `CertUtil -hashfile unpin.exe SHA256` (Windows) to verify the download.
+
 ### From source via Cargo
 
 ```sh
