@@ -19,6 +19,11 @@ Versioning](https://semver.org).
   `unpin --help`.
 
 ### Changed
+- **Windows: programs go on `PATH` as real `<name>.exe` NTFS hardlinks**, not
+  `.cmd` wrappers. They now resolve everywhere an `.exe` does — cmd,
+  PowerShell, git-bash/MSYS, WSL interop — and `unpin list`/`info` can show
+  which version a link points at. Breaking for v0.3.0 installs (no `.cmd`
+  migration): reinstall the affected packages.
 - **`--help` is colored and wraps to the terminal width.** Section headers
   yellow, commands/flags/literals green (same palette throughout, including
   the Auth/Networking/Config footer and the DNS hint), prose re-flows to the
