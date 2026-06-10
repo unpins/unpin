@@ -3,8 +3,8 @@
 > Install programs straight from GitHub releases — no root, no distro packages.
 
 `unpin` is the CLI installer of the [unpins](https://unpins.org) project. It
-fetches a single self-contained binary from a GitHub release, verifies its checksum, and
-either runs it on the spot or drops it in your PATH.
+fetches a program from a GitHub release, verifies its checksum, and either
+runs it on the spot or drops it in your PATH.
 
 <div align="center">
   <picture>
@@ -27,16 +27,18 @@ unpin install BurntSushi/ripgrep
 
 ## The unpins catalog
 
-A name with no owner installs from the [unpins catalog](https://unpins.org/packages.html) —
-a curated set of common programs we build as single self-contained binaries,
-built natively for Linux, macOS, and Windows. `unpin install jq` resolves to [`unpins/jq`](https://github.com/unpins/jq)
-and works the same on Linux, macOS, and Windows. You're not limited to it: give
-`unpin` any `owner/repo[@version]` and it installs from that GitHub release.
+A name with no owner installs from the [unpins catalog](https://unpins.org/packages.html),
+a curated set of common programs that we build as single self-contained
+binaries. `unpin install jq` resolves to [`unpins/jq`](https://github.com/unpins/jq)
+and works the same on Linux, macOS, and Windows. You're not limited to the
+catalog: give `unpin` any `owner/repo[@version]` and it installs from that
+GitHub release.
 
 ## Install
 
-The official builds are at **<https://unpins.org>**. Each is a single self-contained binary. Download it, then run `unpin install` — it moves
-the binary into place and offers to add that directory to your `PATH`:
+The official builds are at **<https://unpins.org>**. Each platform gets a
+single self-contained binary. Download yours, then run `unpin install` — it
+moves the binary into place and offers to add that directory to your `PATH`:
 
 ```sh
 # Linux
@@ -97,9 +99,9 @@ unpin [run] <repo> [args...] Fetch and execute a binary without linking (default
 unpin install                Self-install: move this binary into place and add it to PATH
 unpin install <repo>...      Install one or more packages onto PATH
 unpin update [<name>...]     Pull newer releases (all packages if no names)
-unpin uninstall <name>...    Uninstall one or more packages (all if no names)
+unpin uninstall [<name>...]  Uninstall one or more packages (all if no names)
 unpin list                   List installed packages
-unpin info <name>...         Show details for installed packages
+unpin info <name>...         Show details for packages (installed or not)
 unpin prune                  Drop old versions, keep the active one
 unpin completion <shell>     Print a shell completion script
 ```
@@ -114,7 +116,7 @@ Common flags:
 | Flag                | Meaning                                                    |
 | ------------------- | ---------------------------------------------------------- |
 | `-y`, `--yes`       | Skip confirmation prompts                                  |
-| `-j N`, `--jobs N`  | Parallel workers for download + extract (default: min(N, 4)) |
+| `-j N`, `--jobs N`  | Parallel workers for download + extract (default: one per package, max 4) |
 | `--pick`            | Always prompt when multiple release assets match           |
 | `-v`, `--verbose`   | Print every HTTP request and the release assets filtered out |
 | `-V`, `--version`   | Print `unpin <version>`                                    |
