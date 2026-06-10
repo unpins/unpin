@@ -24,6 +24,10 @@ Versioning](https://semver.org).
   PowerShell, git-bash/MSYS, WSL interop — and `unpin list`/`info` can show
   which version a link points at. Breaking for v0.3.0 installs (no `.cmd`
   migration): reinstall the affected packages.
+- **unpin's own man page is embedded by the release pipeline**, through the
+  same metadata overlay every catalog package uses, instead of a special
+  compiled-in copy. `unpin man unpin` works as before on release binaries; a
+  source build via `cargo install` carries no embedded manual.
 - **`--help` is colored and wraps to the terminal width.** Section headers
   yellow, commands/flags/literals green (same palette throughout, including
   the Auth/Networking/Config footer and the DNS hint), prose re-flows to the

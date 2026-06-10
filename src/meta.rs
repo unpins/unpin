@@ -20,14 +20,6 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-/// Plant unpin's own metadata ZIP (its `unpin.1`, built by `build.rs`) in the
-/// binary so the byte-scan below finds it in our own file, exactly as it would
-/// in any other unpins binary. `#[used]` keeps the bytes through dead-code
-/// elimination — `unpin bundle` reads them back off disk via `current_exe()`,
-/// which is how the `man` package fetches unpin's own manual (`unpin man unpin`).
-#[used]
-static UNPIN_META_ZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unpin_meta.zip"));
-
 /// Don't even try to scan an absurdly large file into memory.
 const MAX_FILE: u64 = 512 * 1024 * 1024;
 /// Caps so a crafted ZIP can't drive unbounded allocation while reading `unpin/*`.
@@ -649,19 +641,12 @@ mod tests {
     }
 
     #[test]
-    fn reads_own_embedded_zip() {
-        // The test binary carries the same `#[used]` UNPIN_META_ZIP + build.rs
-        // ZIP as the real `unpin` binary, so scanning our own file must find it.
-        // Locks down `#[used]` retention AND that the self-scan needs no marker
-        // (the EOCD validation rejects the reader's own .rodata constants).
+    fn own_binary_scan_is_clean() {
+        // The reader's own .rodata constants (EOCD/CDH signatures) must not be
+        // mistaken for an embedded ZIP when unpin scans its own file — the
+        // cargo-built test binary carries no metadata overlay (that's appended
+        // by the nix build), so the self-scan must come back empty, not error.
         let exe = std::env::current_exe().expect("current_exe");
-        let meta = read(&exe)
-            .expect("read own binary")
-            .expect("embedded meta ZIP present");
-        let page = meta.entry("unpin/man/unpin.1").expect("unpin.1 entry");
-        assert!(
-            page.data.windows(9).any(|w| w == b".TH UNPIN"),
-            "expected unpin man roff source"
-        );
+        assert!(read(&exe).expect("read own binary").is_none());
     }
 }

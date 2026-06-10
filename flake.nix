@@ -45,6 +45,22 @@
           doCheck = false;
         }).overrideAttrs (_: { stripAllList = [ "bin" ]; });
 
+      # Embed unpin's own man page (`unpin.1`, hand-authored at the repo root)
+      # as the standard `unpin/man/unpin.1` metadata-overlay entry, exactly the
+      # way every catalog package gets its man embedded. `withMan` harvests
+      # from a share/man tree, so wrap the single roff file in that layout.
+      # Applied outermost (after withDnsFallback): it only appends a postFixup,
+      # so the link-flag surgery underneath is untouched. A plain
+      # `cargo install` build carries no overlay — `unpin man unpin` then
+      # reports no embedded manual, which is the accepted trade-off for
+      # out-of-ecosystem builds.
+      unpinManRoot = pkgs: pkgs.buildPackages.runCommand "unpin-man-src" { } ''
+        mkdir -p $out/share/man/man1
+        cp ${./unpin.1} $out/share/man/man1/unpin.1
+      '';
+      withUnpinMan = pkgs: drv:
+        ulib.withMan pkgs { primary = "unpin"; manRoot = unpinManRoot pkgs; } drv;
+
       # withDnsFallback links the __wrap_getaddrinfo archive into the
       # linux-static binary so it resolves names where /etc/resolv.conf is
       # absent (Android, minimal containers) — the same fix the C catalog gets
@@ -57,10 +73,11 @@
       # final link too — verified end-to-end on i686 and aarch64 (the Android
       # arch) with no /etc/resolv.conf.
       nativeUnpin = system:
-        ulib.withDnsFallback nixpkgsFor.${system}.pkgsStatic (mkUnpin {
-          rustPlatform = nixpkgsFor.${system}.pkgsStatic.rustPlatform;
-          env.RUSTFLAGS = "-C relocation-model=static";
-        });
+        withUnpinMan nixpkgsFor.${system}.pkgsStatic
+          (ulib.withDnsFallback nixpkgsFor.${system}.pkgsStatic (mkUnpin {
+            rustPlatform = nixpkgsFor.${system}.pkgsStatic.rustPlatform;
+            env.RUSTFLAGS = "-C relocation-model=static";
+          }));
 
       # auditable=false: rustc 1.91 + LTO + cargo-auditable overflows mingw's
       # 32-bit relocation limit. Plain `cargo build --target` skips auditable.
@@ -68,10 +85,11 @@
       # windows it rides --wrap (GNU ld, mingw) + the COFF-compiled archive, so
       # Rust's std::net resolution falls back to UDP/DoH when the OS resolver
       # can't be reached (proven on a real Win10 VM).
-      windowsUnpin = ulib.withDnsFallback nixpkgsFor.x86_64-linux.pkgsCross.mingwW64 (mkUnpin {
-        rustPlatform = nixpkgsFor.x86_64-linux.pkgsCross.mingwW64.rustPlatform;
-        auditable = false;
-      });
+      windowsUnpin = withUnpinMan nixpkgsFor.x86_64-linux.pkgsCross.mingwW64
+        (ulib.withDnsFallback nixpkgsFor.x86_64-linux.pkgsCross.mingwW64 (mkUnpin {
+          rustPlatform = nixpkgsFor.x86_64-linux.pkgsCross.mingwW64.rustPlatform;
+          auditable = false;
+        }));
 
       # rustc injects `-liconv` on darwin targets. The default cross stdenv
       # ships libiconv as a dylib → the binary carries an LC_LOAD_DYLIB for
@@ -89,7 +107,7 @@
       # x86_64-darwin builds get the fallback through nativeUnpin's pkgsStatic.
       darwinX86Unpin =
         let cross = nixpkgsFor.aarch64-darwin.pkgsCross.x86_64-darwin; in
-        ulib.withDnsFallback cross
+        withUnpinMan cross (ulib.withDnsFallback cross
         ((mkUnpin { rustPlatform = cross.rustPlatform; }).overrideAttrs (old: {
           buildInputs = [ cross.pkgsStatic.libiconv ] ++ (old.buildInputs or [ ]);
           # buildInputs above only covers the target (x86_64) link. In this
@@ -105,7 +123,7 @@
           # `NIX_LDFLAGS_<suffixSalt>` (salt = arm64_apple_darwin), with the
           # build-arch (aarch64) libiconv, not the x86_64 target one.
           NIX_LDFLAGS_arm64_apple_darwin = "-L${cross.buildPackages.libiconv}/lib";
-        }));
+        })));
 
       # Rustup-distributed toolchain with every cross target we ship. rustup
       # supplies `rust-std-<triple>` as a precompiled tarball, so adding a
@@ -136,16 +154,17 @@
       # override threads rust-overlay's native binary through unchanged.
       mkCross = crossPkgs:
         let rust = rustToolchain crossPkgs.buildPackages; in
-        ulib.withDnsFallback crossPkgs.pkgsStatic (mkUnpin {
-          rustPlatform = crossPkgs.makeRustPlatform { cargo = rust; rustc = rust; };
-          auditable = false;
-          # rust-overlay's musl target specs default to `crt-static = false`
-          # (rustup's convention), unlike nixpkgs's pkgsStatic which flips it
-          # on. Without the explicit `+crt-static` the binary keeps a musl
-          # dynamic-link interpreter and action-build's portability check
-          # rejects it.
-          env.RUSTFLAGS = "-C target-feature=+crt-static";
-        });
+        withUnpinMan crossPkgs.pkgsStatic
+          (ulib.withDnsFallback crossPkgs.pkgsStatic (mkUnpin {
+            rustPlatform = crossPkgs.makeRustPlatform { cargo = rust; rustc = rust; };
+            auditable = false;
+            # rust-overlay's musl target specs default to `crt-static = false`
+            # (rustup's convention), unlike nixpkgs's pkgsStatic which flips it
+            # on. Without the explicit `+crt-static` the binary keeps a musl
+            # dynamic-link interpreter and action-build's portability check
+            # rejects it.
+            env.RUSTFLAGS = "-C target-feature=+crt-static";
+          }));
 
       linuxI686Unpin   = mkCross nixpkgsFor.x86_64-linux.pkgsCross.musl32;
       linuxPpc64leUnpin = mkCross nixpkgsFor.x86_64-linux.pkgsCross.musl-power;
