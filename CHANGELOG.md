@@ -19,6 +19,12 @@ Versioning](https://semver.org).
   `unpin --help`.
 
 ### Changed
+- **`--help` is colored and wraps to the terminal width.** Section headers
+  yellow, commands/flags/literals green (same palette throughout, including
+  the Auth/Networking/Config footer and the DNS hint), prose re-flows to the
+  terminal; piped output stays plain. The banner now carries the project
+  slogan, and `--jobs`'s default is described as what it is (one worker per
+  package, max 4).
 - Reads **zstd-compressed embedded metadata**, so `unpin man <pkg>` and
   `unpin bundle` keep working as catalog packages shrink their embedded man
   pages. Backward-compatible: older (deflate) packages still read fine.

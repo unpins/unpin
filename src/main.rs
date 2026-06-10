@@ -23,8 +23,15 @@ mod readurl;
 mod setup;
 mod sigint;
 
+// The palette help.rs mirrors for the hand-written parts: section headers
+// yellow, typeable literals green (the scheme gleam uses).
+const STYLES: clap::builder::Styles = clap::builder::Styles::styled()
+    .header(clap::builder::styling::AnsiColor::Yellow.on_default())
+    .usage(clap::builder::styling::AnsiColor::Yellow.on_default())
+    .literal(clap::builder::styling::AnsiColor::Green.on_default());
+
 #[derive(Parser, Debug)]
-#[command(name = "unpin", version)]
+#[command(name = "unpin", version, styles = STYLES)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -83,7 +90,7 @@ impl Cmd {
 struct InstallCmd {
     #[command(flatten)]
     flags: InstallUpdateFlags,
-    /// owner/repo (or bare name for unpins/<name>), optionally with @version. Omit to self-install unpin.
+    /// owner/repo (or a catalog name for unpins/<name>), optionally with @version. Omit to self-install unpin.
     #[arg(value_name = "PKG")]
     pkgs: Vec<String>,
 }
@@ -157,7 +164,7 @@ struct InfoCmd {
     /// Print every HTTP request and show release assets that were filtered out
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
-    /// installed name, owner/repo, or bare name for unpins/<name>
+    /// installed name, owner/repo, or a catalog name for unpins/<name>
     #[arg(value_name = "PKG", required = true)]
     pkgs: Vec<String>,
 }
@@ -188,7 +195,7 @@ struct RunCmd {
     /// Print every HTTP request and show release assets that were filtered out
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
-    /// owner/repo (or bare name for unpins/<name>), optionally with @version
+    /// owner/repo (or a catalog name for unpins/<name>), optionally with @version
     #[arg(value_name = "PKG")]
     pkg: String,
     /// arguments forwarded to the binary
@@ -282,7 +289,7 @@ struct InstallUpdateFlags {
     /// cached version (self-install just refreshes the placed binary and links)
     #[arg(short = 'f', long = "force")]
     force: bool,
-    /// Parallel downloads (default: min(N, 4))
+    /// Parallel downloads (default: one per package, max 4)
     #[arg(
         short = 'j',
         long = "jobs",
@@ -412,7 +419,7 @@ fn classify_help(pre_ddash: &[&str]) -> HelpKind {
 /// Parse argv. If the user didn't lead with a subcommand or top-level flag,
 /// try a second pass with `run` injected as the default subcommand — so
 /// `unpin owner/repo [args...]` runs the package, and `unpin man coreutils ls`
-/// dispatches the `man` verb to the `man` package (a bare name is now run, not
+/// dispatches the `man` verb to the `man` package (a catalog name is now run, not
 /// installed; installing is the explicit `unpin install`). On retry failure,
 /// return the original error so clap's error usage line doesn't expose the
 /// injected prefix.

@@ -1,12 +1,13 @@
 //! The hand-written parts of `--help` (banner, footer) and the DNS hint.
 //!
-//! clap renders the generated help colored (`color` feature) and wrapped to
-//! the terminal (`wrap_help`); these printers follow the same two rules so the
-//! seam between generated and hand-written output is invisible: section
-//! headers are bold+underline, user-typeable literals are bold, prose re-wraps
-//! to the width of the stream it goes to, and copy-pasteable example lines are
-//! never wrapped. `console` (already used by the progress UI) supplies the
-//! styling — it strips ANSI when the stream isn't a tty, like clap does.
+//! clap renders the generated help colored (`color` feature, palette set by
+//! `STYLES` in main.rs) and wrapped to the terminal (`wrap_help`); these
+//! printers follow the same rules so the seam between generated and
+//! hand-written output is invisible: section headers yellow, user-typeable
+//! literals green, prose re-wraps to the width of the stream it goes to, and
+//! copy-pasteable example lines are never wrapped. `console` (already used by
+//! the progress UI) supplies the styling — it strips ANSI when the stream
+//! isn't a tty, like clap does.
 
 use std::path::Path;
 
@@ -21,8 +22,8 @@ const MIN_DESC_WIDTH: usize = 25;
 pub fn banner() {
     let out = Out { err: false };
     out.line(&format!(
-        "{} — install programs from GitHub releases",
-        out.bold(&format!("unpin {}", env!("CARGO_PKG_VERSION")))
+        "{} — Unpin your programs from your OS",
+        out.lit(&format!("unpin {}", env!("CARGO_PKG_VERSION")))
     ));
     out.line("https://unpins.org");
 }
@@ -129,14 +130,14 @@ pub fn dns_hint(config: &Path) {
         0,
     ));
     out.line("");
-    // The opt-in lines are copy-paste material: bold, never wrapped.
+    // The opt-in lines are copy-paste material: styled, never wrapped.
     out.line(&format!(
         "  one run:   {}",
-        out.bold("UNPIN_DNS=\"1.1.1.1 8.8.8.8\" unpin …")
+        out.lit("UNPIN_DNS=\"1.1.1.1 8.8.8.8\" unpin …")
     ));
     out.line(&format!(
         "  always:    add {} to {}",
-        out.bold("dns = 1.1.1.1 8.8.8.8"),
+        out.lit("dns = 1.1.1.1 8.8.8.8"),
         config.display()
     ));
     out.line("             (then every unpins program uses it)");
@@ -169,8 +170,10 @@ impl Out {
             .max(40)
     }
 
-    fn bold(&self, s: &str) -> String {
-        let styled = console::style(s).bold();
+    /// A user-typeable literal — env var, config line, command. Green, like
+    /// clap's `literal` style in `STYLES`.
+    fn lit(&self, s: &str) -> String {
+        let styled = console::style(s).green();
         if self.err {
             styled.for_stderr().to_string()
         } else {
@@ -178,8 +181,9 @@ impl Out {
         }
     }
 
+    /// A section header. Yellow, like clap's `header` style in `STYLES`.
     fn header(&self, s: &str) -> String {
-        let styled = console::style(s).bold().underlined();
+        let styled = console::style(s).yellow();
         if self.err {
             styled.for_stderr().to_string()
         } else {
@@ -198,7 +202,7 @@ impl Out {
         ));
     }
 
-    /// Two-column rows: bold term, plain description wrapped with a hanging
+    /// Two-column rows: green term, plain description wrapped with a hanging
     /// indent at the description column. When the terminal is too narrow for
     /// a useful side column, the description moves below the term instead
     /// (clap's next-line-help, same idea).
@@ -211,7 +215,7 @@ impl Out {
         let desc_col = indent + term_w + 2;
         for (term, desc) in rows {
             if width.saturating_sub(desc_col) < MIN_DESC_WIDTH {
-                self.line(&format!("{}{}", " ".repeat(indent), self.bold(term)));
+                self.line(&format!("{}{}", " ".repeat(indent), self.lit(term)));
                 let ind = indent + 4;
                 self.line(&format!(
                     "{}{}",
@@ -223,7 +227,7 @@ impl Out {
                 self.line(&format!(
                     "{}{}{}{}",
                     " ".repeat(indent),
-                    self.bold(term),
+                    self.lit(term),
                     " ".repeat(pad),
                     wrapped(desc, width, desc_col, desc_col)
                 ));
