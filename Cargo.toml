@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 minreq = { version = "2", default-features = false, features = ["https-rustls"] }
-clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "color", "wrap_help"] }
 clap_complete = { version = "4", default-features = false }
 nanoserde = { version = "0.2", default-features = false, features = ["json", "std"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

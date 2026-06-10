@@ -48,9 +48,14 @@ pub fn saw_dns_failure() -> bool {
 fn transport_err(url: &str, e: impl std::fmt::Display) -> String {
     let msg = format!("HTTP GET {url}: {e}");
     let dns = msg.contains("failed to lookup address information")
-        || ["os error 11001", "os error 11002", "os error 11003", "os error 11004"]
-            .iter()
-            .any(|c| msg.contains(c));
+        || [
+            "os error 11001",
+            "os error 11002",
+            "os error 11003",
+            "os error 11004",
+        ]
+        .iter()
+        .any(|c| msg.contains(c));
     if dns {
         DNS_FAILURE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -117,9 +122,7 @@ mod minreq_backend {
             // malicious/MITM'd endpoint could exhaust memory before we ever
             // look at it. Read at most CAP+1 bytes so an exactly-CAP body
             // still passes while anything larger trips the overflow check.
-            let resp = req
-                .send_lazy()
-                .map_err(|e| transport_err(url, e))?;
+            let resp = req.send_lazy().map_err(|e| transport_err(url, e))?;
             let status = resp.status_code as u16;
             let mut body = Vec::new();
             Read::take(resp, GET_BODY_CAP_BYTES + 1)
