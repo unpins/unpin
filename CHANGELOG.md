@@ -28,3 +28,26 @@ Versioning](https://semver.org).
 - Reads **zstd-compressed embedded metadata**, so `unpin man <pkg>` and
   `unpin bundle` keep working as catalog packages shrink their embedded man
   pages. Backward-compatible: older (deflate) packages still read fine.
+
+## [0.3.0] — 2026-06-08
+
+**First public release** (earlier versions were internal). `unpin` arrives
+with its core feature set complete:
+
+- **Run by default** — `unpin ffmpeg -version` fetches the program from a
+  GitHub release, verifies its SHA-256, and runs it; nothing is installed.
+  Putting it on `PATH` is the explicit `unpin install`.
+- **The unpins catalog** — a catalog name (`unpin install htop`) resolves to
+  `unpins/htop`: curated programs built as single self-contained binaries,
+  natively for Linux, macOS, and Windows. Any `owner/repo[@version]` installs
+  from that repo's releases just the same.
+- **The full management cycle** — `update`, `uninstall`, `list`, `info`,
+  `prune`; parallel downloads with a live progress display; multicall
+  aliases (`coreutils` can install its applets as commands).
+- **Self-install** — `unpin install` with no package moves the downloaded
+  binary into place and offers to put its directory on `PATH`. No root.
+- **Helper verbs and embedded metadata** — `unpin man coreutils ls` renders
+  the manual embedded in the package's own binary (via the `man` package);
+  `unpin bundle` exposes the raw entries.
+- **Shell completions** for bash, zsh, fish, and elvish, generated from the
+  real parser.
