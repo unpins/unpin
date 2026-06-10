@@ -131,8 +131,7 @@ downloads fail with a resolver error. unpin and every program from the catalog
 can resolve through a public DNS server instead, but that fallback is **off by
 default**: it never second-guesses a working resolver, and even when enabled it
 only kicks in when the system resolver can't be reached at all. On such a
-failure unpin explains this and, interactively, offers to turn it on. To do it
-yourself:
+failure unpin prints a short hint with both ways to turn it on:
 
 ```sh
 # one run:

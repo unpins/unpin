@@ -10,8 +10,8 @@ Versioning](https://semver.org).
   On a host that can't reach any DNS server — some containers, Android, a
   dead/blocked nameserver — downloads fail to resolve. `unpin` can now resolve
   through a public DNS server instead, but it stays **off by default** so it
-  never second-guesses your resolver. On such a failure it explains how to turn
-  it on and, in a terminal, offers to enable one now and save it. Set
+  never second-guesses your resolver. When an error looks like a failed name
+  resolution, `unpin` prints a short hint with both ways to turn it on: set
   `UNPIN_DNS="1.1.1.1 8.8.8.8"` for a single run, or add `dns = 1.1.1.1 8.8.8.8`
   to the config file — which every unpins program then honors, not just `unpin`.
   A normal answer, including a deliberate "no such host", is always respected;

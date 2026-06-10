@@ -25,6 +25,38 @@ pub trait HttpStream: Read {
 /// separately by its callers.
 pub const GET_BODY_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Latched by [`transport_err`] when any HTTP error text reads like a failed
+/// host-name resolution. `main` checks it after a failed command to print the
+/// opt-in DNS-fallback hint — errors reach `main` summarized ("N operation(s)
+/// failed"), so the detection has to happen here, where every transport error
+/// is born. May be set from pump threads; hence atomic.
+static DNS_FAILURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether any request this run failed on what looks like name resolution.
+pub fn saw_dns_failure() -> bool {
+    DNS_FAILURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Format a transport error, latching [`saw_dns_failure`] when it reads like a
+/// failed resolution. Loose on purpose: the hint it gates is hedged ("may be"),
+/// so a false positive costs a few harmless lines while a false negative hides
+/// the only pointer to the fix. Text is all there is to match on — std throws
+/// the numeric EAI code away on unix (`ErrorKind::Uncategorized`, no
+/// `raw_os_error`), leaving only its stable message prefix; Windows formats the
+/// WSA name-resolution codes into the message (`(os error 1100X)`:
+/// HOST_NOT_FOUND/TRY_AGAIN/NO_RECOVERY/NO_DATA).
+fn transport_err(url: &str, e: impl std::fmt::Display) -> String {
+    let msg = format!("HTTP GET {url}: {e}");
+    let dns = msg.contains("failed to lookup address information")
+        || ["os error 11001", "os error 11002", "os error 11003", "os error 11004"]
+            .iter()
+            .any(|c| msg.contains(c));
+    if dns {
+        DNS_FAILURE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    msg
+}
+
 /// Minimum surface unpin needs from an HTTP client.
 ///
 /// Contract:
@@ -87,12 +119,12 @@ mod minreq_backend {
             // still passes while anything larger trips the overflow check.
             let resp = req
                 .send_lazy()
-                .map_err(|e| format!("HTTP GET {url}: {e}"))?;
+                .map_err(|e| transport_err(url, e))?;
             let status = resp.status_code as u16;
             let mut body = Vec::new();
             Read::take(resp, GET_BODY_CAP_BYTES + 1)
                 .read_to_end(&mut body)
-                .map_err(|e| format!("HTTP GET {url}: {e}"))?;
+                .map_err(|e| transport_err(url, e))?;
             if body.len() as u64 > GET_BODY_CAP_BYTES {
                 return Err(format!(
                     "response exceeded {GET_BODY_CAP_BYTES}-byte cap for {url}"
@@ -175,7 +207,7 @@ mod minreq_backend {
                 let mut resp = match req.send_lazy() {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = head_tx.send(Head::Failed(format!("HTTP GET {owned_url}: {e}")));
+                        let _ = head_tx.send(Head::Failed(transport_err(&owned_url, e)));
                         return;
                     }
                 };

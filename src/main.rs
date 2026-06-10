@@ -7,11 +7,6 @@ mod archive;
 mod bundle;
 mod config;
 mod ctx;
-// Opt-in DNS fallback: the strong override of the C shim's
-// `unpin_dns_note_unreachable` hook plus the teach-on-failure UX. The override
-// is kept by `#[no_mangle]` (bound by the C archive when linked, an unused
-// export otherwise); the UX is driven from `main`'s error path.
-mod dns;
 mod github;
 mod http;
 mod install;
@@ -552,77 +547,42 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Map a command result to a process exit code. Child exit codes are 8-bit
-    // on Unix (waitpid masks the low byte); on Windows they fit a DWORD but
-    // ExitCode caps at u8 anyway. Truncating is the same thing the shell does
-    // after a child dies, so callers see the conventional value.
-    let exit = |r: Result<i32, String>| -> ExitCode {
-        match r {
-            Ok(0) => ExitCode::SUCCESS,
-            Ok(code) => ExitCode::from((code & 0xff) as u8),
-            Err(e) => {
-                eprintln!("unpin: {e}");
-                ExitCode::FAILURE
-            }
-        }
-    };
-
     match cli.command.run(&paths) {
-        // The failure was "system resolver unreachable, no opt-in DNS" (the C
-        // shim latched it). Teach the user about the opt-in fallback; if they
-        // enable a resolver interactively, run the whole command once more in
-        // a RELAUNCHED process with `UNPIN_DNS` in its environment.
-        Err(e) if dns::was_resolver_unreachable() => {
-            if dns::offer_fallback(&paths) {
-                relaunch_with_dns(&raw)
-            } else {
-                eprintln!("unpin: {e}");
-                ExitCode::FAILURE
+        Ok(0) => ExitCode::SUCCESS,
+        // Child exit codes are 8-bit on Unix (waitpid masks the low byte); on
+        // Windows they fit a DWORD but ExitCode caps at u8 anyway. Truncating
+        // is the same thing the shell does after a child dies, so callers see
+        // the conventional value.
+        Ok(code) => ExitCode::from((code & 0xff) as u8),
+        Err(e) => {
+            eprintln!("unpin: {e}");
+            // `e` is often just a summary ("N operation(s) failed") — the
+            // per-request errors were printed (and classified) where they
+            // were born, in the http layer. Its latch is the signal.
+            if http::saw_dns_failure() {
+                print_dns_hint(&paths.config);
             }
+            ExitCode::FAILURE
         }
-        other => exit(other),
     }
 }
 
-/// Run this same command line again with `UNPIN_DNS=`[`dns::SUGGESTED`] in the
-/// new process' environment — the DNS-fallback retry after the user opted in.
-///
-/// A relaunch, not an in-process retry with `env::set_var`: the failed run can
-/// leave detached HTTP pump threads behind (`http::PumpStream` — a worker that
-/// hits its idle window abandons its pump mid-request), and on this exact
-/// failure path a stray pump may still sit inside `getaddrinfo`, where the C
-/// shim calls `getenv("UNPIN_DNS")`. `set_var` under a possibly concurrent
-/// `getenv` is UB; `Command::env` builds the child's environment privately and
-/// never touches ours. No re-prompt loop is possible: with `UNPIN_DNS` set the
-/// shim has resolvers, so its no-opt-in hook (the latch gating this path)
-/// can't fire in the new process.
-///
-/// On unix this `exec`s — the process image is replaced, stray threads and
-/// all, and the command keeps our pid/TTY/signal disposition. On windows it
-/// spawns the child and forwards its exit code.
-fn relaunch_with_dns(raw: &[String]) -> ExitCode {
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from(&raw[0]));
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(&raw[1..]).env("UNPIN_DNS", dns::SUGGESTED);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let e = cmd.exec(); // replaces the process; returns only on failure
-        eprintln!("unpin: couldn't relaunch for the DNS retry ({e})");
-        ExitCode::FAILURE
-    }
-    #[cfg(not(unix))]
-    {
-        match cmd.status() {
-            // None = terminated by signal (unix-only) — call it plain failure.
-            Ok(st) => ExitCode::from((st.code().unwrap_or(1) & 0xff) as u8),
-            Err(e) => {
-                eprintln!("unpin: couldn't relaunch for the DNS retry ({e})");
-                ExitCode::FAILURE
-            }
-        }
-    }
+/// A short, hedged hint after a resolution-looking failure: the cause MAY be a
+/// host with no working DNS (Android, minimal containers), and the opt-in
+/// fallback is the fix. Teaching only — no prompt, no retry; the user opts in
+/// and reruns the command themselves. The C shim (nix-lib/dns-fallback) picks
+/// either source up on its own: `$UNPIN_DNS` from the environment, the `dns`
+/// key straight from the config file (which is why the config line covers
+/// every unpins program, not just unpin).
+fn print_dns_hint(config: &std::path::Path) {
+    eprintln!();
+    eprintln!("This may be a DNS problem. If this host can't reach a DNS server (common on");
+    eprintln!("Android and in minimal containers), unpin can resolve through a public one —");
+    eprintln!("it's off by default, so opt in and rerun the command:");
+    eprintln!();
+    eprintln!("  one run:   UNPIN_DNS=\"1.1.1.1 8.8.8.8\" unpin …");
+    eprintln!("  always:    add `dns = 1.1.1.1 8.8.8.8` to {}", config.display());
+    eprintln!("             (then every unpins program uses it)");
 }
 
 #[cfg(test)]
