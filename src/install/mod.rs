@@ -18,8 +18,6 @@ mod spec;
 
 use asset::pick_asset;
 use job::{PipelineMode, PipelineRequest};
-#[cfg(windows)]
-use linker::aliases_from_vdir;
 use linker::{
     ensure_executable, is_executable, link_all_executables, sweep_dangling_links,
     walk_binary_candidates,
@@ -549,45 +547,56 @@ fn uninstall_one(paths: &Paths, name: &str) -> Result<(), String> {
         eprintln!("Waiting for another unpin process to finish updating links...");
     })?;
 
-    // Windows-only alias cleanup: hardlinks can't be reverse-mapped from
-    // `bin_dir`, so we re-derive the alias names by scanning the binary's
-    // embedded `unpin/aliases` and unlinking each. On Unix the read_link sweep
-    // below catches alias symlinks naturally — no extra I/O needed.
     let bin = &paths.bin;
-    #[cfg(windows)]
-    {
-        let mut alias_names: Vec<String> = Vec::new();
-        for v in &versions {
-            for n in aliases_from_vdir(&paths.version_dir(&owner, &repo, v)) {
-                if !alias_names.contains(&n) {
-                    alias_names.push(n);
-                }
-            }
-        }
-        for n in &alias_names {
-            let p = bin.join(platform::alias_link_filename(n));
-            let _ = fs::remove_file(&p);
-        }
-    }
 
+    // Self-uninstall detection — and the janitor staging copy — must happen
+    // BEFORE the link sweep: on Windows the running unpin image usually *is*
+    // the bin-dir hardlink, and the sweep deletes/renames that name — after
+    // which `current_exe()`'s recorded path is stale and both the check and
+    // the copy would fail.
+    #[cfg(windows)]
+    let janitor = if crate::setup::running_from(&rdir) {
+        Some(crate::setup::stage_janitor()?)
+    } else {
+        None
+    };
+
+    // Reclaim tombstones from earlier sidelined links whose process exited.
+    #[cfg(windows)]
+    platform::sweep_sidelined(bin);
+
+    // Remove every managed link pointing into rdir — primaries and aliases
+    // alike; `read_link` introspects Windows hardlinks via name enumeration,
+    // so one pass covers both platforms.
+    #[cfg(windows)]
+    let mut sidelined: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = fs::read_dir(bin) {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(target) = platform::read_link(&path)
                 && target.starts_with(&rdir)
+                && fs::remove_file(&path).is_err()
             {
-                let _ = fs::remove_file(&path);
+                // Windows: a link that is the executing image of a live
+                // process (e.g. unpin itself) can't be deleted — rename it
+                // aside; the janitor below or a later tombstone sweep
+                // finishes the delete.
+                #[cfg(windows)]
+                if let Ok(t) = platform::sideline_busy_link(&path) {
+                    sidelined.push(t);
+                }
             }
         }
     }
     if rdir.exists() {
-        // Self-uninstall on Windows: the running unpin.exe lives inside rdir
-        // and can't be deleted while executing. The bin links are already gone
-        // (above); hand the dir to a detached janitor that wipes it once we
-        // exit, and report success now.
+        // Self-uninstall on Windows: the running unpin image lives inside
+        // rdir and can't be deleted while executing. Its PATH name is gone
+        // (deleted, or renamed to a tombstone, above); hand the dir and any
+        // tombstones to a detached janitor that wipes them once we exit,
+        // and report success now.
         #[cfg(windows)]
-        if crate::setup::running_from(&rdir) {
-            crate::setup::spawn_dir_janitor(&rdir)?;
+        if let Some(staged) = &janitor {
+            crate::setup::spawn_dir_janitor(staged, &rdir, &sidelined)?;
             println!("Removed {owner}/{repo} (cleanup finishes after unpin exits)");
             return Ok(());
         }
@@ -772,7 +781,7 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
 
     let bin = &paths.bin;
     let root = &paths.data;
-    // Phase 1: catch dangling symlinks/wrappers that already existed before
+    // Phase 1: catch dangling symlinks that already existed before
     // this prune run (e.g. user deleted a binary by hand). Must run BEFORE
     // phase 2 — otherwise phase 2's "live links" calculation would treat
     // those dangling pointers as anchors and refuse to remove their vdirs.
@@ -786,6 +795,9 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
         let _links = platform::acquire_links_lock(root, || {
             eprintln!("Waiting for another unpin process to finish updating links...");
         })?;
+        // Reclaim tombstones of sidelined busy links whose process exited.
+        #[cfg(windows)]
+        platform::sweep_sidelined(bin);
         removed += sweep_dangling_links(bin, root);
     }
 
@@ -841,25 +853,6 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
             if linked_targets.iter().any(|t| t.starts_with(&vpath)) {
                 continue;
             }
-            // Windows-only: alias entries in bin_dir are NTFS hardlinks
-            // (no target to dangle), so removing this vdir leaves them
-            // behind unless we re-derive the names here. On Unix the
-            // post-loop dangling sweep catches alias symlinks naturally
-            // once their targets vanish. We hold the repo lock here, so
-            // taking the links lock keeps the repo → links order intact.
-            #[cfg(windows)]
-            {
-                let _links = platform::acquire_links_lock(root, || {
-                    eprintln!("Waiting for another unpin process to finish updating links...");
-                })?;
-                for n in aliases_from_vdir(&vpath) {
-                    let p = bin.join(platform::alias_link_filename(&n));
-                    if fs::remove_file(&p).is_ok() {
-                        println!("Removed alias {}", p.display());
-                        removed += 1;
-                    }
-                }
-            }
             if fs::remove_dir_all(&vpath).is_ok() {
                 println!("Removed orphan {owner}/{repo}@{v}");
                 removed += 1;
@@ -870,11 +863,11 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
         let _ = fs::remove_dir(paths.data.join(&owner));
     }
 
-    // Phase 3 (Unix-only): orphan-vdir removal above just broke any alias
-    // symlinks pointing into those vdirs. Re-sweep so prune cleans in one
-    // invocation instead of leaving newly-dangling entries for the next
-    // run. On Windows the per-vdir rescan handles this inline.
-    #[cfg(not(windows))]
+    // Phase 3: orphan-vdir removal above just broke any alias symlinks
+    // pointing into those vdirs (Unix). Re-sweep so prune cleans in one
+    // invocation instead of leaving newly-dangling entries for the next run.
+    // On Windows this is a natural no-op — hardlinks never dangle, and a
+    // vdir with any live hardlink in bin_dir was anchored and kept above.
     {
         let _links = platform::acquire_links_lock(root, || {
             eprintln!("Waiting for another unpin process to finish updating links...");

@@ -26,8 +26,8 @@ use crate::install;
 use crate::platform::{self, Paths};
 
 /// On-disk file name for unpin's own binary inside its version dir — the real
-/// executable. The `bin` entry that points at it is a symlink (Unix) or a
-/// `.cmd` wrapper (Windows), created by the linker like any package's.
+/// executable. The `bin` entry that points at it is a symlink (Unix) or an
+/// NTFS hardlink (Windows), created by the linker like any package's.
 const SELF_NAME: &str = if cfg!(windows) { "unpin.exe" } else { "unpin" };
 
 /// Entry point for `unpin install` with no package argument. `force` reinstalls
@@ -40,7 +40,7 @@ pub fn run(paths: &Paths, assume_yes: bool, force: bool) -> Result<(), String> {
     let tag = spec.version.clone().unwrap_or_default();
     let vdir = paths.version_dir(&spec.owner, &spec.name, &tag);
     // The binary lives at `<vdir>/unpin[.exe]`; the PATH entry is the link the
-    // linker creates next to the other packages' wrappers.
+    // linker creates next to the other packages' links.
     let dest = vdir.join(SELF_NAME);
     let link = paths.bin.join(platform::link_filename(&spec.name));
 
@@ -64,8 +64,7 @@ pub fn run(paths: &Paths, assume_yes: bool, force: bool) -> Result<(), String> {
         println!("Installed unpin {tag} ({}).", link.display());
         #[cfg(windows)]
         if let Relocation::CopiedOriginRemains(origin) = &reloc {
-            // Spawn the real `.exe` we just placed (not the `.cmd` wrapper —
-            // CreateProcess can't run a batch file directly).
+            // Spawn the `.exe` we just placed under packages\ as the janitor.
             spawn_janitor(&dest, origin);
         }
         // Bind on non-Windows so the `reloc` value is always "used".
@@ -127,7 +126,15 @@ fn relocate(current: &Path, dest: &Path) -> Result<Relocation, String> {
 
 /// True if both paths resolve to the same file. Canonicalization fails when
 /// `dest` doesn't exist yet (first install) — that's a clean "not the same".
+/// Windows compares file identity instead: the running unpin is usually the
+/// bin-dir *hardlink* of the registered `packages\` binary, and two hardlink
+/// names of one file never canonicalize equal.
 fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        platform::is_same_file(a, b)
+    }
+    #[cfg(unix)]
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
@@ -183,60 +190,79 @@ fn janitor_delete_dir(dir: &Path) {
 }
 
 /// Entry point for the hidden `unpin reap` subcommand: the janitor body that a
-/// detached copy runs to finish a Windows self-(un)install. `file` (if given)
-/// is a stray download to unlink; `dir` is unpin's own repo dir to remove (and
-/// its now-empty owner pruned). Both paths come straight from the spawning
-/// parent's memory as CLI arguments — never re-derived. A no-op off Windows,
-/// where the reaper is never spawned.
-pub fn reap(file: Option<PathBuf>, dir: Option<PathBuf>) {
+/// detached copy runs to finish a Windows self-(un)install. Each `--file` is a
+/// stray file to unlink (a copied-from download, or the tombstone of a busy
+/// bin link); `dir` is unpin's own repo dir to remove (and its now-empty owner
+/// pruned). All paths come straight from the spawning parent's memory as CLI
+/// arguments — never re-derived. A no-op off Windows, where the reaper is
+/// never spawned.
+pub fn reap(files: Vec<PathBuf>, dir: Option<PathBuf>) {
     #[cfg(windows)]
     {
-        if let Some(f) = file {
-            janitor_delete(&f);
+        for f in &files {
+            janitor_delete(f);
         }
         if let Some(d) = dir {
             janitor_delete_dir(&d);
         }
     }
     #[cfg(not(windows))]
-    let _ = (file, dir);
+    let _ = (files, dir);
 }
 
-/// True if the running binary lives inside `dir` — i.e. uninstalling `dir`
-/// would have to delete the very `.exe` we're executing, which Windows forbids.
+/// True if the running image lives inside `dir` — i.e. uninstalling `dir`
+/// would have to delete the very file we're executing, which Windows forbids.
+/// Covers both spellings of "inside": executing the `packages\` binary
+/// directly (path containment), and executing its bin-dir *hardlink* — the
+/// usual case since the PATH entry is a hardlink — where `read_link` maps the
+/// running name to its `packages\` co-name.
 #[cfg(windows)]
 pub fn running_from(dir: &Path) -> bool {
-    match (env::current_exe(), fs::canonicalize(dir)) {
-        (Ok(exe), Ok(d)) => fs::canonicalize(&exe)
-            .map(|e| e.starts_with(&d))
-            .unwrap_or(false),
-        _ => false,
+    let Ok(exe) = env::current_exe() else {
+        return false;
+    };
+    if let (Ok(e), Ok(d)) = (fs::canonicalize(&exe), fs::canonicalize(dir))
+        && e.starts_with(&d)
+    {
+        return true;
     }
+    platform::read_link(&exe).is_some_and(|t| t.starts_with(dir))
 }
 
-/// Hand unpin's own repo dir to a detached janitor for self-uninstall on
-/// Windows: copy the running exe to `%TEMP%` and spawn it as `unpin reap --dir
-/// <dir>`, so it can `remove_dir_all` the dir — including the no-longer-running
-/// exe — once this process exits. The staged copy is left in `%TEMP%` (it can't
-/// delete itself); the OS reclaims it.
+/// Copy the running exe to `%TEMP%` so it can later be spawned as the
+/// janitor for a self-uninstall. Must run **before** the uninstall link
+/// sweep: the running image is usually the bin-dir hardlink, and once the
+/// sweep deletes/renames that name, `current_exe()`'s recorded path is stale
+/// and the copy would fail.
 ///
 /// The staged copy's name carries our PID so concurrent or back-to-back
 /// self-uninstalls don't collide on a single fixed path — a still-running or
 /// still-locked earlier copy would make `fs::copy` to a shared name fail and
-/// abort the cleanup. The repo dir is passed verbatim as an argument — exactly
-/// what the parent resolved, not re-derived by the reaper.
+/// abort the cleanup. The copy is left in `%TEMP%` (it can't delete itself);
+/// the OS reclaims it.
 #[cfg(windows)]
-pub fn spawn_dir_janitor(dir: &Path) -> Result<(), String> {
-    use std::process::Command;
+pub fn stage_janitor() -> Result<PathBuf, String> {
     let current = env::current_exe().map_err(|e| format!("locate self: {e}"))?;
     let tmp = env::temp_dir().join(format!("unpin-reap-{}.exe", std::process::id()));
     fs::copy(&current, &tmp).map_err(|e| format!("stage janitor: {e}"))?;
-    Command::new(&tmp)
-        .arg("reap")
-        .arg("--dir")
-        .arg(dir)
-        .spawn()
-        .map_err(|e| format!("spawn janitor: {e}"))?;
+    Ok(tmp)
+}
+
+/// Spawn the [`stage_janitor`] copy as a detached `unpin reap --dir <dir>
+/// [--file <f>]…` so it can `remove_dir_all` unpin's own repo dir — including
+/// the no-longer-running exe — once this process exits. Every path is passed
+/// verbatim from the parent's memory as an argument, never re-derived.
+#[cfg(windows)]
+pub fn spawn_dir_janitor(staged: &Path, dir: &Path, files: &[PathBuf]) -> Result<(), String> {
+    use std::process::Command;
+    let mut cmd = Command::new(staged);
+    cmd.arg("reap").arg("--dir").arg(dir);
+    // Tombstones of busy bin links (our own sidelined hardlink) that could
+    // only be renamed, not deleted, while this process runs.
+    for f in files {
+        cmd.arg("--file").arg(f);
+    }
+    cmd.spawn().map_err(|e| format!("spawn janitor: {e}"))?;
     Ok(())
 }
 

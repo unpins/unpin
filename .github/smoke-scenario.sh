@@ -16,9 +16,10 @@ UNPIN="$1"
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*)
     BIN_DIR="${LOCALAPPDATA}\\unpin"
-    # The PATH entry on Windows is a .cmd wrapper (the .exe itself lives
-    # under packages\); git-bash execs .cmd files via cmd.exe interop.
-    EXE=".cmd"
+    # The PATH entry on Windows is an NTFS hardlink named <pkg>.exe (the
+    # backing binary lives under packages\) — resolvable by cmd, PowerShell
+    # and git-bash alike.
+    EXE=".exe"
     ;;
   *)
     BIN_DIR="${HOME}/.local/bin"

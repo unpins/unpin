@@ -9,7 +9,6 @@
 //! the parent module and come in via `super::`; the on-disk layout (`bin`,
 //! `data`, `repo_dir`) arrives as a borrowed [`crate::platform::Paths`].
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -344,6 +343,12 @@ pub fn link_all_executables(
     let bin = &paths.bin;
     let rdir = paths.repo_dir(&spec.owner, &spec.name);
 
+    // A previous update that ran while a linked program was executing may
+    // have renamed its busy link aside (Windows can't delete a running
+    // image); reclaim any tombstone whose process has since exited.
+    #[cfg(windows)]
+    platform::sweep_sidelined(bin);
+
     // Snapshot of unpin-managed links currently pointing anywhere into this
     // package's repo dir — the old version's link set. We remove all of them
     // up front (below), then create the new set, so an interrupted update can
@@ -351,9 +356,8 @@ pub fn link_all_executables(
     // `active_version` reports the version of whichever bin/ entry `read_dir`
     // yields first: a half-repointed package would make it non-deterministic.
     // Anything that survives a crash here is now a subset of one version.
-    //
-    // On Windows alias hardlinks aren't introspectable by `read_link`; they
-    // get a separate cleanup pass below keyed on the binary's `unpin/aliases`.
+    // (`read_link` introspects Windows hardlinks — primaries and aliases —
+    // via name enumeration, so one pass covers both platforms.)
     let existing_managed: Vec<PathBuf> = match fs::read_dir(bin) {
         Ok(entries) => entries
             .flatten()
@@ -381,11 +385,6 @@ pub fn link_all_executables(
     // version off bare-binary asset names (`htop-3.4.1-1-...` → `htop`).
     let version = vdir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let mut refreshed: Vec<PathBuf> = Vec::new();
-    // Names the new version declared and attempted to link, across all
-    // primaries. The Windows alias sweep below consults this so it never
-    // deletes an alias the new version still declares but couldn't (re)link
-    // this run. Built on every platform; only read under `cfg(windows)`.
-    let mut attempted_aliases: HashSet<String> = HashSet::new();
     for target in &executables {
         let basename = target
             .file_name()
@@ -414,7 +413,6 @@ pub fn link_all_executables(
         for a in &alias_outcome.linked {
             refreshed.push(bin.join(platform::alias_link_filename(a)));
         }
-        attempted_aliases.extend(alias_outcome.attempted);
         // `classify_slot` already kept first-seen on disk (via `refreshed`),
         // so a name can't appear twice here — no extra dedup needed.
         summary.aliases.extend(alias_outcome.linked);
@@ -447,40 +445,6 @@ pub fn link_all_executables(
         }
     }
 
-    // Windows-only: alias hardlinks have no introspectable target so the
-    // `existing_managed` scan above didn't see them. Derive the name set
-    // from older vdirs' `unpin/aliases` and remove any name the new
-    // version doesn't declare. `aliases_from_vdir` swallows scan errors —
-    // a corrupted older binary is a degraded but safe outcome here.
-    #[cfg(windows)]
-    {
-        if let Ok(entries) = fs::read_dir(&rdir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                let is_old_vdir =
-                    entry.file_type().map(|t| t.is_dir()).unwrap_or(false) && p != vdir;
-                if !is_old_vdir {
-                    continue;
-                }
-                for old_alias in aliases_from_vdir(&p) {
-                    // Keep any alias the new version still declares — whether it
-                    // linked cleanly or was blocked this run (a foreign file the
-                    // user declined to overwrite, or a name collision). Deleting
-                    // a still-declared name would remove the very file the user
-                    // chose to keep. `attempted_aliases` ⊇ the linked set, so it
-                    // subsumes the old `summary.aliases` check.
-                    if attempted_aliases.contains(&old_alias) {
-                        continue;
-                    }
-                    let link_p = bin.join(platform::alias_link_filename(&old_alias));
-                    if fs::remove_file(&link_p).is_ok() {
-                        orphans.push(old_alias);
-                    }
-                }
-            }
-        }
-    }
-
     if !orphans.is_empty() {
         summary.notes.push(format!(
             "removed {} orphan link(s) from previous version: {}",
@@ -497,13 +461,6 @@ pub fn link_all_executables(
 struct AliasOutcome {
     /// Aliases successfully linked this run.
     linked: Vec<String>,
-    /// Every alias the new version *declared and attempted* — the create loop
-    /// ran over them, whether they linked, were declined, or collided. Empty
-    /// when aliases were skipped wholesale (non-catalog, `--no-aliases`, or the
-    /// whole-list prompt declined). The Windows orphan sweep keeps any name in
-    /// here, so a still-declared alias that merely failed to link this run
-    /// isn't deleted out from under the user. `linked` ⊆ `attempted`.
-    attempted: Vec<String>,
     /// Zero or more one-line summary notes: aliases declared but skipped
     /// (non-catalog source, `--no-aliases`, existing files) or a name that
     /// collided with another binary/package.
@@ -643,23 +600,14 @@ fn link_aliases_for(
             declined.join(", ")
         ));
     }
-    Ok(AliasOutcome {
-        linked,
-        attempted: declared.clone(),
-        notes,
-    })
+    Ok(AliasOutcome { linked, notes })
 }
 
 /// Create an alias link at `link`, classifying an existing entry the same way
 /// `link_binary` does (intra-package dup, our own version, cross-package, or
 /// foreign file). The filesystem op (`platform::create_alias_link`) is a
-/// symlink on Unix and an NTFS hardlink on Windows.
-///
-/// Note: on Windows `read_link` can't introspect an existing alias *hardlink*
-/// (no target), so a pre-existing alias from another unpin package reads as a
-/// foreign file and takes the foreign-overwrite path rather than the
-/// cross-package one. That's the safe direction (prompt rather than silently
-/// clobber).
+/// symlink on Unix and an NTFS hardlink on Windows; `read_link` introspects
+/// both, so all four classifications work on both platforms.
 fn link_alias(
     paths: &Paths,
     ui: &Ui,
@@ -689,43 +637,12 @@ fn link_alias(
     }
 }
 
-/// Scan every executable in `vdir` for an embedded `unpin/aliases` entry and
-/// return the union of alias names declared. Windows-only: alias entries
-/// in `bin_dir` are NTFS hardlinks with no introspectable target, so the
-/// only way to learn their names at cleanup time is to re-derive from the
-/// binary itself. On Unix, alias entries are symlinks — `read_link` on
-/// `bin_dir` covers them directly without any binary I/O.
-///
-/// Errors during scan are swallowed: a corrupted/missing binary at cleanup
-/// time means we just don't clean up some aliases. That's a degraded but
-/// safe outcome (the orphan link in bin_dir is the user's recovery hint).
-#[cfg(windows)]
-pub fn aliases_from_vdir(vdir: &Path) -> Vec<String> {
-    let mut files = Vec::new();
-    if walk_files(vdir, &mut files).is_err() {
-        return Vec::new();
-    }
-    let mut out: Vec<String> = Vec::new();
-    for f in &files {
-        if !is_executable(f) {
-            continue;
-        }
-        if let Ok(Some(m)) = meta::read(f) {
-            for a in m.aliases() {
-                if !out.contains(&a) {
-                    out.push(a);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Sweep `bin_dir` for symlinks (or `.cmd` wrappers) whose target lives
-/// under `root` but no longer exists on disk. Used by `prune` before AND
-/// after orphan-vdir removal: the second call catches alias symlinks that
-/// just became dangling when their owning vdir was wiped (Unix-only flow;
-/// the Windows hardlink path uses `aliases_from_vdir` instead).
+/// Sweep `bin_dir` for symlinks whose target lives under `root` but no
+/// longer exists on disk. Used by `prune` before AND after orphan-vdir
+/// removal: the second call catches alias symlinks that just became dangling
+/// when their owning vdir was wiped. On Windows this is naturally a no-op:
+/// a hardlink keeps its file alive, so `read_link` either resolves to a
+/// data-dir name that exists or returns `None` — nothing ever dangles.
 pub fn sweep_dangling_links(bin: &Path, root: &Path) -> usize {
     let mut removed = 0usize;
     if let Ok(entries) = fs::read_dir(bin) {

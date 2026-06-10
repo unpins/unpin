@@ -27,6 +27,11 @@ console = { version = "0.16", default-features = false }
 dialoguer = { version = "0.12", default-features = false }
 cap-std = { version = "4.0.2", default-features = false }
 
+[target.'cfg(windows)'.dependencies]
+# Hardlink-name enumeration (FindFirstFileNameW) and file identity
+# (GetFileInformationByHandle) for the bin-dir hardlink bookkeeping.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3"
 zstd = { version = "0.13", default-features = false }

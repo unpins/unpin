@@ -2,11 +2,13 @@
 //! asset filtering) routes through here so the rest of the crate stays portable.
 //!
 //! - Linux/macOS: XDG-ish paths, symlinks for binaries, +x bit for executable.
-//! - Windows: `%LOCALAPPDATA%\unpin\` holds the `.cmd` wrappers the user adds
-//!   to PATH; extracted package binaries go under `%LOCALAPPDATA%\unpin\packages\`.
-//!   unpin manages itself the same way — `unpin.exe` lives under `packages\`
-//!   with a `unpin.cmd` wrapper alongside the rest. Wrappers (no admin, no
-//!   Developer Mode) replace symlinks; `.exe` extension marks executables.
+//! - Windows: `%LOCALAPPDATA%\unpin\` holds the `<name>.exe` NTFS hardlinks the
+//!   user adds to PATH; extracted package binaries go under
+//!   `%LOCALAPPDATA%\unpin\packages\`. unpin manages itself the same way —
+//!   `unpin.exe` lives under `packages\` with a hardlink alongside the rest.
+//!   Hardlinks (no admin, no Developer Mode) replace symlinks; the `.exe`
+//!   extension marks executables and is what PATHEXT — and every Unixy shell
+//!   on Windows (git-bash/MSYS, WSL interop) — resolves.
 
 use std::env;
 use std::fs;
@@ -24,7 +26,7 @@ use std::path::{Path, PathBuf};
 pub struct Paths {
     /// Per-package extracted trees (`<data>/<owner>/<repo>/<tag>/...`).
     pub data: PathBuf,
-    /// The PATH entry: symlinks/wrappers to each package's executables.
+    /// The PATH entry: symlinks/hardlinks to each package's executables.
     pub bin: PathBuf,
     /// Flat `key = value` config file.
     pub config: PathBuf,
@@ -53,7 +55,7 @@ impl Paths {
         #[cfg(windows)]
         {
             // `bin` is the same folder that holds `unpin.exe` itself — the one
-            // the user adds to PATH. `.cmd` wrappers live next to it; per-
+            // the user adds to PATH. Package hardlinks live next to it; per-
             // package data goes under the `packages\` subdirectory.
             let local = nonempty_env("LOCALAPPDATA").ok_or_else(|| missing("LOCALAPPDATA"))?;
             let appdata = nonempty_env("APPDATA").ok_or_else(|| missing("APPDATA"))?;
@@ -446,23 +448,10 @@ pub fn ensure_executable(p: &Path) -> Result<(), String> {
 }
 
 /// File name to use on disk for an unpin-managed link with the logical short
-/// name `name`. On Windows appends `.cmd` so the file is invocable via PATHEXT.
+/// name `name`. On Windows appends `.exe`: the link is an NTFS hardlink to the
+/// real binary, and `.exe` is what PATHEXT — and git-bash/MSYS/WSL-interop
+/// lookup, which only resolve `.exe` — find on PATH.
 pub fn link_filename(name: &str) -> String {
-    #[cfg(unix)]
-    {
-        name.to_owned()
-    }
-    #[cfg(windows)]
-    {
-        format!("{name}.cmd")
-    }
-}
-
-/// File name for a multi-call **alias** link. On Windows aliases use NTFS
-/// hardlinks (so argv[0] preserves the alias name, which `.cmd` wrappers
-/// can't do — they pass the resolved target path instead), and a hardlinked
-/// executable needs an `.exe` extension to be invocable via PATHEXT.
-pub fn alias_link_filename(name: &str) -> String {
     #[cfg(unix)]
     {
         name.to_owned()
@@ -473,49 +462,58 @@ pub fn alias_link_filename(name: &str) -> String {
     }
 }
 
-/// Magic first line in Windows `.cmd` wrappers so `read_link` can distinguish
-/// our wrappers from any other `.cmd` the user might place in the same folder.
-/// Without it, a stray `tool.cmd` whose body happens to match the
-/// `@"…" %*` shape — and that points anywhere under `data_dir()` — would be
-/// treated as managed and silently overwritten.
-#[cfg(any(windows, test))]
-const WINDOWS_WRAPPER_MARKER: &str = "@rem unpin-managed";
-
-/// Build the body of an unpin-managed `.cmd` wrapper pointing at `target`.
-/// Shared by `create_link` (the writer) and the parser tests so the
-/// write → [`parse_cmd_wrapper`] round-trip is guaranteed to hold for any path.
-#[cfg(any(windows, test))]
-fn cmd_wrapper_body(target: &str) -> String {
-    format!("{WINDOWS_WRAPPER_MARKER}\r\n@\"{target}\" %*\r\n")
+/// File name for a multi-call **alias** link — same shape as a primary link
+/// on both platforms (Windows aliases additionally rely on the hardlink
+/// preserving the alias name in argv[0] for the binary's applet dispatch).
+pub fn alias_link_filename(name: &str) -> String {
+    link_filename(name)
 }
 
-/// Pure parser for the `.cmd` wrapper body. Cross-platform so we can test it
-/// from Unix. Returns the target path inside the second-line `@"…" %*` only
-/// when the first line matches `WINDOWS_WRAPPER_MARKER`.
-///
-/// The path is delimited by the structural `@"` prefix and the trailing
-/// `" %*` suffix — *not* by the first inner quote. Anchoring on the suffix
-/// means a `target` containing a `"` round-trips intact instead of being
-/// truncated at the embedded quote (Windows forbids `"` in real paths, but a
-/// hostile `%LOCALAPPDATA%` could still smuggle one in, and the invariant
-/// should hold regardless).
-#[cfg(any(windows, test))]
-fn parse_cmd_wrapper(body: &str) -> Option<&str> {
-    let mut lines = body.lines();
-    if lines.next()?.trim_end() != WINDOWS_WRAPPER_MARKER {
-        return None;
+/// Marker carried in the file name of a busy link that was renamed aside (a
+/// running image can't be deleted on Windows, but it can be renamed). Entries
+/// carrying it are tombstones: invisible to `read_link` and reclaimed by
+/// [`sweep_sidelined`] once the old process exits.
+#[cfg(windows)]
+const SIDELINED_MARKER: &str = ".unpin-old-";
+
+/// Rename a bin entry we cannot delete — it is the executing image of a live
+/// process — out of the link slot. Returns the tombstone path so callers (the
+/// self-uninstall janitor) can finish the delete after this process exits.
+#[cfg(windows)]
+pub fn sideline_busy_link(link: &Path) -> io::Result<PathBuf> {
+    let mut name = link.file_name().unwrap_or_default().to_os_string();
+    name.push(format!("{SIDELINED_MARKER}{}", std::process::id()));
+    let dest = link.with_file_name(name);
+    let _ = fs::remove_file(&dest);
+    fs::rename(link, &dest)?;
+    Ok(dest)
+}
+
+/// Best-effort removal of tombstones left by [`sideline_busy_link`]. A file
+/// still held by a running old process just stays for the next sweep.
+#[cfg(windows)]
+pub fn sweep_sidelined(bin: &Path) {
+    if let Ok(entries) = fs::read_dir(bin) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .contains(SIDELINED_MARKER)
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
-    let target_line = lines.next()?;
-    target_line
-        .strip_prefix("@\"")?
-        .strip_suffix(" %*")?
-        .strip_suffix('"')
 }
 
 /// Create an unpin-managed link at `link_path` pointing at `target`.
-/// On Unix this is a regular symlink. On Windows it writes a `.cmd` wrapper
-/// that forwards `%*` — no Developer Mode or admin needed. The first line is
-/// a `@rem` marker so we can recognize our own wrappers later.
+/// On Unix this is a regular symlink. On Windows it's an NTFS hardlink — no
+/// Developer Mode or admin needed, only that `target` and the link share a
+/// volume, which unpin's layout guarantees (`bin` and `packages\` both live
+/// under `%LOCALAPPDATA%\unpin`). If the slot is occupied by a file we can't
+/// delete (the running image of a live process — e.g. unpin itself during a
+/// self-update), the occupant is renamed aside instead: Windows permits
+/// renaming a running image, just not deleting it.
 pub fn create_link(target: &Path, link_path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -523,15 +521,21 @@ pub fn create_link(target: &Path, link_path: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let body = cmd_wrapper_body(&target.display().to_string());
-        fs::write(link_path, body)
+        match fs::hard_link(target, link_path) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::remove_file(link_path).is_err() {
+                    sideline_busy_link(link_path)?;
+                }
+                fs::hard_link(target, link_path)
+            }
+            r => r,
+        }
     }
 }
 
 /// Create a multi-call **alias** link named `name` inside the trusted
 /// directory `dir`, pointing at `target`. Aliases need argv[0] to carry the
-/// alias name (so the binary's argv[0] dispatch picks the right code path);
-/// `.cmd` wrappers can't do that — they invoke the target with its own path.
+/// alias name (so the binary's argv[0] dispatch picks the right code path).
 /// So:
 ///   - Unix: symlink (kernel preserves the symlink name in argv[0]). The
 ///     symlink is created through a cap-std `Dir` opened on `dir`, so `name`
@@ -567,11 +571,8 @@ pub fn create_alias_link(dir: &Path, name: &str, target: &Path) -> io::Result<()
     }
     #[cfg(windows)]
     {
-        let link_path = dir.join(alias_link_filename(name));
-        if fs::symlink_metadata(&link_path).is_ok() {
-            let _ = fs::remove_file(&link_path);
-        }
-        fs::hard_link(target, &link_path)
+        // Same mechanism as a primary link (hardlink + busy-slot sideline).
+        create_link(target, &dir.join(alias_link_filename(name)))
     }
 }
 
@@ -657,7 +658,7 @@ pub fn acquire_install_lock(repo_dir: &Path) -> Result<InstallLock, String> {
 }
 
 /// Process-wide exclusive lock guarding mutations of the shared `bin_dir`
-/// (link/wrapper create + orphan cleanup). The per-package [`InstallLock`]
+/// (link create + orphan cleanup). The per-package [`InstallLock`]
 /// only covers a repo's own `repo_dir`; `bin_dir` is shared across every
 /// package, so without this two `unpin` processes installing *different*
 /// packages could interleave their link writes (lost links, an orphan sweep
@@ -713,9 +714,15 @@ pub fn acquire_links_lock(data_dir: &Path, on_wait: impl FnOnce()) -> Result<Lin
 }
 
 /// Read the target path from an unpin-managed link, or `None` if `p` isn't one.
-/// On Unix this is `fs::read_link`. On Windows the wrapper must start with the
-/// `WINDOWS_WRAPPER_MARKER` line — any other `.cmd` (user-written batch script,
-/// or a `.cmd` from another tool) yields `None` rather than a wrong target.
+/// On Unix this is `fs::read_link`. On Windows links are NTFS hardlinks; a
+/// hardlink has no stored target, but `FindFirstFileNameW` enumerates *every*
+/// name of the underlying file, and in unpin's layout exactly one of them is
+/// the real binary under `packages\` — every other name (the link itself, any
+/// sibling aliases) lives in the bin dir. So: return the first co-name outside
+/// `p`'s own directory. A file with a single name (a regular `.exe`, e.g. a
+/// user's own binary parked in the bin dir) yields `None`, as do tombstones
+/// from [`sideline_busy_link`] — they still alias an *old* version's binary
+/// and must not count as that package's live link.
 pub fn read_link(p: &Path) -> Option<PathBuf> {
     #[cfg(unix)]
     {
@@ -723,108 +730,128 @@ pub fn read_link(p: &Path) -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
-        let ext_is_cmd = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("cmd"))
-            .unwrap_or(false);
-        if !ext_is_cmd {
+        if p.file_name()?.to_string_lossy().contains(SIDELINED_MARKER) {
             return None;
         }
-        let body = fs::read_to_string(p).ok()?;
-        parse_cmd_wrapper(&body).map(PathBuf::from)
+        let names = hardlink_names(p)?;
+        if names.len() < 2 {
+            return None;
+        }
+        // FindFirstFileNameW returns volume-relative paths ("\Users\…"); a
+        // hardlink never crosses volumes, so `p`'s drive prefix completes them.
+        let prefix = match p.components().next()? {
+            std::path::Component::Prefix(pre) => pre.as_os_str().to_owned(),
+            _ => return None,
+        };
+        let parent = p.parent()?;
+        for n in names {
+            let mut s = prefix.clone();
+            s.push(&n);
+            let full = PathBuf::from(s);
+            // NTFS is case-insensitive; the enumerated casing is the on-disk
+            // one, which may differ from how the env spelled our paths.
+            let same_dir = full
+                .parent()
+                .is_some_and(|fp| fp.as_os_str().eq_ignore_ascii_case(parent.as_os_str()));
+            if !same_dir {
+                return Some(full);
+            }
+        }
+        None
     }
+}
+
+/// Every name (volume-relative) of the file at `p`, via the
+/// `FindFirstFileNameW`/`FindNextFileNameW` hardlink enumeration API.
+/// `None` on any failure (non-NTFS volume, vanished file, …).
+#[cfg(windows)]
+fn hardlink_names(p: &Path) -> Option<Vec<std::ffi::OsString>> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindClose, FindFirstFileNameW, FindNextFileNameW,
+    };
+
+    let wide: Vec<u16> = p
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buf: Vec<u16> = vec![0; 512];
+    let mut len = buf.len() as u32;
+    let handle = unsafe { FindFirstFileNameW(wide.as_ptr(), 0, &mut len, buf.as_mut_ptr()) };
+    let handle = if handle == INVALID_HANDLE_VALUE {
+        if unsafe { GetLastError() } != ERROR_MORE_DATA {
+            return None;
+        }
+        buf.resize(len as usize, 0);
+        let h = unsafe { FindFirstFileNameW(wide.as_ptr(), 0, &mut len, buf.as_mut_ptr()) };
+        if h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        h
+    } else {
+        handle
+    };
+
+    // `len` counts UTF-16 units including the terminator; trim to the string.
+    let take = |buf: &[u16], len: u32| {
+        let n = buf
+            .iter()
+            .take(len as usize)
+            .position(|&c| c == 0)
+            .unwrap_or(len as usize);
+        std::ffi::OsString::from_wide(&buf[..n])
+    };
+
+    let mut names = vec![take(&buf, len)];
+    loop {
+        len = buf.len() as u32;
+        if unsafe { FindNextFileNameW(handle, &mut len, buf.as_mut_ptr()) } == 0 {
+            match unsafe { GetLastError() } {
+                ERROR_MORE_DATA => {
+                    buf.resize(len as usize, 0);
+                    continue;
+                }
+                _ => break, // ERROR_HANDLE_EOF is the clean end; anything else, stop too.
+            }
+        }
+        names.push(take(&buf, len));
+    }
+    unsafe { FindClose(handle) };
+    Some(names)
+}
+
+/// Whether `a` and `b` are the same file — including via different hardlink
+/// names, which `fs::canonicalize` equality can't see. Self-install needs
+/// this: the running `unpin.exe` is usually the bin-dir hardlink, while the
+/// registered binary is the `packages\` name of the very same file.
+#[cfg(windows)]
+pub fn is_same_file(a: &Path, b: &Path) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    fn file_id(p: &Path) -> Option<(u32, u32, u32)> {
+        let f = fs::File::open(p).ok()?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {
+            return None;
+        }
+        Some((
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ))
+    }
+
+    matches!((file_id(a), file_id(b)), (Some(x), Some(y)) if x == y)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- parse_cmd_wrapper ----
-    // Cross-platform: testing the parser doesn't require Windows.
-
-    #[test]
-    fn cmd_wrapper_round_trip() {
-        let body = format!(
-            "{WINDOWS_WRAPPER_MARKER}\r\n@\"C:\\Users\\me\\AppData\\Local\\unpin\\packages\\foo\\rg.exe\" %*\r\n"
-        );
-        assert_eq!(
-            parse_cmd_wrapper(&body),
-            Some("C:\\Users\\me\\AppData\\Local\\unpin\\packages\\foo\\rg.exe")
-        );
-    }
-
-    #[test]
-    fn cmd_wrapper_accepts_lf_only() {
-        // Files edited or written with Unix tools may not have \r.
-        let body = format!("{WINDOWS_WRAPPER_MARKER}\n@\"C:\\x.exe\" %*\n");
-        assert_eq!(parse_cmd_wrapper(&body), Some("C:\\x.exe"));
-    }
-
-    #[test]
-    fn cmd_wrapper_rejects_missing_marker() {
-        // The pre-marker format (or any user-written .cmd) must NOT be
-        // recognized as managed — this is the regression fix from review #5.
-        let body = "@\"C:\\x.exe\" %*\r\n";
-        assert_eq!(parse_cmd_wrapper(body), None);
-    }
-
-    #[test]
-    fn cmd_wrapper_rejects_wrong_marker() {
-        let body = "@rem other-tool\r\n@\"C:\\x.exe\" %*\r\n";
-        assert_eq!(parse_cmd_wrapper(body), None);
-    }
-
-    #[test]
-    fn cmd_wrapper_rejects_empty() {
-        assert_eq!(parse_cmd_wrapper(""), None);
-    }
-
-    #[test]
-    fn cmd_wrapper_rejects_marker_only() {
-        // Marker present but no target line.
-        let body = format!("{WINDOWS_WRAPPER_MARKER}\r\n");
-        assert_eq!(parse_cmd_wrapper(&body), None);
-    }
-
-    #[test]
-    fn cmd_wrapper_rejects_target_without_quotes() {
-        let body = format!("{WINDOWS_WRAPPER_MARKER}\r\n@C:\\x.exe %*\r\n");
-        assert_eq!(parse_cmd_wrapper(&body), None);
-    }
-
-    #[test]
-    fn cmd_wrapper_rejects_unterminated_quote() {
-        let body = format!("{WINDOWS_WRAPPER_MARKER}\r\n@\"C:\\x.exe %*\r\n");
-        assert_eq!(parse_cmd_wrapper(&body), None);
-    }
-
-    #[test]
-    fn cmd_wrapper_ignores_extra_lines() {
-        // Trailing content shouldn't trip the parser (we only consume two lines).
-        let body = format!("{WINDOWS_WRAPPER_MARKER}\r\n@\"C:\\x.exe\" %*\r\nrem extra\r\n");
-        assert_eq!(parse_cmd_wrapper(&body), Some("C:\\x.exe"));
-    }
-
-    #[test]
-    fn cmd_wrapper_round_trips_via_writer() {
-        // Feed the actual writer (`cmd_wrapper_body`) into the parser so the
-        // create_link → read_link invariant is exercised, not just a
-        // hand-written body. Includes a path with an embedded quote: NTFS
-        // forbids it, but a hostile %LOCALAPPDATA% could inject one, and the
-        // old `find('"')` parser truncated such paths at the first quote.
-        for target in [
-            "C:\\Users\\me\\AppData\\Local\\unpin\\packages\\foo\\rg.exe",
-            "C:\\weird\"dir\\tool.exe",
-            "C:\\trailing\".exe",
-        ] {
-            assert_eq!(
-                parse_cmd_wrapper(&cmd_wrapper_body(target)),
-                Some(target),
-                "round-trip failed for {target:?}"
-            );
-        }
-    }
 
     // ---- create_alias_link ----
 
@@ -922,7 +949,7 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(f, "rg");
         #[cfg(windows)]
-        assert_eq!(f, "rg.cmd");
+        assert_eq!(f, "rg.exe");
     }
 
     // ---- InstallLock ----
@@ -1013,8 +1040,8 @@ mod tests {
 
     #[test]
     fn alias_link_filename_uses_exe_on_windows() {
-        // Aliases need the `.exe` extension on Windows because they're
-        // NTFS hardlinks to the actual binary, not `.cmd` wrappers.
+        // Aliases are NTFS hardlinks to the actual binary on Windows and
+        // need the `.exe` extension to resolve via PATHEXT.
         let f = alias_link_filename("xzcat");
         #[cfg(unix)]
         assert_eq!(f, "xzcat");

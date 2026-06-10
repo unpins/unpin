@@ -961,6 +961,7 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "windows-sys 0.61.2",
  "xz2",
  "zip",
  "zstd",

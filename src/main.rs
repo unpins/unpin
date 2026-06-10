@@ -145,9 +145,10 @@ impl UninstallCmd {
 /// the parent can finish removing files/dirs it couldn't unlink while running.
 #[derive(Args, Debug)]
 struct ReapCmd {
-    /// A stray file to delete (the copied-from download, after a self-install).
+    /// Stray files to delete (the copied-from download after a self-install,
+    /// or tombstones of busy bin links after a self-uninstall). Repeatable.
     #[arg(long)]
-    file: Option<std::path::PathBuf>,
+    file: Vec<std::path::PathBuf>,
     /// unpin's own repo dir to remove, owner dir pruned (after a self-uninstall).
     #[arg(long)]
     dir: Option<std::path::PathBuf>,
