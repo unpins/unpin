@@ -280,7 +280,7 @@ fn decompress(
             .map_err(|e| e.to_string())
     }
     match method {
-        0 => Some(Ok(payload.to_vec())),
+        0 => Some(capped(payload)),
         8 => Some(capped(flate2::read::DeflateDecoder::new(payload))),
         93 => match dict {
             Some(fd) => match ruzstd::StreamingDecoder::new_with_decoder(payload, fd) {

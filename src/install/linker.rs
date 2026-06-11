@@ -592,7 +592,7 @@ fn link_aliases_for(
 
     // No sidecar manifest written — the binary itself is the authoritative
     // source for which aliases this version declared. `remove`/`prune`
-    // re-scan via `aliases_from_vdir` when they need the list.
+    // introspect the installed links via `read_link` when they need the list.
     if !declined.is_empty() {
         notes.push(format!(
             "{} alias(es) not installed (existing files): {}",
