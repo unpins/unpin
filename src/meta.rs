@@ -16,6 +16,7 @@
 //! `aliases.rs` / `install/linker.rs`), not here — see the doc §4. The one guard
 //! kept: two distinct ZIPs both carrying `unpin/aliases` is a fatal ambiguity.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -272,23 +273,38 @@ fn decompress(
     payload: &[u8],
     dict: Option<&mut ruzstd::FrameDecoder>,
 ) -> Option<Result<Vec<u8>, String>> {
-    fn capped<R: Read>(r: R) -> Result<Vec<u8>, String> {
+    decompress_capped(method, payload, dict, MAX_META_ENTRY + 1)
+}
+
+/// Like [`decompress`] but stops after at most `limit` output bytes. Used to
+/// read only the NAME-section prefix of a man page (see [`read_program_docs`])
+/// without inflating the whole body. `ruzstd`'s streaming decoder decodes blocks
+/// on demand, so a small `limit` touches only the first block(s); dropping the
+/// decoder mid-frame is safe because the next `new`/`new_with_decoder` re-`init`s
+/// the frame from its header (and the shared dict map survives that reset).
+fn decompress_capped(
+    method: u16,
+    payload: &[u8],
+    dict: Option<&mut ruzstd::FrameDecoder>,
+    limit: u64,
+) -> Option<Result<Vec<u8>, String>> {
+    fn capped<R: Read>(r: R, limit: u64) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
-        r.take(MAX_META_ENTRY + 1)
+        r.take(limit)
             .read_to_end(&mut out)
             .map(|_| out)
             .map_err(|e| e.to_string())
     }
     match method {
-        0 => Some(capped(payload)),
-        8 => Some(capped(flate2::read::DeflateDecoder::new(payload))),
+        0 => Some(capped(payload, limit)),
+        8 => Some(capped(flate2::read::DeflateDecoder::new(payload), limit)),
         93 => match dict {
             Some(fd) => match ruzstd::StreamingDecoder::new_with_decoder(payload, fd) {
-                Ok(z) => Some(capped(z)),
+                Ok(z) => Some(capped(z, limit)),
                 Err(e) => Some(Err(e.to_string())),
             },
             None => match ruzstd::StreamingDecoder::new(payload) {
-                Ok(z) => Some(capped(z)),
+                Ok(z) => Some(capped(z, limit)),
                 Err(e) => Some(Err(e.to_string())),
             },
         },
@@ -368,25 +384,301 @@ impl Meta {
     /// `#` comments skipped, deduped preserving first-seen order. Validation
     /// (blocklist, charset, …) is the caller's job via `aliases::validate_alias`.
     pub fn aliases(&self) -> Vec<String> {
-        let Some(e) = self.entry(ALIASES_PATH) else {
-            return Vec::new();
+        self.entry(ALIASES_PATH)
+            .map(|e| alias_names(&e.data))
+            .unwrap_or_default()
+    }
+}
+
+/// Parse the `unpin/aliases` payload: one name per line, blank lines and `#`
+/// comments skipped, deduped preserving first-seen order. Shared by
+/// [`Meta::aliases`] and [`read_program_docs`].
+fn alias_names(data: &[u8]) -> Vec<String> {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let n = line.trim();
+        if n.is_empty() || n.starts_with('#') {
+            continue;
+        }
+        if seen.insert(n.to_string()) {
+            out.push(n.to_string());
+        }
+    }
+    out
+}
+
+/// One documented program in a binary's bundle: its command name and, when its
+/// man page carries a NAME section, the one-line description harvested from it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProgramDoc {
+    pub name: String,
+    pub whatis: Option<String>,
+}
+
+/// How much of each man page to inflate when harvesting its whatis. The NAME
+/// section sits right after the `.TH`/comment preamble, so a small prefix always
+/// covers it (even the long DocBook headers) while never touching the — often
+/// far larger — body.
+const WHATIS_SCAN: u64 = 8 * 1024;
+
+/// Enumerate the programs a binary's embedded bundle documents, each paired with
+/// the one-line description from its man page's NAME section (the `whatis`).
+///
+/// The program set is the union of the declared multicall aliases
+/// (`unpin/aliases`) and the stems of the embedded man pages
+/// (`unpin/man/<name>.<section>`): a single-command package shows its one tool,
+/// a multicall shows every applet. Names are returned sorted.
+///
+/// Only a bounded prefix of each man page is inflated (see [`WHATIS_SCAN`]) —
+/// never the whole body — so this stays cheap even for a multicall with a man
+/// page per applet. `Ok(None)` = no bundle (or nothing documentable). It is
+/// best-effort by design: a page we can't locate or parse yields `whatis: None`,
+/// not an error.
+pub fn read_program_docs(path: &Path) -> Result<Option<Vec<ProgramDoc>>, String> {
+    let len = fs::metadata(path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    if len > MAX_FILE {
+        return Ok(None);
+    }
+    let data = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(program_docs_from_bytes(&data))
+}
+
+fn program_docs_from_bytes(data: &[u8]) -> Option<Vec<ProgramDoc>> {
+    // Accumulate across every embedded ZIP, not just the first: a binary built
+    // before the unified container splits `unpin/aliases` (main embed) from its
+    // `unpin/man/*` pages (a separate dict-trained man overlay), so the program
+    // names and their descriptions can live in different ZIPs. Each overlay
+    // carries its own shared dict, so whatis is resolved inside its own loop.
+    let mut whatis: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut aliases: Vec<String> = Vec::new();
+    let mut saw_bundle = false;
+
+    for (start, end, eocd) in locate_zips(data) {
+        let slice = &data[start..end];
+        let Some(cd) = parse_central_dir(slice, eocd - start) else {
+            continue;
         };
-        let Ok(text) = std::str::from_utf8(&e.data) else {
-            return Vec::new();
-        };
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for line in text.lines() {
-            let n = line.trim();
-            if n.is_empty() || n.starts_with('#') {
+        // Skip non-bundle ZIPs (cosmo/VFS runtime ZIPs carry no `unpin/*`).
+        if !cd
+            .iter()
+            .any(|e| e.name.starts_with("unpin/") && !e.name.ends_with('/'))
+        {
+            continue;
+        }
+        saw_bundle = true;
+        let mut dict = overlay_dict(&cd).ok().flatten();
+
+        // Index this ZIP's man pages by program stem, preferring the lowest
+        // section so `foo.1` wins over a stray `foo.3`.
+        let mut man: BTreeMap<String, usize> = BTreeMap::new();
+        for (i, e) in cd.iter().enumerate() {
+            let Some(file) = e.name.strip_prefix("unpin/man/") else {
+                continue;
+            };
+            if file.is_empty() || file.ends_with('/') {
                 continue;
             }
-            if seen.insert(n.to_string()) {
-                out.push(n.to_string());
+            let (stem, sec) = split_section(file);
+            match man.get(&stem) {
+                Some(&j) => {
+                    let prev = cd[j].name.strip_prefix("unpin/man/").unwrap_or("");
+                    if sec < split_section(prev).1 {
+                        man.insert(stem, i);
+                    }
+                }
+                None => {
+                    man.insert(stem, i);
+                }
             }
         }
-        out
+
+        // Declared multicall aliases (small entry — full-decode is cheap).
+        if let Some(e) = cd.iter().find(|e| e.name == ALIASES_PATH)
+            && let Some(Ok(b)) = decompress(e.method, e.payload, dict.as_mut())
+        {
+            aliases.extend(alias_names(&b));
+        }
+
+        // Resolve each man page's whatis now, while this overlay's dict is live.
+        for stem in man.keys().cloned().collect::<Vec<_>>() {
+            let w = whatis_for(&stem, &man, &cd, &mut dict);
+            let slot = whatis.entry(stem).or_insert(None);
+            if w.is_some() {
+                *slot = w;
+            }
+        }
     }
+
+    if !saw_bundle {
+        return None;
+    }
+    let mut names: BTreeSet<String> = whatis.keys().cloned().collect();
+    names.extend(aliases);
+    if names.is_empty() {
+        return None;
+    }
+    Some(
+        names
+            .into_iter()
+            .map(|name| {
+                let whatis = whatis.get(&name).cloned().flatten();
+                ProgramDoc { name, whatis }
+            })
+            .collect(),
+    )
+}
+
+/// The whatis for program `name`: locate its man page, follow one `.so`/symlink
+/// redirect (e.g. `unxz.1 -> xz.1`), inflate only the NAME-section prefix, and
+/// parse it. `None` if there's no page, the redirect dead-ends, or no NAME line.
+fn whatis_for(
+    name: &str,
+    man: &BTreeMap<String, usize>,
+    cd: &[CdEntry],
+    dict: &mut Option<ruzstd::FrameDecoder>,
+) -> Option<String> {
+    let &idx = man.get(name)?;
+    let ent = &cd[idx];
+    let target = if ent.is_symlink {
+        let tgt = decompress(ent.method, ent.payload, dict.as_mut())?.ok()?;
+        let tgt = String::from_utf8(tgt).ok()?;
+        let base = tgt.trim().rsplit(['/', '\\']).next()?;
+        let (tstem, _) = split_section(base);
+        let &j = man.get(&tstem)?;
+        if cd[j].is_symlink {
+            return None; // don't chase multi-hop redirects
+        }
+        j
+    } else {
+        idx
+    };
+    let tent = &cd[target];
+    let prefix = decompress_capped(tent.method, tent.payload, dict.as_mut(), WHATIS_SCAN)?.ok()?;
+    whatis_from_roff(&String::from_utf8_lossy(&prefix))
+}
+
+/// Split a man-page filename into `(stem, section)` on the final dot:
+/// `pdftotext.1 -> ("pdftotext", "1")`, `mkfs.ext4.8 -> ("mkfs.ext4", "8")`.
+fn split_section(file: &str) -> (String, String) {
+    match file.rfind('.') {
+        Some(i) if i > 0 => (file[..i].to_string(), file[i + 1..].to_string()),
+        _ => (file.to_string(), String::new()),
+    }
+}
+
+/// Pull the one-line description from a man page's NAME section. Handles man(7)
+/// (`.SH NAME` / `name[, name…] \- description`) and mdoc(7) (`.Sh NAME` /
+/// `.Nd description`). Only the first description line is taken (a continuation
+/// like poppler's `(version 3.03)` is dropped, matching `whatis`/`apropos`).
+/// `None` if the prefix holds no recognizable NAME description.
+fn whatis_from_roff(text: &str) -> Option<String> {
+    let mut lines = text.lines();
+    loop {
+        if is_name_header(lines.next()?.trim()) {
+            break;
+        }
+    }
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with(".\\\"") {
+            continue; // blank line or roff comment
+        }
+        if t.starts_with(".SH") || t.starts_with(".Sh") {
+            break; // next section — NAME had no usable description
+        }
+        // mdoc: the description is its own `.Nd` macro.
+        if let Some(rest) = t.strip_prefix(".Nd ") {
+            return Some(clean_roff(rest));
+        }
+        // Other mdoc dot-macros in NAME (`.Nm name`) precede `.Nd` — skip them.
+        if t.starts_with('.') {
+            continue;
+        }
+        // man(7): `name[, name…] \- description`.
+        if let Some(desc) = split_name_dash(t) {
+            return Some(clean_roff(desc));
+        }
+    }
+    None
+}
+
+/// Is `t` a `NAME`-section header — `.SH NAME`, `.SH "NAME"`, or mdoc `.Sh NAME`?
+fn is_name_header(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix(".SH").or_else(|| t.strip_prefix(".Sh")) else {
+        return false;
+    };
+    rest.trim()
+        .trim_matches('"')
+        .trim()
+        .eq_ignore_ascii_case("NAME")
+}
+
+/// The description after the `name … \- description` separator on a man(7) NAME
+/// line. The separator is a dash flanked by whitespace (` \- `, or an en/em dash,
+/// or a literal ` - `) — matching that, not a bare `\-`, avoids splitting inside
+/// a hyphenated command name written in roff as `curl\-config`.
+fn split_name_dash(t: &str) -> Option<&str> {
+    for sep in [" \\- ", " \\(en ", " \\(em ", " - "] {
+        if let Some(i) = t.find(sep) {
+            return Some(t[i + sep.len()..].trim_start());
+        }
+    }
+    None
+}
+
+/// Strip the handful of roff escapes that show up in NAME lines (`\-`, font
+/// changes `\fX`/`\f(XX`/`\f[..]`, zero-width `\&`) and collapse whitespace. Not
+/// a full roff engine — just enough for a readable one-liner.
+fn clean_roff(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('f') => match chars.peek() {
+                Some('(') => {
+                    chars.next();
+                    chars.next();
+                    chars.next();
+                }
+                Some('[') => {
+                    chars.next();
+                    for x in chars.by_ref() {
+                        if x == ']' {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            },
+            Some('(') => {
+                // A two-char glyph name, e.g. `\(aq`/`\(oq`/`\(cq` (quotes) or
+                // `\(en`/`\(em` (dashes). Map the common ones to ASCII; drop
+                // anything else rather than emit the raw glyph name.
+                match (chars.next(), chars.next()) {
+                    (Some('a' | 'o' | 'c'), Some('q')) => out.push('\''),
+                    (Some('e'), Some('n' | 'm')) => out.push('-'),
+                    _ => {}
+                }
+            }
+            Some('-') => out.push('-'),
+            Some('&') => {}
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -584,6 +876,106 @@ mod tests {
     fn no_zip_returns_none() {
         let bin = b"a plain binary with no embedded zip at all".to_vec();
         assert!(read_bytes(&bin).unwrap().is_none());
+    }
+
+    #[test]
+    fn whatis_parses_man_and_mdoc() {
+        // man(7), unquoted header (poppler style); the continuation line after
+        // the description must be dropped.
+        let man = ".TH X 1\n.SH NAME\npdftotext \\- PDF to text converter\n(version 3.03)\n.SH SYNOPSIS\n";
+        assert_eq!(
+            whatis_from_roff(man).as_deref(),
+            Some("PDF to text converter")
+        );
+        // DocBook output: quoted header.
+        let docbook = ".TH IFNE 1\n.SH \"NAME\"\nifne \\- Run command if stdin is not empty\n.SH \"SYNOPSIS\"\n";
+        assert_eq!(
+            whatis_from_roff(docbook).as_deref(),
+            Some("Run command if stdin is not empty")
+        );
+        // Several names share one description.
+        let multi = ".SH NAME\ngrep, egrep, fgrep \\- print lines matching a pattern\n";
+        assert_eq!(
+            whatis_from_roff(multi).as_deref(),
+            Some("print lines matching a pattern")
+        );
+        // mdoc(7): the description is its own `.Nd` macro.
+        let mdoc = ".Sh NAME\n.Nm tmux\n.Nd terminal multiplexer\n.Sh DESCRIPTION\n";
+        assert_eq!(
+            whatis_from_roff(mdoc).as_deref(),
+            Some("terminal multiplexer")
+        );
+        // Font escapes are stripped.
+        let fonts = ".SH NAME\nfoo \\- a \\fBbold\\fR word\n";
+        assert_eq!(whatis_from_roff(fonts).as_deref(), Some("a bold word"));
+        // A hyphenated command name (roff `name\-part`) must not be mistaken for
+        // the ` \- ` description separator.
+        let hyphen = ".SH NAME\ncurl\\-config \\- Get information about libcurl\n";
+        assert_eq!(
+            whatis_from_roff(hyphen).as_deref(),
+            Some("Get information about libcurl")
+        );
+        // Two-char glyph escapes map to ASCII (apostrophe), not raw `(aq`.
+        let glyph = ".SH NAME\nfoo \\- don\\(aqt panic\n";
+        assert_eq!(whatis_from_roff(glyph).as_deref(), Some("don't panic"));
+        // No NAME section → nothing.
+        assert_eq!(whatis_from_roff(".TH X 1\n.SH SYNOPSIS\nfoo\n"), None);
+    }
+
+    #[test]
+    fn program_docs_lists_and_describes() {
+        // A man body larger than the prefix scan proves we never inflate the
+        // whole page — the NAME line sits above the filler and still resolves.
+        let sponge = format!(
+            ".TH SPONGE 1\n.SH NAME\nsponge \\- soak up standard input and write to a file\n.SH DESCRIPTION\n{}",
+            "filler line filler line\n".repeat(2000)
+        );
+        let ifne =
+            ".TH IFNE 1\n.SH \"NAME\"\nifne \\- run command if stdin is not empty\n.SH SYNOPSIS\n";
+        let zip = build_zip(&[
+            ("unpin/aliases", b"sponge\nifne\nlckdo\n", M::Stored),
+            ("unpin/man/sponge.1", sponge.as_bytes(), M::Zstd),
+            ("unpin/man/ifne.1", ifne.as_bytes(), M::Deflate),
+            // `lckdo` ships no man page → listed, but with no description.
+        ]);
+        let docs = program_docs_from_bytes(&embed(&zip)).expect("docs");
+        assert_eq!(
+            docs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["ifne", "lckdo", "sponge"],
+        );
+        assert_eq!(
+            docs[0].whatis.as_deref(),
+            Some("run command if stdin is not empty")
+        );
+        assert_eq!(docs[1].whatis, None);
+        assert_eq!(
+            docs[2].whatis.as_deref(),
+            Some("soak up standard input and write to a file")
+        );
+    }
+
+    #[test]
+    fn program_docs_follow_so_redirect() {
+        // `unxz.1` is a `.so` redirect (stored as a unix symlink) to `xz.1`; the
+        // alias `unxz` borrows xz's description.
+        let xz = ".TH XZ 1\n.SH NAME\nxz \\- Compress or decompress .xz files\n.SH SYNOPSIS\n";
+        let zip = build_zip(&[
+            ("unpin/aliases", b"unxz\n", M::Stored),
+            ("unpin/man/xz.1", xz.as_bytes(), M::Zstd),
+            ("unpin/man/unxz.1", b"xz.1\n", M::Symlink),
+        ]);
+        let docs = program_docs_from_bytes(&embed(&zip)).expect("docs");
+        let unxz = docs.iter().find(|d| d.name == "unxz").expect("unxz listed");
+        assert_eq!(
+            unxz.whatis.as_deref(),
+            Some("Compress or decompress .xz files")
+        );
+    }
+
+    #[test]
+    fn program_docs_none_without_bundle() {
+        let zip = build_zip(&[("usr/share/zoneinfo/UTC", b"TZif...", M::Stored)]);
+        assert!(program_docs_from_bytes(&embed(&zip)).is_none());
     }
 
     #[test]
