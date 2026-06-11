@@ -511,7 +511,7 @@ fn link_aliases_for(
             let q = format!(
                 "Install {} alias(es) for {} ({})?",
                 declared.len(),
-                spec.repo(),
+                spec.display(),
                 declared.join(", ")
             );
             match ui.prompt_yes_no(&q) {

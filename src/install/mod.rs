@@ -942,7 +942,7 @@ pub fn run(
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or_default();
-                    eprintln!("Using {} {} (cached)", cand.repo(), tag);
+                    eprintln!("Using {} {} (cached)", cand.display(), tag);
                 }
                 return run_binary(cand, &vdir, args, assume_yes);
             }
@@ -956,12 +956,12 @@ pub fn run(
     // Resolve the program first; on a *genuine* 404 (not a transient error like
     // a rate-limit) retry the verb package. Whichever resolves wins, and the
     // rest of the function runs against that spec.
-    eprintln!("Resolving {}...", spec.repo());
+    eprintln!("Resolving {}...", spec.display());
     let (spec, release) = match fetch_release_typed(ctx, &spec) {
         Ok(r) => (spec, r),
         Err(github::FetchError::NotFound) if verb_spec.is_some() => {
             let vspec = verb_spec.unwrap();
-            eprintln!("Resolving {}...", vspec.repo());
+            eprintln!("Resolving {}...", vspec.display());
             let release = fetch_release(ctx, &vspec)?;
             (vspec, release)
         }
@@ -983,13 +983,13 @@ pub fn run(
         // A one-row live block for the single package's download (+ a
         // transient companion row). Cleared on success — the binary runs
         // next, so no leftover line; frozen red on failure.
-        let prefix = format!("{} {}", spec.name, release.tag_name);
+        let prefix = spec.with_tag(&release.tag_name);
         let (reporter, handle) = progress::start(vec![prefix.clone()]);
         let ui = Ui::Live(reporter.clone());
         let asset_size = job.asset.as_ref().map(|a| a.size).unwrap_or(0);
         let primary = reporter.start_download(0, prefix, asset_size);
         let companion = job.companion.as_ref().map(|c| {
-            let cprefix = format!("{} {} (data)", spec.name, release.tag_name);
+            let cprefix = format!("{} (data)", spec.with_tag(&release.tag_name));
             let (cid, csink) = reporter.add_companion(cprefix, c.size);
             (cid, csink as Arc<dyn ByteSink>)
         });
@@ -1013,7 +1013,7 @@ pub fn run(
             .unwrap_or(false);
         if !has_links {
             // stderr, same reasoning as the "Resolving..." line above.
-            eprintln!("Using {} {} (cached)", spec.repo(), release.tag_name);
+            eprintln!("Using {} {} (cached)", spec.display(), release.tag_name);
         }
     }
 

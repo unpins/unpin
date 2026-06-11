@@ -601,7 +601,11 @@ pub fn run_pipeline_v2(
     }
 
     // One render thread owns the whole live block; every row starts Queued.
-    let prefixes: Vec<String> = requests.iter().map(|r| r.label.clone()).collect();
+    // The row identity is the package's display name (not the raw argv `label`,
+    // which still drives error lines) so it matches the `<display> <tag>` the
+    // download/link phases grow into — the row never changes name, only gains
+    // the version.
+    let prefixes: Vec<String> = requests.iter().map(|r| r.spec.display()).collect();
     let (reporter, handle) = progress::start(prefixes);
     let ui = Ui::Live(reporter.clone());
 
@@ -661,13 +665,19 @@ pub fn run_pipeline_v2(
                     // Switch the row to a live download (+ a transient
                     // companion row) and hand the shared counters to the
                     // download. Cached jobs never reach the extract pool.
+                    //
+                    // The prefix appends the now-known version to the row's
+                    // display-name identity (catalog `jq`, third-party
+                    // `owner/repo`), so the row grows the tag once instead of
+                    // swapping wholesale to another name and back — which read as
+                    // the line flickering.
                     let sinks = if let Some(asset) = job.asset.as_ref() {
-                        let prefix = format!("{} {}", job.spec.name, job.release.tag_name);
+                        let prefix = job.spec.with_tag(&job.release.tag_name);
                         let primary: Arc<dyn ByteSink> =
                             reporter.start_download(idx, prefix, asset.size);
                         let companion = job.companion.as_ref().map(|c| {
                             let cprefix =
-                                format!("{} {} (data)", job.spec.name, job.release.tag_name);
+                                format!("{} (data)", job.spec.with_tag(&job.release.tag_name));
                             let (cid, csink) = reporter.add_companion(cprefix, c.size);
                             (cid, csink as Arc<dyn ByteSink>)
                         });
@@ -792,8 +802,12 @@ fn link_on_main(
     job: ExtractJob,
     errors: &mut Vec<String>,
 ) {
-    // Reset the row from the download prefix back to the owner/repo label.
-    reporter.set_prefix(idx, request.label.clone());
+    // Keep the row's identity and the resolved version together for the rest of
+    // its life (`<display> <tag>`). Downloaded rows already carry this;
+    // cached rows (which skip the extract pool) gain the tag here, so both end up
+    // identical and the version never has to reappear on the right where it would
+    // read as a duplicate of the prefix.
+    reporter.set_prefix(idx, job.spec.with_tag(&job.release.tag_name));
     reporter.working(idx, "Linking...");
     // Serialize all bin_dir writes across processes. The per-repo lock in
     // job._lock only covers this package's repo_dir; bin_dir is shared, so
@@ -1208,11 +1222,13 @@ fn resolve_missing_checksum_prompt(
 /// multi-line summary the legacy pipeline printed via `println!`, collapsed
 /// onto one line so it fits a single progress row.
 ///
-/// `previous` is whatever `active_version` returned just before linking ran
-/// — when it differs from `tag` the verb becomes "Updated prev → tag" so a
-/// version bump shows the upgrade direction inline on the bar. Same-tag
-/// (cached or replace-active no-op) and fresh installs (`previous == None`)
-/// keep reading as "Installed tag".
+/// The resolved `tag` is *not* repeated here — it already sits in the row's
+/// prefix (`<display> <tag>`), so echoing it on the right would show the version
+/// twice. `previous` is whatever `active_version` returned just before linking
+/// ran — when it differs from `tag` the verb becomes "Updated from prev" so a
+/// version bump still shows where it came from (the destination tag is in the
+/// prefix). Same-tag (cached or replace-active no-op) and fresh installs
+/// (`previous == None`) just read "Installed".
 fn install_summary_message(
     previous: Option<&str>,
     tag: &str,
@@ -1220,8 +1236,8 @@ fn install_summary_message(
     summary: &LinkSummary,
 ) -> String {
     let verb_phrase = match previous {
-        Some(prev) if prev != tag => format!("Updated {prev} → {tag}"),
-        _ => format!("Installed {tag}"),
+        Some(prev) if prev != tag => format!("Updated from {prev}"),
+        _ => "Installed".to_string(),
     };
     // The `(binaries)` tail tells the user which commands landed on PATH — worth
     // showing when they differ from the package name (`coreutils` → `ls, cat`),
@@ -1293,6 +1309,28 @@ mod tests {
             .copied()
             .expect("payload is the original &str panic message");
         assert_eq!(msg, "boom-original");
+    }
+
+    #[test]
+    fn summary_message_never_repeats_the_tag_now_carried_by_the_prefix() {
+        // The row prefix is `<display> <tag>` for its whole life, so the
+        // right-side summary must not echo the tag — otherwise the version
+        // shows twice on one row. Guards the dedup against a regression where
+        // the verb phrase drifts back to "Installed <tag>".
+        let summary = LinkSummary {
+            primary: vec!["rg".into()],
+            aliases: Vec::new(),
+            notes: Vec::new(),
+        };
+        let fresh = install_summary_message(None, "14.1.0", "ripgrep", &summary);
+        assert!(!fresh.contains("14.1.0"), "fresh install echoed the tag: {fresh}");
+        assert!(fresh.starts_with("Installed"), "unexpected verb: {fresh}");
+
+        // An update keeps the *source* version (the destination is in the
+        // prefix) but still must not repeat the destination tag.
+        let upd = install_summary_message(Some("13.0.0"), "14.1.0", "ripgrep", &summary);
+        assert!(upd.contains("13.0.0"), "update dropped the previous tag: {upd}");
+        assert!(!upd.contains("14.1.0"), "update echoed the destination tag: {upd}");
     }
 
     #[test]

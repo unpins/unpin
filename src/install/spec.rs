@@ -23,6 +23,27 @@ impl Spec {
     pub fn repo(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }
+
+    /// How the package is shown to the user: a curated catalog entry is just its
+    /// bare `name` (the `unpins/` owner is implied and pure noise), while a
+    /// third-party package keeps its disambiguating `<owner>/<name>`. Display
+    /// only — never use this for a filesystem path or URL (use [`Spec::repo`]).
+    pub fn display(&self) -> String {
+        if self.owner == CATALOG_OWNER {
+            self.name.clone()
+        } else {
+            self.repo()
+        }
+    }
+
+    /// The progress-row identity once the release tag is known: `<display> <tag>`
+    /// (e.g. `jq 1.8.1` or `BurntSushi/ripgrep 15.1.0`). Every path (install
+    /// download, install link, and `run`) renders a package through this one
+    /// helper so a row never reads as two different names — the name half stays
+    /// put for the row's whole life and only gains the version.
+    pub fn with_tag(&self, tag: &str) -> String {
+        format!("{} {tag}", self.display())
+    }
 }
 
 pub fn parse_spec(input: &str) -> Result<Spec, String> {

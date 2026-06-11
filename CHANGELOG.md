@@ -37,6 +37,13 @@ Versioning](https://semver.org).
 - Reads **zstd-compressed embedded metadata**, so `unpin man <pkg>` and
   `unpin bundle` keep working as catalog packages shrink their embedded man
   pages. Backward-compatible: older (deflate) packages still read fine.
+- **A download row keeps one stable name.** It used to flip between
+  `owner/repo` and `name version` mid-download and back; now it shows a single
+  identity the whole time and merely gains the resolved version once it's known
+  (`BurntSushi/ripgrep 15.1.0`), never repeating the version on the finished
+  row. Catalog programs render by their bare name (`jq`, not `unpins/jq`),
+  third-party ones keep `owner/repo`, and `install` and `run` now look
+  identical.
 
 ## [0.3.0] — 2026-06-08
 
