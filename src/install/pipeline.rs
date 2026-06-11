@@ -1254,7 +1254,11 @@ fn install_summary_message(
         msg.push_str(&format!(": {}", summary.primary.join(", ")));
     }
     if !summary.aliases.is_empty() {
-        let label = if summary.aliases.len() == 1 { "alias" } else { "aliases" };
+        let label = if summary.aliases.len() == 1 {
+            "alias"
+        } else {
+            "aliases"
+        };
         msg.push_str(&format!(" with {label} {}", summary.aliases.join(", ")));
     }
     for note in &summary.notes {
@@ -1328,14 +1332,23 @@ mod tests {
             notes: Vec::new(),
         };
         let fresh = install_summary_message(None, "14.1.0", "ripgrep", &summary);
-        assert!(!fresh.contains("14.1.0"), "fresh install echoed the tag: {fresh}");
+        assert!(
+            !fresh.contains("14.1.0"),
+            "fresh install echoed the tag: {fresh}"
+        );
         assert!(fresh.starts_with("Installed"), "unexpected verb: {fresh}");
 
         // An update keeps the *source* version (the destination is in the
         // prefix) but still must not repeat the destination tag.
         let upd = install_summary_message(Some("13.0.0"), "14.1.0", "ripgrep", &summary);
-        assert!(upd.contains("13.0.0"), "update dropped the previous tag: {upd}");
-        assert!(!upd.contains("14.1.0"), "update echoed the destination tag: {upd}");
+        assert!(
+            upd.contains("13.0.0"),
+            "update dropped the previous tag: {upd}"
+        );
+        assert!(
+            !upd.contains("14.1.0"),
+            "update echoed the destination tag: {upd}"
+        );
     }
 
     #[test]
@@ -1352,16 +1365,27 @@ mod tests {
         // Lone binary == package name: bare verb, the name is already in the prefix.
         assert_eq!(msg(&["xz"], &[], &[], "xz"), "Installed");
         // Binaries differing from the name follow the verb after a colon.
-        assert_eq!(msg(&["ls", "cat"], &[], &[], "coreutils"), "Installed: ls, cat");
+        assert_eq!(
+            msg(&["ls", "cat"], &[], &[], "coreutils"),
+            "Installed: ls, cat"
+        );
         // Aliases get a `with alias(es)` clause; singular vs plural is respected.
-        assert_eq!(msg(&["xz"], &["xzcat"], &[], "xz"), "Installed with alias xzcat");
+        assert_eq!(
+            msg(&["xz"], &["xzcat"], &[], "xz"),
+            "Installed with alias xzcat"
+        );
         assert_eq!(
             msg(&["xz"], &["xzcat", "unxz"], &[], "xz"),
             "Installed with aliases xzcat, unxz"
         );
         // Notes trail as parenthesized asides, one set of parens each.
         assert_eq!(
-            msg(&["ls", "cat"], &["dir"], &["2 alias(es) skipped"], "coreutils"),
+            msg(
+                &["ls", "cat"],
+                &["dir"],
+                &["2 alias(es) skipped"],
+                "coreutils"
+            ),
             "Installed: ls, cat with alias dir (2 alias(es) skipped)"
         );
         // Update with a binary list: the colon keeps the list off the version.

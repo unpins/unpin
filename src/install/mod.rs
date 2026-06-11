@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::ctx::Ctx;
 use crate::github::{self, ByteSink, Release};
+use crate::meta;
 use crate::platform::{self, Paths};
 use crate::progress::{self, Ui};
 
@@ -455,19 +456,31 @@ pub fn link_installed(
     Ok(())
 }
 
-pub fn uninstall_many(paths: &Paths, names: &[String], assume_yes: bool) -> Result<(), String> {
+pub fn uninstall_many(
+    paths: &Paths,
+    names: &[String],
+    assume_yes: bool,
+    keep_unpin: bool,
+) -> Result<(), String> {
     let targets: Vec<String> = if names.is_empty() {
-        let all = installed_repos(paths);
+        let mut all = installed_repos(paths);
         if all.is_empty() {
             println!("No packages installed");
             return Ok(());
         }
         // unpin self-installs as a managed package, so a bare `uninstall`
-        // sweeps it up with everything else — and that's the surprising bit:
-        // the command the user is running disappears. Call it out inline and
-        // in a dedicated warning so the confirmation isn't a blind "all".
+        // sweeps it up with everything else — including the command the user
+        // is running. `--keep-unpin` drops it from the batch; otherwise we
+        // flag it inline and the confirmation question spells out the stakes.
         let me = self_spec();
         let is_self = |o: &str, r: &str| me.owner == o && me.name == r;
+        if keep_unpin {
+            all.retain(|(o, r)| !is_self(o, r));
+            if all.is_empty() {
+                println!("Nothing to uninstall (only unpin itself is installed).");
+                return Ok(());
+            }
+        }
         let includes_self = all.iter().any(|(o, r)| is_self(o, r));
         println!(
             "This will uninstall all {} installed package(s):",
@@ -482,7 +495,7 @@ pub fn uninstall_many(paths: &Paths, names: &[String], assume_yes: bool) -> Resu
             println!("  {owner}/{repo}{mark}");
         }
         if includes_self {
-            println!("This includes unpin itself — the `unpin` command will be removed.");
+            println!("Tip: `unpin uninstall --keep-unpin` removes everything except unpin itself.");
         }
         let question = if includes_self {
             "Continue? This will remove unpin itself."
@@ -508,6 +521,28 @@ pub fn uninstall_many(paths: &Paths, names: &[String], assume_yes: bool) -> Resu
             failures += 1;
         }
     }
+
+    // Windows: if the batch left unpin's shared bin dir with no managed links
+    // (every package, including unpin itself, gone — a running-image tombstone
+    // reads as None), take the dir back off the user PATH so we don't leave an
+    // entry pointing at nothing. Done after the whole loop so the order targets
+    // are removed in doesn't matter. Best-effort, and a no-op when the dir was
+    // never on PATH. Unix keeps the shell-profile line (we can't reliably
+    // re-find it across shells).
+    #[cfg(windows)]
+    {
+        let bin_empty = fs::read_dir(&paths.bin)
+            .map(|it| !it.flatten().any(|e| platform::read_link(&e.path()).is_some()))
+            .unwrap_or(false);
+        if bin_empty {
+            match crate::setup::remove_dir_from_user_path(&paths.bin) {
+                Ok(true) => println!("Removed {} from your PATH.", paths.bin.display()),
+                Ok(false) => {}
+                Err(e) => eprintln!("warning: couldn't update PATH: {e}"),
+            }
+        }
+    }
+
     if failures == 0 {
         Ok(())
     } else {
@@ -737,6 +772,17 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
         if versions.len() > 1 || active.is_none() {
             println!("Versions: {}", versions.join(", "));
         }
+        // Programs the binary provides, each with the one-line description from
+        // its embedded man page (NAME section). Shown before the link list (it's
+        // the more useful view for a big multicall). Best-effort: any read/parse
+        // failure just omits the section — it never fails `info`.
+        if active.is_some()
+            && let Ok(bins) = installed_binaries(&ctx.paths, input)
+            && let Some(b) = bins.first()
+            && let Ok(Some(docs)) = meta::read_program_docs(b)
+        {
+            print_programs(&docs);
+        }
         println!("Links:");
         let bin = &ctx.paths.bin;
         let mut any = false;
@@ -773,6 +819,22 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
         Err(e) => println!("Asset:   (unresolved: {e})"),
     }
     Ok(())
+}
+
+/// Render the `Programs:` block: one row per command, the name in a padded
+/// column followed by its man-page whatis (omitted when none was found).
+fn print_programs(docs: &[meta::ProgramDoc]) {
+    if docs.is_empty() {
+        return;
+    }
+    println!("Programs:");
+    let w = docs.iter().map(|d| d.name.len()).max().unwrap_or(0);
+    for d in docs {
+        match &d.whatis {
+            Some(desc) => println!("  {:<w$}  {desc}", d.name),
+            None => println!("  {}", d.name),
+        }
+    }
 }
 
 pub fn clean(paths: &Paths) -> Result<(), String> {

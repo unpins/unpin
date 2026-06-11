@@ -128,6 +128,9 @@ struct UninstallCmd {
     /// Skip prompts
     #[arg(short = 'y', long = "yes")]
     assume_yes: bool,
+    /// When uninstalling all (no NAME), keep unpin itself installed
+    #[arg(long = "keep-unpin")]
+    keep_unpin: bool,
     /// installed package name; empty = uninstall all (with confirmation)
     #[arg(value_name = "NAME")]
     names: Vec<String>,
@@ -135,7 +138,7 @@ struct UninstallCmd {
 
 impl UninstallCmd {
     fn run(self, paths: &platform::Paths) -> Result<(), String> {
-        install::uninstall_many(paths, &self.names, self.assume_yes)
+        install::uninstall_many(paths, &self.names, self.assume_yes, self.keep_unpin)
     }
 }
 

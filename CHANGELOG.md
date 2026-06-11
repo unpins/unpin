@@ -6,6 +6,9 @@ Versioning](https://semver.org).
 ## [0.4.0] — 2026-06-10
 
 ### Added
+- **`unpin uninstall --keep-unpin`** uninstalls every package except unpin
+  itself. A bare `unpin uninstall` (no names) now points this option out before
+  it removes unpin along with everything else.
 - **Opt-in DNS fallback for hosts where the system resolver is unreachable.**
   On a host that can't reach any DNS server — some containers, Android, a
   dead/blocked nameserver — downloads fail to resolve. `unpin` can now resolve
@@ -22,6 +25,9 @@ Versioning](https://semver.org).
 - **`prune` is renamed to `clean`.** Same behavior — remove dangling links and
   unused version dirs. No alias is kept; update any scripts that called
   `unpin prune`.
+- **Windows: uninstalling unpin itself now takes its folder back off your user
+  PATH** once no other installed package's link remains in it, instead of
+  leaving a dangling entry. (Unix leaves the shell-profile line in place.)
 - **Windows: programs go on `PATH` as real `<name>.exe` NTFS hardlinks**, not
   `.cmd` wrappers. They now resolve everywhere an `.exe` does — cmd,
   PowerShell, git-bash/MSYS, WSL interop — and `unpin list`/`info` can show

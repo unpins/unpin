@@ -558,6 +558,46 @@ fn apply_path_change(bin: &Path) -> Result<PathOutcome, String> {
     }))
 }
 
+/// Remove `dir` from the per-user `Path` registry value, if present. The mirror
+/// of `apply_path_change` (which only ever adds): the Windows self-uninstall
+/// path calls this once the shared bin dir holds no more managed links, so
+/// unpin doesn't leave a dangling PATH entry pointing at a gone directory.
+/// Returns `Ok(true)` when an entry was actually removed. Unix has no
+/// counterpart — we can't reliably re-find the line we appended across shells,
+/// so the profile edit is left in place there.
+#[cfg(windows)]
+pub fn remove_dir_from_user_path(dir: &Path) -> Result<bool, String> {
+    use std::process::Command;
+
+    let escaped = dir.display().to_string().replace('\'', "''");
+    // `-ne` is case-insensitive in PowerShell, matching NTFS path semantics, so
+    // a differently-cased stored entry still matches; splitting on ';' and
+    // dropping empties also tidies any stray separators while we're here.
+    let script = format!(
+        "$b='{escaped}'; \
+         $p=[Environment]::GetEnvironmentVariable('Path','User'); \
+         if (-not $p) {{ 'absent' }} else {{ \
+             $parts = $p -split ';' | Where-Object {{ $_ -ne '' -and $_ -ne $b }}; \
+             $new = $parts -join ';'; \
+             if ($new -ne $p) {{ \
+                 [Environment]::SetEnvironmentVariable('Path', $new, 'User'); 'removed' \
+             }} else {{ 'absent' }} \
+         }}"
+    );
+
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| format!("run powershell to update PATH: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "powershell failed to update PATH: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim() == "removed")
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
