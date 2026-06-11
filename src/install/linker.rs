@@ -287,10 +287,10 @@ fn link_binary(
     }
 }
 
-/// Outcome of `link_all_executables`. Primary names go into the install
-/// summary line; alias names get a separate `aliases:` line; notes ride a
-/// `note:` line (e.g. when aliases were declared but skipped — non-catalog
-/// source, `--no-aliases`, etc).
+/// Outcome of `link_all_executables`. Primary names ride bare after the verb in
+/// the install summary line; alias names get a `with alias(es)` clause; notes
+/// trail as parenthesized asides (e.g. when aliases were declared but skipped —
+/// non-catalog source, `--no-aliases`, etc). See `install_summary_message`.
 #[derive(Default)]
 pub struct LinkSummary {
     pub primary: Vec<String>,

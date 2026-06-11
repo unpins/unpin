@@ -37,6 +37,10 @@ Versioning](https://semver.org).
 - Reads **zstd-compressed embedded metadata**, so `unpin man <pkg>` and
   `unpin bundle` keep working as catalog packages shrink their embedded man
   pages. Backward-compatible: older (deflate) packages still read fine.
+- **The install summary line reads as a sentence** —
+  `Installed ls, cat with aliases zcat, unxz (1 alias skipped)`. Binaries ride
+  bare after the verb, aliases get a `with alias(es)` clause, and notes trail in
+  parentheses.
 - **A download row keeps one stable name.** It used to flip between
   `owner/repo` and `name version` mid-download and back; now it shows a single
   identity the whole time and merely gains the resolved version once it's known

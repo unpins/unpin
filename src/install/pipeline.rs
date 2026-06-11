@@ -1217,10 +1217,15 @@ fn resolve_missing_checksum_prompt(
     ui.prompt_yes_no(question)
 }
 
-/// Compose the trailing "Installed v1.2.3 (binary names); aliases: ...; note: ..."
-/// message that sits to the right of the green check-mark. Mirrors the
-/// multi-line summary the legacy pipeline printed via `println!`, collapsed
-/// onto one line so it fits a single progress row.
+/// Compose the trailing summary that sits to the right of the green check-mark,
+/// reading as a sentence: `Installed ls, cat with aliases xzcat, unxz (note)`.
+/// Mirrors the multi-line summary the legacy pipeline printed via `println!`,
+/// collapsed onto one line so it fits a single progress row.
+///
+/// The three parts are graded by how much they add: the binary list rides bare
+/// after the verb, aliases get a `with alias(es)` clause, and notes — which are
+/// caveats (skipped/shadowed aliases, non-catalog source) — trail in parens as
+/// asides.
 ///
 /// The resolved `tag` is *not* repeated here — it already sits in the row's
 /// prefix (`<display> <tag>`), so echoing it on the right would show the version
@@ -1235,25 +1240,24 @@ fn install_summary_message(
     name: &str,
     summary: &LinkSummary,
 ) -> String {
-    let verb_phrase = match previous {
+    let mut msg = match previous {
         Some(prev) if prev != tag => format!("Updated from {prev}"),
         _ => "Installed".to_string(),
     };
-    // The `(binaries)` tail tells the user which commands landed on PATH — worth
+    // The binary list tells the user which commands landed on PATH — worth
     // showing when they differ from the package name (`coreutils` → `ls, cat`),
     // but pure noise when the lone binary *is* the package name (already in the
-    // bar's prefix). Drop it in that case.
+    // row's prefix). Drop it in that case.
     let redundant = summary.primary == [name];
-    let mut msg = if summary.primary.is_empty() || redundant {
-        verb_phrase
-    } else {
-        format!("{verb_phrase} ({})", summary.primary.join(", "))
-    };
+    if !summary.primary.is_empty() && !redundant {
+        msg.push_str(&format!(" {}", summary.primary.join(", ")));
+    }
     if !summary.aliases.is_empty() {
-        msg.push_str(&format!("; aliases: {}", summary.aliases.join(" ")));
+        let label = if summary.aliases.len() == 1 { "alias" } else { "aliases" };
+        msg.push_str(&format!(" with {label} {}", summary.aliases.join(", ")));
     }
     for note in &summary.notes {
-        msg.push_str(&format!("; note: {note}"));
+        msg.push_str(&format!(" ({note})"));
     }
     msg
 }
@@ -1331,6 +1335,34 @@ mod tests {
         let upd = install_summary_message(Some("13.0.0"), "14.1.0", "ripgrep", &summary);
         assert!(upd.contains("13.0.0"), "update dropped the previous tag: {upd}");
         assert!(!upd.contains("14.1.0"), "update echoed the destination tag: {upd}");
+    }
+
+    #[test]
+    fn summary_message_reads_as_a_sentence() {
+        let msg = |primary: &[&str], aliases: &[&str], notes: &[&str], name: &str| {
+            let summary = LinkSummary {
+                primary: primary.iter().map(|s| s.to_string()).collect(),
+                aliases: aliases.iter().map(|s| s.to_string()).collect(),
+                notes: notes.iter().map(|s| s.to_string()).collect(),
+            };
+            install_summary_message(None, "1.0", name, &summary)
+        };
+
+        // Lone binary == package name: bare verb, the name is already in the prefix.
+        assert_eq!(msg(&["xz"], &[], &[], "xz"), "Installed");
+        // Binaries differing from the name ride bare after the verb, comma-joined.
+        assert_eq!(msg(&["ls", "cat"], &[], &[], "coreutils"), "Installed ls, cat");
+        // Aliases get a `with alias(es)` clause; singular vs plural is respected.
+        assert_eq!(msg(&["xz"], &["xzcat"], &[], "xz"), "Installed with alias xzcat");
+        assert_eq!(
+            msg(&["xz"], &["xzcat", "unxz"], &[], "xz"),
+            "Installed with aliases xzcat, unxz"
+        );
+        // Notes trail as parenthesized asides, one set of parens each.
+        assert_eq!(
+            msg(&["ls", "cat"], &["dir"], &["2 alias(es) skipped"], "coreutils"),
+            "Installed ls, cat with alias dir (2 alias(es) skipped)"
+        );
     }
 
     #[test]
