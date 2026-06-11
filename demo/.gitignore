@@ -1,0 +1,6 @@
+# Throwaway HOME used during recording (cfonts cache + downloaded packages).
+/sbox
+# Rendered outputs — regenerate with `make`; the served copy lives in the website repo.
+/unpin-demo-dark.svg
+/unpin-demo-light.svg
+/.demo.cast.new

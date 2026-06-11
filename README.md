@@ -8,9 +8,9 @@ runs it on the spot or drops it in your PATH.
 
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/unpins/unpin/releases/download/v0.3.0/unpin-demo-dark.gif">
-    <source media="(prefers-color-scheme: light)" srcset="https://github.com/unpins/unpin/releases/download/v0.3.0/unpin-demo-light.gif">
-    <img alt="unpin demo — run a program straight from a GitHub release, then install several from the curated catalog in parallel" src="https://github.com/unpins/unpin/releases/download/v0.3.0/unpin-demo-dark.gif">
+    <source media="(prefers-color-scheme: dark)" srcset="https://unpins.org/demo/unpin-demo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://unpins.org/demo/unpin-demo-light.svg">
+    <img alt="unpin demo — run a program straight from a GitHub release, then install several from the curated catalog in parallel" src="https://unpins.org/demo/unpin-demo-dark.svg">
   </picture>
 </div>
 
