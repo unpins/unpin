@@ -754,17 +754,27 @@ pub fn read_link(p: &Path) -> Option<PathBuf> {
             std::path::Component::Prefix(pre) => pre.as_os_str().to_owned(),
             _ => return None,
         };
-        let parent = p.parent()?;
+        // Decide "is this co-name a sibling of `p`?" by on-disk directory
+        // identity, not by spelling. The enumerated co-name carries the volume's
+        // on-disk casing and backslashes, while `p` carries however the env
+        // spelled our paths — a drive letter in either case, a non-ASCII
+        // username whose case NTFS folds but `eq_ignore_ascii_case` wouldn't, an
+        // 8.3 component, a trailing separator. Canonicalizing both parents
+        // collapses all of that to one form so the test can't misfire (a
+        // misfire would either hide a managed link from uninstall/prune or
+        // return a sibling alias as the target). The returned path stays the
+        // reconstructed, non-verbatim `full` so callers can keep comparing it
+        // with `starts_with` against their plain `paths`-derived dirs.
+        let parent_canon = fs::canonicalize(p.parent()?).ok()?;
         for n in names {
             let mut s = prefix.clone();
             s.push(&n);
             let full = PathBuf::from(s);
-            // NTFS is case-insensitive; the enumerated casing is the on-disk
-            // one, which may differ from how the env spelled our paths.
-            let same_dir = full
+            let sibling = full
                 .parent()
-                .is_some_and(|fp| fp.as_os_str().eq_ignore_ascii_case(parent.as_os_str()));
-            if !same_dir {
+                .and_then(|fp| fs::canonicalize(fp).ok())
+                .is_some_and(|c| c == parent_canon);
+            if !sibling {
                 return Some(full);
             }
         }
