@@ -6,9 +6,9 @@
 //! markdown is rendered with termimad and paged with the shared reflowing pager,
 //! which re-renders at the live width on each resize.
 //!
-//! This was the `unpins/unpin-readme` package; folded in, it reads the bundle
-//! directly instead of through `unpin bundle dump`. The repo-fetch fallback is
-//! ported from that package.
+//! This was the `unpins/unpin-readme` package, which shelled out to read the
+//! bundle; folded in, it reads the bundle directly in-process. The repo-fetch
+//! fallback is ported from that package.
 
 use std::io::Read;
 

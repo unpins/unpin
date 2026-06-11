@@ -8,8 +8,8 @@
 //! re-runs the `mandoc-sys` renderer on each resize for true reflow.
 //!
 //! This was the `unpins/unpin-man` package, which drove the same renderer over
-//! a subprocess and read the bundle through `unpin bundle list/dump`. Folded in,
-//! it reads the bundle directly and links the renderer — no fetch, no IPC,
+//! a subprocess and read the bundle through a separate process. Folded in, it
+//! reads the bundle directly and links the renderer — no fetch, no IPC,
 //! offline. The page-resolution logic (parse / pick / `.so` follow) is ported
 //! from that package.
 

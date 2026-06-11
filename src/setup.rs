@@ -33,7 +33,7 @@ const SELF_NAME: &str = if cfg!(windows) { "unpin.exe" } else { "unpin" };
 /// Entry point for `unpin install` with no package argument. `force` reinstalls
 /// even when this binary is already the installed one — though there's nothing
 /// to relocate then (it's in place), so force only refreshes the link + PATH.
-pub fn run(paths: &Paths, assume_yes: bool, force: bool) -> Result<(), String> {
+pub fn run(paths: &Paths, assume_yes: bool, force: bool, quiet: bool) -> Result<(), String> {
     let current =
         env::current_exe().map_err(|e| format!("cannot locate the running unpin binary: {e}"))?;
     let spec = install::self_spec();
@@ -50,13 +50,15 @@ pub fn run(paths: &Paths, assume_yes: bool, force: bool) -> Result<(), String> {
         // re-check PATH. `--force` can't redo a no-op relocation, so it only
         // changes the message.
         install::link_installed(paths, &spec, &vdir, assume_yes)?;
-        if force {
-            println!(
-                "Reinstalled unpin {tag} ({}) — already in place, links refreshed.",
-                link.display()
-            );
-        } else {
-            println!("unpin {tag} is already installed ({}).", link.display());
+        if !quiet {
+            if force {
+                println!(
+                    "Reinstalled unpin {tag} ({}) — already in place, links refreshed.",
+                    link.display()
+                );
+            } else {
+                println!("unpin {tag} is already installed ({}).", link.display());
+            }
         }
     } else {
         // Windows: replacing the registered binary in place (same-version
@@ -74,7 +76,9 @@ pub fn run(paths: &Paths, assume_yes: bool, force: bool) -> Result<(), String> {
         }
         let reloc = relocate(&current, &dest)?;
         install::link_installed(paths, &spec, &vdir, assume_yes)?;
-        println!("Installed unpin {tag} ({}).", link.display());
+        if !quiet {
+            println!("Installed unpin {tag} ({}).", link.display());
+        }
         #[cfg(windows)]
         if let Relocation::CopiedOriginRemains(origin) = &reloc {
             // Spawn the `.exe` we just placed under packages\ as the janitor.
@@ -84,13 +88,19 @@ pub fn run(paths: &Paths, assume_yes: bool, force: bool) -> Result<(), String> {
         let _ = &reloc;
     }
 
-    match ensure_on_path(&paths.bin, assume_yes)? {
+    match ensure_on_path(&paths.bin, assume_yes, quiet)? {
         PathOutcome::AlreadyOnPath => {
-            println!("{} is already on your PATH.", paths.bin.display());
+            if !quiet {
+                println!("{} is already on your PATH.", paths.bin.display());
+            }
         }
         PathOutcome::Added(note) => {
-            println!("{note}");
+            if !quiet {
+                println!("{note}");
+            }
         }
+        // Always shown: the install isn't usable until the user acts on this,
+        // so it's actionable guidance rather than a success line `--quiet` drops.
         PathOutcome::Skipped(instruction) => {
             println!("{instruction}");
         }
@@ -329,7 +339,7 @@ enum PathOutcome {
 /// Ensure `bin` is on `PATH`, prompting first. Already there → no-op. Declined,
 /// or non-interactive without `-y` → return manual instructions rather than
 /// silently editing a profile / the registry.
-fn ensure_on_path(bin: &Path, assume_yes: bool) -> Result<PathOutcome, String> {
+fn ensure_on_path(bin: &Path, assume_yes: bool, quiet: bool) -> Result<PathOutcome, String> {
     if bin_on_path(bin) {
         return Ok(PathOutcome::AlreadyOnPath);
     }
@@ -342,9 +352,12 @@ fn ensure_on_path(bin: &Path, assume_yes: bool) -> Result<PathOutcome, String> {
         PathPlan::Pending { prompt } => prompt,
     };
 
+    // `--quiet` can't show the consent prompt, so it never silently edits a
+    // profile / the registry: fall back to the same manual-instruction path a
+    // non-interactive stdin takes (that instruction prints even under quiet).
     let proceed = if assume_yes {
         true
-    } else if !io::stdin().is_terminal() {
+    } else if quiet || !io::stdin().is_terminal() {
         return Ok(PathOutcome::Skipped(manual_instruction(bin)));
     } else {
         confirm(&prompt)

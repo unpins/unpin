@@ -963,6 +963,12 @@ pub struct Reporter {
     /// stderr is a terminal (bars are actually drawn). Prompts fall back to a
     /// plain stdin read when this is false.
     tty: bool,
+    /// `--quiet`: the live block is silenced (render thread runs on a null
+    /// screen) and every prompt short-circuits to `Skip` *without* reading
+    /// stdin — a quiet run must never block on a question it can't show. The
+    /// caller turns that `Skip` into the right outcome (refuse, or the safe
+    /// non-destructive default); see the prompt methods below.
+    quiet: bool,
     next_companion: Arc<AtomicU64>,
 }
 
@@ -1044,7 +1050,7 @@ impl Reporter {
     /// a plain stderr prompt when stderr isn't a terminal; auto-skips a
     /// non-interactive stdin.
     fn prompt_yes_no(&self, question: &str) -> PromptResult<bool> {
-        if !io::stdin().is_terminal() {
+        if self.quiet || !io::stdin().is_terminal() {
             return PromptResult::Skip;
         }
         if !self.tty {
@@ -1067,7 +1073,7 @@ impl Reporter {
     /// arrow-driven so the render thread fully owns every drawn line and can
     /// clear it exactly — no `dialoguer` redraws racing the bars.)
     fn prompt_pick(&self, header: &str, items: &[String]) -> PromptResult<usize> {
-        if items.is_empty() || !io::stdin().is_terminal() {
+        if self.quiet || items.is_empty() || !io::stdin().is_terminal() {
             return PromptResult::Skip;
         }
         if !self.tty {
@@ -1137,8 +1143,12 @@ impl Handle {
 
 /// Spawn the render thread for `prefixes` rows (all start Queued). Registers
 /// the SIGINT freeze hook for the lifetime of the returned [`Handle`].
-pub fn start(prefixes: Vec<String>) -> (Reporter, Handle) {
-    let tty = io::stderr().is_terminal();
+pub fn start(prefixes: Vec<String>, quiet: bool) -> (Reporter, Handle) {
+    // `--quiet` runs the block on a null screen (same path as a non-TTY stderr):
+    // every paint and the teardown newline become no-ops, so the whole live
+    // block is silent. Errors still surface — the dispatcher spells them out
+    // when `quiet` (see `finalize_errors`).
+    let tty = io::stderr().is_terminal() && !quiet;
     let (tx, rx) = mpsc::channel::<Msg>();
     let join = thread::spawn(move || render_loop(rx, tty));
     // Grow the Model to one Queued row per prefix. Messages are processed in
@@ -1150,6 +1160,7 @@ pub fn start(prefixes: Vec<String>) -> (Reporter, Handle) {
     let reporter = Reporter {
         tx: tx.clone(),
         tty,
+        quiet,
         next_companion: Arc::new(AtomicU64::new(0)),
     };
     let handle = Handle {

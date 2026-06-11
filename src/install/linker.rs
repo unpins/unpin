@@ -287,10 +287,12 @@ fn link_binary(
     }
 }
 
-/// Outcome of `link_all_executables`. Primary names ride bare after the verb in
-/// the install summary line; alias names get a `with alias(es)` clause; notes
-/// trail as parenthesized asides (e.g. when aliases were declared but skipped —
-/// non-catalog source, `--no-aliases`, etc). See `install_summary_message`.
+/// Outcome of `link_all_executables`. A primary name that differs from the
+/// package follows the verb with `as` in the install summary line (a homonymous
+/// one is dropped — it's already in the row's prefix); alias names get a
+/// `with alias(es)` clause; notes trail as parenthesized asides (e.g. when
+/// aliases were declared but skipped — non-catalog source, `--no-aliases`, etc).
+/// See `install_summary_message`.
 #[derive(Default)]
 pub struct LinkSummary {
     pub primary: Vec<String>,
@@ -643,7 +645,7 @@ fn link_alias(
 /// when their owning vdir was wiped. On Windows this is naturally a no-op:
 /// a hardlink keeps its file alive, so `read_link` either resolves to a
 /// data-dir name that exists or returns `None` — nothing ever dangles.
-pub fn sweep_dangling_links(bin: &Path, root: &Path) -> usize {
+pub fn sweep_dangling_links(bin: &Path, root: &Path, quiet: bool) -> usize {
     let mut removed = 0usize;
     if let Ok(entries) = fs::read_dir(bin) {
         for entry in entries.flatten() {
@@ -656,7 +658,9 @@ pub fn sweep_dangling_links(bin: &Path, root: &Path) -> usize {
                 continue;
             }
             if fs::metadata(&target).is_err() && fs::remove_file(&path).is_ok() {
-                println!("Removed dangling {}", path.display());
+                if !quiet {
+                    println!("Removed dangling {}", path.display());
+                }
                 removed += 1;
             }
         }

@@ -94,12 +94,6 @@ to re-resolve the latest release.
 .BI completion " SHELL"
 Print a shell completion script for
 .IR bash ", " zsh ", " fish ", or " elvish .
-.TP
-.BI bundle " list|dump PKG " [ \fIENTRY\fR ]
-Inspect a package's embedded metadata bundle \(em its
-.I unpin/*
-entries. A stable interface used by helper packages such as
-.IR man .
 .SH OPTIONS
 These apply to
 .B install
@@ -128,6 +122,21 @@ Always prompt to choose the release asset instead of auto-picking.
 .TP
 .BR \-v ", " \-\-verbose
 Print every HTTP request and show release assets that were filtered out.
+.TP
+.BR \-q ", " \-\-quiet
+Silence the progress display and per-package summary lines; only errors are
+printed, so a successful run is silent
+.RB ( install ", " update ", " uninstall ", " clean ).
+Prompts never block: a missing-checksum download is refused rather than run
+unverified, a bare
+.B uninstall
+(all packages) refuses without
+.BR \-y ,
+and other confirmations take their safe non-interactive default. Conflicts with
+.BR \-\-verbose ;
+pair with
+.B \-y
+for unattended runs.
 .TP
 .B \-\-no\-data
 Skip the per-release runtime-data tarball (overrides config

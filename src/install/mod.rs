@@ -158,10 +158,9 @@ pub(super) fn active_version(paths: &Paths, owner: &str, name: &str) -> Option<S
 }
 
 /// `true` if `name` (`owner/repo` or bare) resolves to an installed repo dir.
-/// Lets `bundle` report a not-installed package with a distinct exit code instead
-/// of a hard error, so helper packages (`unpin man`) can tell "not installed"
-/// apart from an unreadable/corrupt bundle without parsing stderr. A genuinely
-/// malformed/ambiguous name still propagates as `Err`.
+/// Lets the doc verbs (`man`/`readme`) tell "not installed" apart from an absent
+/// or unreadable bundle, so they can offer a tailored "run `unpin install …`"
+/// hint. A genuinely malformed/ambiguous name still propagates as `Err`.
 pub(crate) fn is_installed(paths: &Paths, name: &str) -> Result<bool, String> {
     Ok(resolve_installed(paths, name)?.is_some())
 }
@@ -470,11 +469,14 @@ pub fn uninstall_many(
     names: &[String],
     assume_yes: bool,
     keep_unpin: bool,
+    quiet: bool,
 ) -> Result<(), String> {
     let targets: Vec<String> = if names.is_empty() {
         let mut all = installed_repos(paths);
         if all.is_empty() {
-            println!("No packages installed");
+            if !quiet {
+                println!("No packages installed");
+            }
             return Ok(());
         }
         // unpin self-installs as a managed package, so a bare `uninstall`
@@ -486,25 +488,39 @@ pub fn uninstall_many(
         if keep_unpin {
             all.retain(|(o, r)| !is_self(o, r));
             if all.is_empty() {
-                println!("Nothing to uninstall (only unpin itself is installed).");
+                if !quiet {
+                    println!("Nothing to uninstall (only unpin itself is installed).");
+                }
                 return Ok(());
             }
         }
         let includes_self = all.iter().any(|(o, r)| is_self(o, r));
-        println!(
-            "This will uninstall all {} installed package(s):",
-            all.len()
-        );
-        for (owner, repo) in &all {
-            let mark = if is_self(owner, repo) {
-                "  (unpin itself)"
-            } else {
-                ""
-            };
-            println!("  {owner}/{repo}{mark}");
+        // A quiet uninstall-all can't show the confirmation, and clearing every
+        // package (unpin included) is destructive — refuse unless `-y` already
+        // settled it.
+        if quiet && !assume_yes {
+            return Err(
+                "refusing to uninstall all packages under --quiet without --yes".into(),
+            );
         }
-        if includes_self {
-            println!("Tip: `unpin uninstall --keep-unpin` removes everything except unpin itself.");
+        if !quiet {
+            println!(
+                "This will uninstall all {} installed package(s):",
+                all.len()
+            );
+            for (owner, repo) in &all {
+                let mark = if is_self(owner, repo) {
+                    "  (unpin itself)"
+                } else {
+                    ""
+                };
+                println!("  {owner}/{repo}{mark}");
+            }
+            if includes_self {
+                println!(
+                    "Tip: `unpin uninstall --keep-unpin` removes everything except unpin itself."
+                );
+            }
         }
         let question = if includes_self {
             "Continue? This will remove unpin itself."
@@ -525,7 +541,7 @@ pub fn uninstall_many(
 
     let mut failures = 0usize;
     for name in &targets {
-        if let Err(e) = uninstall_one(paths, name) {
+        if let Err(e) = uninstall_one(paths, name, quiet) {
             eprintln!("unpin: {name}: {e}");
             failures += 1;
         }
@@ -548,8 +564,8 @@ pub fn uninstall_many(
             .unwrap_or(false);
         if bin_empty {
             match crate::setup::remove_dir_from_user_path(&paths.bin) {
-                Ok(true) => println!("Removed {} from your PATH.", paths.bin.display()),
-                Ok(false) => {}
+                Ok(true) if !quiet => println!("Removed {} from your PATH.", paths.bin.display()),
+                Ok(_) => {}
                 Err(e) => eprintln!("warning: couldn't update PATH: {e}"),
             }
         }
@@ -562,7 +578,7 @@ pub fn uninstall_many(
     }
 }
 
-fn uninstall_one(paths: &Paths, name: &str) -> Result<(), String> {
+fn uninstall_one(paths: &Paths, name: &str, quiet: bool) -> Result<(), String> {
     let (owner, repo) = resolve_installed(paths, name)?.ok_or("not installed")?;
     let rdir = paths.repo_dir(&owner, &repo);
 
@@ -644,18 +660,22 @@ fn uninstall_one(paths: &Paths, name: &str) -> Result<(), String> {
         #[cfg(windows)]
         if let Some(staged) = &janitor {
             crate::setup::spawn_dir_janitor(staged, &rdir, &sidelined)?;
-            println!("Removed {owner}/{repo} (cleanup finishes after unpin exits)");
+            if !quiet {
+                println!("Removed {owner}/{repo} (cleanup finishes after unpin exits)");
+            }
             return Ok(());
         }
         fs::remove_dir_all(&rdir).map_err(|e| format!("remove {}: {e}", rdir.display()))?;
     }
     let _ = fs::remove_dir(paths.data.join(&owner));
 
-    if versions.is_empty() {
-        println!("Removed {owner}/{repo}");
-    } else {
-        for v in &versions {
-            println!("Removed {owner}/{repo}@{v}");
+    if !quiet {
+        if versions.is_empty() {
+            println!("Removed {owner}/{repo}");
+        } else {
+            for v in &versions {
+                println!("Removed {owner}/{repo}@{v}");
+            }
         }
     }
     Ok(())
@@ -685,7 +705,9 @@ pub fn update(ctx: &Ctx, opts: &InstallOptions, names: &[String]) -> Result<(), 
     };
 
     if targets.is_empty() {
-        println!("No packages installed");
+        if !opts.quiet {
+            println!("No packages installed");
+        }
         return Ok(());
     }
 
@@ -849,7 +871,7 @@ fn print_programs(docs: &[meta::ProgramDoc]) {
     }
 }
 
-pub fn clean(paths: &Paths) -> Result<(), String> {
+pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
     let mut removed = 0usize;
     let mut skipped: Vec<String> = Vec::new();
 
@@ -872,7 +894,7 @@ pub fn clean(paths: &Paths) -> Result<(), String> {
         // Reclaim tombstones of sidelined busy links whose process exited.
         #[cfg(windows)]
         platform::sweep_sidelined(bin);
-        removed += sweep_dangling_links(bin, root);
+        removed += sweep_dangling_links(bin, root, quiet);
     }
 
     // Orphan version dirs: no live link in bin_dir points into them.
@@ -919,7 +941,9 @@ pub fn clean(paths: &Paths) -> Result<(), String> {
             if is_part_dir_name(&v) {
                 if fs::remove_dir_all(&vpath).is_ok() {
                     let tag = v.strip_suffix(".part").unwrap_or(&v);
-                    println!("Removed stale extraction {owner}/{repo}@{tag}");
+                    if !quiet {
+                        println!("Removed stale extraction {owner}/{repo}@{tag}");
+                    }
                     removed += 1;
                 }
                 continue;
@@ -928,7 +952,9 @@ pub fn clean(paths: &Paths) -> Result<(), String> {
                 continue;
             }
             if fs::remove_dir_all(&vpath).is_ok() {
-                println!("Removed orphan {owner}/{repo}@{v}");
+                if !quiet {
+                    println!("Removed orphan {owner}/{repo}@{v}");
+                }
                 removed += 1;
             }
         }
@@ -946,9 +972,11 @@ pub fn clean(paths: &Paths) -> Result<(), String> {
         let _links = platform::acquire_links_lock(root, || {
             eprintln!("Waiting for another unpin process to finish updating links...");
         })?;
-        removed += sweep_dangling_links(bin, root);
+        removed += sweep_dangling_links(bin, root, quiet);
     }
 
+    // A lock-skip means clean didn't fully run — a caveat worth keeping even
+    // under `--quiet` (it's why a vdir survived); errors and caveats still talk.
     if !skipped.is_empty() {
         eprintln!(
             "Skipped {} package(s) with an active install lock: {}",
@@ -956,10 +984,12 @@ pub fn clean(paths: &Paths) -> Result<(), String> {
             skipped.join(", ")
         );
     }
-    if removed > 0 {
-        println!("Cleaned {removed} item(s)");
-    } else if skipped.is_empty() {
-        println!("Nothing to clean");
+    if !quiet {
+        if removed > 0 {
+            println!("Cleaned {removed} item(s)");
+        } else if skipped.is_empty() {
+            println!("Nothing to clean");
+        }
     }
     Ok(())
 }
@@ -1059,7 +1089,8 @@ pub fn run(
         // transient companion row). Cleared on success — the binary runs
         // next, so no leftover line; frozen red on failure.
         let prefix = spec.with_tag(&release.tag_name);
-        let (reporter, handle) = progress::start(vec![prefix.clone()]);
+        // `run` has no `--quiet` (it forwards everything to the tool); never quiet.
+        let (reporter, handle) = progress::start(vec![prefix.clone()], false);
         let ui = Ui::Live(reporter.clone());
         let asset_size = job.asset.as_ref().map(|a| a.size).unwrap_or(0);
         let primary = reporter.start_download(0, prefix, asset_size);
@@ -1221,15 +1252,8 @@ fn run_binary(spec: &Spec, vdir: &Path, args: &[String], assume_yes: bool) -> Re
         }
     };
 
-    // Expose this unpin binary to the launched package via $UNPIN_SELF, so a
-    // helper package (e.g. `man`) can shell back to `unpin bundle …` against
-    // exactly this binary instead of guessing one off $PATH. Best-effort: if we
-    // can't resolve our own path the child just falls back to `unpin` on $PATH.
     let mut cmd = Command::new(&bin);
     cmd.args(args);
-    if let Ok(self_exe) = std::env::current_exe() {
-        cmd.env("UNPIN_SELF", self_exe);
-    }
     let status = cmd
         .status()
         .map_err(|e| format!("exec {}: {e}", bin.display()))?;
@@ -1357,7 +1381,7 @@ mod tests {
     fn is_installed_tracks_the_repo_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_data(tmp.path());
-        // Nothing on disk → not installed (drives `bundle`'s EXIT_NOT_INSTALLED).
+        // Nothing on disk → not installed (drives the doc verbs' install hint).
         assert!(!is_installed(&paths, "htop").unwrap());
         assert!(!is_installed(&paths, "unpins/htop").unwrap());
         // A bare repo dir is enough for "installed" (a linked version is a later,

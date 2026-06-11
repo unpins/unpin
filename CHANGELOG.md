@@ -6,6 +6,14 @@ Versioning](https://semver.org).
 ## [0.4.0] — 2026-06-10
 
 ### Added
+- **`-q`/`--quiet` on `install`, `update`, `uninstall`, and `clean`.** Silences
+  the progress display and the per-package summary/`Removed`/`Cleaned` lines;
+  only errors still print, so a successful run is silent. Prompts never block —
+  a missing-checksum download is refused (non-zero exit) rather than run
+  unverified, `uninstall` with no names refuses without `-y`, and other
+  confirmations take their safe non-interactive default. Pair with `-y` for
+  fully unattended runs. (`run` is unaffected — it forwards every flag to the
+  program.)
 - **`unpin uninstall --keep-unpin`** uninstalls every package except unpin
   itself. A bare `unpin uninstall` (no names) now points this option out before
   it removes unpin along with everything else.
@@ -43,13 +51,14 @@ Versioning](https://semver.org).
   terminal; piped output stays plain. The banner now carries the project
   slogan, and `--jobs`'s default is described as what it is (one worker per
   package, max 4).
-- Reads **zstd-compressed embedded metadata**, so `unpin man <pkg>` and
-  `unpin bundle` keep working as catalog packages shrink their embedded man
-  pages. Backward-compatible: older (deflate) packages still read fine.
-- **The install summary line reads as a sentence** —
-  `Installed ls, cat with aliases zcat, unxz (1 alias skipped)`. Binaries ride
-  bare after the verb, aliases get a `with alias(es)` clause, and notes trail in
-  parentheses.
+- Reads **zstd-compressed embedded metadata**, so `unpin man <pkg>` keeps
+  working as catalog packages shrink their embedded man pages.
+  Backward-compatible: older (deflate) packages still read fine.
+- **The install summary line reads as a sentence** — `Installed as rg`, or
+  `Installed with aliases ls, cat (1 alias skipped)`. A binary whose name differs
+  from the package follows the verb with `as` (a homonymous one is omitted, since
+  it's already in the row), aliases get a `with alias(es)` clause, and notes
+  trail in parentheses.
 - **A download row keeps one stable name.** It used to flip between
   `owner/repo` and `name version` mid-download and back; now it shows a single
   identity the whole time and merely gains the resolved version once it's known
@@ -57,6 +66,11 @@ Versioning](https://semver.org).
   row. Catalog programs render by their bare name (`jq`, not `unpins/jq`),
   third-party ones keep `owner/repo`, and `install` and `run` now look
   identical.
+
+### Removed
+- **`unpin bundle`** is gone. It exposed a binary's raw `unpin/*` metadata
+  entries for the separate helper-verb packages; `man` and `readme` are now
+  builtins that read those entries in-process.
 
 ## [0.3.0] — 2026-06-08
 

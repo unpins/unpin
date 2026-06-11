@@ -55,13 +55,11 @@ enum Cmd {
     /// Render a program's README in your terminal, paged. Accepts a catalog name or owner/repo.
     Readme(ReadmeCmd),
     /// Remove dangling links and unused version dirs from the unpin cache.
-    Clean,
+    Clean(CleanCmd),
     /// Run a package's binary without installing it (no entry added to PATH). Default command — `unpin owner/repo` is equivalent to `unpin run owner/repo`.
     Run(RunCmd),
     /// Print a shell completion script. Pipe it to your shell's completion directory (see README).
     Completion(CompletionCmd),
-    /// Inspect a package's embedded metadata bundle — its `unpin/*` entries (stable interface for helper-verb packages; the builtin `man`/`readme` read it in-process).
-    Bundle(BundleCmd),
     /// (internal) Detached cleanup helper for Windows self-(un)install: delete a
     /// stray file and/or unpin's own repo dir once the spawning process exits.
     #[command(hide = true)]
@@ -81,10 +79,9 @@ impl Cmd {
             Cmd::Info(c) => c.run(paths).map(|()| 0),
             Cmd::Man(c) => c.run(paths).map(|()| 0),
             Cmd::Readme(c) => c.run(paths).map(|()| 0),
-            Cmd::Clean => install::clean(paths).map(|()| 0),
+            Cmd::Clean(c) => c.run(paths).map(|()| 0),
             Cmd::Run(c) => c.run(paths),
             Cmd::Completion(c) => c.run().map(|()| 0),
-            Cmd::Bundle(c) => c.run(paths),
             Cmd::Reap(c) => {
                 c.run();
                 Ok(0)
@@ -107,7 +104,12 @@ impl InstallCmd {
         // No package = self-install: relocate this binary into `bin` and put
         // that dir on PATH. Only `-y` matters here (skip the PATH prompt).
         if self.pkgs.is_empty() {
-            return setup::run(paths, self.flags.assume_yes, self.flags.force);
+            return setup::run(
+                paths,
+                self.flags.assume_yes,
+                self.flags.force,
+                self.flags.quiet,
+            );
         }
         let (ctx, opts) = self.flags.resolve(paths);
         install::install_many(&ctx, &opts, &self.pkgs)
@@ -138,6 +140,9 @@ struct UninstallCmd {
     /// When uninstalling all (no NAME), keep unpin itself installed
     #[arg(long = "keep-unpin")]
     keep_unpin: bool,
+    /// Silence per-package output; only errors are printed (uninstall-all needs -y)
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
     /// installed package name; empty = uninstall all (with confirmation)
     #[arg(value_name = "NAME")]
     names: Vec<String>,
@@ -145,7 +150,13 @@ struct UninstallCmd {
 
 impl UninstallCmd {
     fn run(self, paths: &platform::Paths) -> Result<(), String> {
-        install::uninstall_many(paths, &self.names, self.assume_yes, self.keep_unpin)
+        install::uninstall_many(
+            paths,
+            &self.names,
+            self.assume_yes,
+            self.keep_unpin,
+            self.quiet,
+        )
     }
 }
 
@@ -267,6 +278,19 @@ impl RunCmd {
 }
 
 #[derive(Args, Debug)]
+struct CleanCmd {
+    /// Silence per-item output; only errors and lock-skip caveats are printed
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
+}
+
+impl CleanCmd {
+    fn run(self, paths: &platform::Paths) -> Result<(), String> {
+        install::clean(paths, self.quiet)
+    }
+}
+
+#[derive(Args, Debug)]
 struct CompletionCmd {
     /// bash | zsh | fish | elvish
     #[arg(value_name = "SHELL")]
@@ -288,40 +312,6 @@ impl CompletionCmd {
         std::io::stdout()
             .write_all(&buf)
             .map_err(|e| format!("write completions: {e}"))
-    }
-}
-
-#[derive(Args, Debug)]
-struct BundleCmd {
-    #[command(subcommand)]
-    op: BundleOp,
-}
-
-#[derive(Subcommand, Debug)]
-enum BundleOp {
-    /// List every entry in the bundle (`path<TAB>size`, or `path<TAB>-> target` for a `.so` symlink).
-    List {
-        /// Package whose binary to read (installed name, or `unpin` for the running binary)
-        #[arg(value_name = "PKG")]
-        pkg: String,
-    },
-    /// Print one entry's bytes to stdout; prints nothing if the entry (or the whole bundle) is absent.
-    Dump {
-        /// Package whose binary to read (installed name, or `unpin` for the running binary)
-        #[arg(value_name = "PKG")]
-        pkg: String,
-        /// Entry path, e.g. `unpin/aliases`
-        #[arg(value_name = "ENTRY")]
-        entry: String,
-    },
-}
-
-impl BundleCmd {
-    fn run(self, paths: &platform::Paths) -> Result<i32, String> {
-        match self.op {
-            BundleOp::List { pkg } => bundle::list(paths, &pkg),
-            BundleOp::Dump { pkg, entry } => bundle::dump(paths, &pkg, &entry),
-        }
     }
 }
 
@@ -349,6 +339,9 @@ struct InstallUpdateFlags {
     /// Print every HTTP request and show release assets that were filtered out
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
+    /// Silence progress and per-package summaries; only errors are printed (pair with -y for unattended runs)
+    #[arg(short = 'q', long = "quiet", conflicts_with = "verbose")]
+    quiet: bool,
     /// Skip the per-release runtime data tarball (overrides config `data = true`)
     #[arg(long = "no-data")]
     no_data: bool,
@@ -375,6 +368,7 @@ impl InstallUpdateFlags {
             self.pick,
             self.no_data,
             self.force,
+            self.quiet,
             alias_override,
         );
         (ctx, opts)
@@ -415,7 +409,6 @@ const SUBCOMMANDS: &[&str] = &[
     "clean",
     "run",
     "completion",
-    "bundle",
     "reap",
     "help",
 ];

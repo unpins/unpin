@@ -46,6 +46,10 @@ pub struct InstallOptions {
     /// Reinstall over a complete cache: bypass the `UpToDate`/`Cached`
     /// short-circuits so the package is re-downloaded and re-extracted.
     pub force: bool,
+    /// `--quiet`: silence the live block and every success/summary line; only
+    /// errors (and the missing-checksum refusal) still print. Prompts never
+    /// block — they short-circuit to their safe non-interactive outcome.
+    pub quiet: bool,
 }
 
 impl InstallOptions {
@@ -53,6 +57,7 @@ impl InstallOptions {
     /// from `--aliases`/`--no-aliases`/`--ask-aliases` resolution; `no_data`
     /// from `--no-data`. Caller owns the `ctx` so config lookups happen
     /// here at the boundary rather than scattered in pipeline functions.
+    #[allow(clippy::too_many_arguments)] // CLI→policy boundary; each flag is distinct
     pub fn resolve(
         ctx: &Ctx,
         assume_yes: bool,
@@ -60,6 +65,7 @@ impl InstallOptions {
         pick: bool,
         no_data: bool,
         force: bool,
+        quiet: bool,
         alias_override: Option<AliasMode>,
     ) -> Self {
         Self {
@@ -69,6 +75,7 @@ impl InstallOptions {
             include_data: !no_data && ctx.cfg.data(),
             alias_mode: alias_override.unwrap_or_else(|| ctx.cfg.aliases()),
             force,
+            quiet,
         }
     }
 }
@@ -606,7 +613,7 @@ pub fn run_pipeline_v2(
     // download/link phases grow into — the row never changes name, only gains
     // the version.
     let prefixes: Vec<String> = requests.iter().map(|r| r.spec.display()).collect();
-    let (reporter, handle) = progress::start(prefixes);
+    let (reporter, handle) = progress::start(prefixes, opts.quiet);
     let ui = Ui::Live(reporter.clone());
 
     let n_workers = pick_jobs(opts.jobs, requests.len());
@@ -783,7 +790,9 @@ pub fn run_pipeline_v2(
     handle.finish();
     // The live block drew a row per package only on a TTY; there it already
     // showed each failure, so suppress the redundant trailing dump.
-    finalize_errors(errors, io::stderr().is_terminal())
+    // Under `--quiet` the rows were never drawn (null screen), so the failures
+    // weren't shown inline — force them to be spelled out here.
+    finalize_errors(errors, !opts.quiet && io::stderr().is_terminal())
 }
 
 /// Run the link phase for one job on the main thread. Called both for
@@ -1087,7 +1096,12 @@ fn finalize_resolution(
             // Cascade: handle missing-checksum prompts now (possibly fresh
             // from the picker resolution).
             if data.primary_checksum_missing {
-                match resolve_missing_checksum_prompt(ui, ChecksumKind::Primary, opts.assume_yes) {
+                match resolve_missing_checksum_prompt(
+                    ui,
+                    ChecksumKind::Primary,
+                    opts.assume_yes,
+                    opts.quiet,
+                ) {
                     PromptResult::Got(true) => {}
                     PromptResult::Got(false) => {
                         return Err("aborted: missing checksum".into());
@@ -1099,8 +1113,12 @@ fn finalize_resolution(
                 data.primary_checksum_missing = false;
             }
             if data.companion_checksum_missing {
-                match resolve_missing_checksum_prompt(ui, ChecksumKind::Companion, opts.assume_yes)
-                {
+                match resolve_missing_checksum_prompt(
+                    ui,
+                    ChecksumKind::Companion,
+                    opts.assume_yes,
+                    opts.quiet,
+                ) {
                     PromptResult::Got(true) => {}
                     PromptResult::Got(false) => {
                         return Err("aborted: missing companion checksum".into());
@@ -1201,12 +1219,19 @@ fn resolve_missing_checksum_prompt(
     ui: &Ui,
     kind: ChecksumKind,
     assume_yes: bool,
+    quiet: bool,
 ) -> PromptResult<bool> {
     if assume_yes {
         // No separate warning line under -y: the missing-checksum fact is
         // folded into the package's final row instead (yellow ⚠
         // "… (unverified)"), so the live block stays one clean line per package.
         return PromptResult::Got(true);
+    }
+    if quiet {
+        // Can't ask, and silently skipping an unverified download would read as
+        // a clean success. Refuse loudly instead — `Got(false)` makes the caller
+        // fail this package (the run still exits non-zero and prints the error).
+        return PromptResult::Got(false);
     }
     let question = match kind {
         ChecksumKind::Primary => "No SHA-256 checksum found. Continue without verification?",
@@ -1218,15 +1243,17 @@ fn resolve_missing_checksum_prompt(
 }
 
 /// Compose the trailing summary that sits to the right of the green check-mark,
-/// reading as a sentence: `Installed: ls, cat with aliases xzcat, unxz (note)`.
+/// reading as a sentence: `Installed as rg`, or `Installed with aliases ls, cat`.
 /// Mirrors the multi-line summary the legacy pipeline printed via `println!`,
 /// collapsed onto one line so it fits a single progress row.
 ///
-/// The three parts are graded by how much they add: the binary list follows the
-/// verb after a colon (the colon keeps it from reading as part of the verb's
-/// version — `Updated from 1.2.3: ls, cat`), aliases get a `with alias(es)`
-/// clause, and notes — which are caveats (skipped/shadowed aliases, non-catalog
-/// source) — trail in parens as asides.
+/// The three parts are graded by how much they add: a binary whose name differs
+/// from the package follows the verb with `as` (which also keeps it from reading
+/// as part of the verb's version — `Updated from 1.2.3 as rg`), aliases get a
+/// `with alias(es)` clause, and notes — which are caveats (skipped/shadowed
+/// aliases, non-catalog source) — trail in parens as asides. A binary homonymous
+/// with the package (the common case: `htop`, `nano`, even `coreutils`, whose
+/// applets ride as aliases) is dropped — it's already in the row's prefix.
 ///
 /// The resolved `tag` is *not* repeated here — it already sits in the row's
 /// prefix (`<display> <tag>`), so echoing it on the right would show the version
@@ -1251,7 +1278,7 @@ fn install_summary_message(
     // row's prefix). Drop it in that case.
     let redundant = summary.primary == [name];
     if !summary.primary.is_empty() && !redundant {
-        msg.push_str(&format!(": {}", summary.primary.join(", ")));
+        msg.push_str(&format!(" as {}", summary.primary.join(", ")));
     }
     if !summary.aliases.is_empty() {
         let label = if summary.aliases.len() == 1 {
@@ -1297,6 +1324,18 @@ fn finalize_errors(errors: Vec<String>, rows_shown: bool) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_refuses_a_missing_checksum_instead_of_skipping() {
+        // Security gate: a quiet run can't show the y/N, and a silent skip would
+        // read as success. It must refuse — `Got(false)` makes the caller fail
+        // the package (non-zero exit), never a non-fatal `Skip`.
+        let r = resolve_missing_checksum_prompt(&Ui::Plain, ChecksumKind::Primary, false, true);
+        assert!(matches!(r, PromptResult::Got(false)));
+        // `-y` still wins (explicit opt-in to run unverified), quiet or not.
+        let y = resolve_missing_checksum_prompt(&Ui::Plain, ChecksumKind::Primary, true, true);
+        assert!(matches!(y, PromptResult::Got(true)));
+    }
 
     #[test]
     fn join_or_resume_reraises_the_original_panic_not_an_err_dump() {
@@ -1364,10 +1403,19 @@ mod tests {
 
         // Lone binary == package name: bare verb, the name is already in the prefix.
         assert_eq!(msg(&["xz"], &[], &[], "xz"), "Installed");
-        // Binaries differing from the name follow the verb after a colon.
+        // A binary whose name differs from the package follows the verb with `as`
+        // (`ripgrep` ships `rg`).
+        assert_eq!(msg(&["rg"], &[], &[], "ripgrep"), "Installed as rg");
+        // Several distinct binaries, none matching the name, list the same way.
         assert_eq!(
-            msg(&["ls", "cat"], &[], &[], "coreutils"),
-            "Installed: ls, cat"
+            msg(&["ar", "ld"], &[], &[], "binutils"),
+            "Installed as ar, ld"
+        );
+        // Multicall homonym (`coreutils`): the binary is dropped (it's the name,
+        // already in the prefix), its applets ride as aliases.
+        assert_eq!(
+            msg(&["coreutils"], &["ls", "cat"], &[], "coreutils"),
+            "Installed with aliases ls, cat"
         );
         // Aliases get a `with alias(es)` clause; singular vs plural is respected.
         assert_eq!(
@@ -1381,22 +1429,22 @@ mod tests {
         // Notes trail as parenthesized asides, one set of parens each.
         assert_eq!(
             msg(
+                &["coreutils"],
                 &["ls", "cat"],
-                &["dir"],
-                &["2 alias(es) skipped"],
+                &["1 alias(es) skipped"],
                 "coreutils"
             ),
-            "Installed: ls, cat with alias dir (2 alias(es) skipped)"
+            "Installed with aliases ls, cat (1 alias(es) skipped)"
         );
-        // Update with a binary list: the colon keeps the list off the version.
+        // Update with a renamed binary: `as` keeps the name off the version.
         let upd = LinkSummary {
-            primary: vec!["ls".into(), "cat".into()],
+            primary: vec!["rg".into()],
             aliases: Vec::new(),
             notes: Vec::new(),
         };
         assert_eq!(
-            install_summary_message(Some("8.0"), "9.0", "coreutils", &upd),
-            "Updated from 8.0: ls, cat"
+            install_summary_message(Some("14.0"), "15.0", "ripgrep", &upd),
+            "Updated from 14.0 as rg"
         );
     }
 
