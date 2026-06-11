@@ -157,6 +157,15 @@ pub(super) fn active_version(paths: &Paths, owner: &str, name: &str) -> Option<S
     None
 }
 
+/// `true` if `name` (`owner/repo` or bare) resolves to an installed repo dir.
+/// Lets `bundle` report a not-installed package with a distinct exit code instead
+/// of a hard error, so helper packages (`unpin man`) can tell "not installed"
+/// apart from an unreadable/corrupt bundle without parsing stderr. A genuinely
+/// malformed/ambiguous name still propagates as `Err`.
+pub(crate) fn is_installed(paths: &Paths, name: &str) -> Result<bool, String> {
+    Ok(resolve_installed(paths, name)?.is_some())
+}
+
 /// Resolve an installed package name (`owner/repo` or bare) to the binary
 /// paths of its active version, primary first (file stem == repo). `unpin man`
 /// uses this to find the binary carrying the embedded `unpin/man/*` pages.
@@ -964,7 +973,7 @@ pub fn clean(paths: &Paths) -> Result<(), String> {
 /// or `None` when the verb fallback doesn't apply: an explicit `owner/repo` (a
 /// direct program run) or an already-`unpin-`prefixed name (no `unpin-unpin-…`).
 /// Detects bareness from the raw input — the version-stripped part has no `/` —
-/// so an explicit `unpins/man` is excluded even though it resolves to the same
+/// so an explicit `unpins/search` is excluded even though it resolves to the same
 /// owner. See docs/helper-verbs.md.
 fn verb_fallback_spec(input: &str, spec: &Spec) -> Option<Spec> {
     let bare = !input.split('@').next().unwrap_or(input).contains('/');
@@ -987,7 +996,8 @@ pub fn run(
 
     // Verb-dispatch fallback (docs/helper-verbs.md): a *bare* catalog name that
     // isn't a published program is retried as the `unpins/unpin-<name>` helper
-    // package, so `unpin man coreutils` resolves the `man` verb.
+    // package, so e.g. `unpin search foo` resolves a future `search` verb. (The
+    // doc verbs `man`/`readme` are builtins now and never reach this path.)
     let verb_spec = verb_fallback_spec(input, &spec);
 
     // Cache-first: if a suitable version is already on disk, run it without
@@ -1257,8 +1267,8 @@ mod tests {
     #[test]
     fn verb_fallback_prefixes_a_bare_catalog_name() {
         assert_eq!(
-            fallback("man"),
-            Some(("unpins".into(), "unpin-man".into(), None))
+            fallback("search"),
+            Some(("unpins".into(), "unpin-search".into(), None))
         );
         // The candidate is built regardless of whether the program exists —
         // program-first network resolution is what keeps it from being used
@@ -1272,8 +1282,8 @@ mod tests {
     #[test]
     fn verb_fallback_carries_the_version_through() {
         assert_eq!(
-            fallback("man@1.14.6-1"),
-            Some(("unpins".into(), "unpin-man".into(), Some("1.14.6-1".into())))
+            fallback("search@1.2.3"),
+            Some(("unpins".into(), "unpin-search".into(), Some("1.2.3".into())))
         );
     }
 
@@ -1281,14 +1291,14 @@ mod tests {
     fn verb_fallback_skips_explicit_owner_repo() {
         // An explicit owner/repo is always a direct program run, even when the
         // owner happens to be the catalog.
-        assert_eq!(fallback("unpins/man"), None);
+        assert_eq!(fallback("unpins/search"), None);
         assert_eq!(fallback("BurntSushi/ripgrep"), None);
     }
 
     #[test]
     fn verb_fallback_skips_already_prefixed_names() {
-        // `unpin man` → `unpins/unpin-man` resolves directly; no `unpin-unpin-…`.
-        assert_eq!(fallback("unpin-man"), None);
+        // `unpin search` → `unpins/unpin-search` resolves directly; no `unpin-unpin-…`.
+        assert_eq!(fallback("unpin-search"), None);
     }
 
     #[test]
@@ -1341,6 +1351,22 @@ mod tests {
             bin: tmp.join("bin"),
             config: tmp.join("config"),
         }
+    }
+
+    #[test]
+    fn is_installed_tracks_the_repo_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        // Nothing on disk → not installed (drives `bundle`'s EXIT_NOT_INSTALLED).
+        assert!(!is_installed(&paths, "htop").unwrap());
+        assert!(!is_installed(&paths, "unpins/htop").unwrap());
+        // A bare repo dir is enough for "installed" (a linked version is a later,
+        // separate check), for both the bare and qualified spellings.
+        fs::create_dir_all(paths.repo_dir("unpins", "htop")).unwrap();
+        assert!(is_installed(&paths, "htop").unwrap());
+        assert!(is_installed(&paths, "unpins/htop").unwrap());
+        // A malformed name is a hard error, not a quiet "false".
+        assert!(is_installed(&paths, "a/b/c").is_err());
     }
 
     #[test]

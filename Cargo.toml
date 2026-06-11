@@ -13,6 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 minreq = { version = "2", default-features = false, features = ["https-rustls"] }
+# The roff→ANSI renderer behind `unpin man` (vendored render-only mandoc subset).
+# Git dep pinned by rev so the nix build vendors a reproducible source from
+# Cargo.lock (its hash is wired into flake.nix via cargoLockOutputHashes).
+mandoc-sys = { git = "https://github.com/unpins/mandoc-sys", rev = "d7a8e18ebb5f2d37a698a5d867096dc73d21e68e" }
+# Markdown → styled terminal text behind `unpin readme`; also the crossterm
+# source for the shared pager (termimad re-exports it), so no separate dep.
+termimad = "0.34"
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "color", "wrap_help"] }
 clap_complete = { version = "4", default-features = false }
 nanoserde = { version = "0.2", default-features = false, features = ["json", "std"] }

@@ -37,11 +37,22 @@
           !(builtins.elem base [ "target" "result" "result-win" ".github" ]);
       };
 
+      # SRI hash of the one git Cargo.lock dep, mandoc-sys (the roff→ANSI
+      # renderer behind `unpin man`). importCargoLock derives crates.io hashes
+      # from the lock's checksums, but a git source carries none, so its hash is
+      # pinned here. Bump alongside the `rev` in Cargo.toml.
+      cargoLockOutputHashes = {
+        "mandoc-sys-0.1.0" = "sha256-JKKB0pAwjdUp81IxmTX9gRHaQUre4aavZlWn2c6HGgE=";
+      };
+
       mkUnpin = { rustPlatform, env ? {}, auditable ? true }:
         (rustPlatform.buildRustPackage {
           pname = "unpin";
           inherit version src auditable env;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = cargoLockOutputHashes;
+          };
           doCheck = false;
         }).overrideAttrs (_: { stripAllList = [ "bin" ]; });
 

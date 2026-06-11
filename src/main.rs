@@ -15,6 +15,7 @@ mod meta;
 mod panic;
 mod platform;
 mod progress;
+mod render;
 // Provides `unpin_readurl`, the optional generic HTTP-fetch hook the static-musl
 // DNS fallback shim (nix-lib/dns-fallback) calls to do DoH when UDP/53 is
 // blocked. Linked, never called from Rust — kept by `#[no_mangle]`, bound by
@@ -49,13 +50,17 @@ enum Cmd {
     List,
     /// Show details about one or more packages (installed or remote).
     Info(InfoCmd),
+    /// Show a program's manual page, rendered and paged. With no package, shows unpin's own manual.
+    Man(ManCmd),
+    /// Render a program's README in your terminal, paged. Accepts a catalog name or owner/repo.
+    Readme(ReadmeCmd),
     /// Remove dangling links and unused version dirs from the unpin cache.
     Clean,
     /// Run a package's binary without installing it (no entry added to PATH). Default command — `unpin owner/repo` is equivalent to `unpin run owner/repo`.
     Run(RunCmd),
     /// Print a shell completion script. Pipe it to your shell's completion directory (see README).
     Completion(CompletionCmd),
-    /// Inspect a package's embedded metadata bundle — its `unpin/*` entries (stable interface used by helper packages such as `man`).
+    /// Inspect a package's embedded metadata bundle — its `unpin/*` entries (stable interface for helper-verb packages; the builtin `man`/`readme` read it in-process).
     Bundle(BundleCmd),
     /// (internal) Detached cleanup helper for Windows self-(un)install: delete a
     /// stray file and/or unpin's own repo dir once the spawning process exits.
@@ -74,10 +79,12 @@ impl Cmd {
             Cmd::Uninstall(c) => c.run(paths).map(|()| 0),
             Cmd::List => install::list(paths).map(|()| 0),
             Cmd::Info(c) => c.run(paths).map(|()| 0),
+            Cmd::Man(c) => c.run(paths).map(|()| 0),
+            Cmd::Readme(c) => c.run(paths).map(|()| 0),
             Cmd::Clean => install::clean(paths).map(|()| 0),
             Cmd::Run(c) => c.run(paths),
             Cmd::Completion(c) => c.run().map(|()| 0),
-            Cmd::Bundle(c) => c.run(paths).map(|()| 0),
+            Cmd::Bundle(c) => c.run(paths),
             Cmd::Reap(c) => {
                 c.run();
                 Ok(0)
@@ -180,6 +187,40 @@ impl InfoCmd {
     }
 }
 
+#[derive(Args, Debug)]
+struct ManCmd {
+    /// installed name, owner/repo, or a catalog name; omit for unpin's own manual. `-` reads roff from stdin.
+    #[arg(value_name = "PKG")]
+    pkg: Option<String>,
+    /// specific page to show (defaults to the package name, e.g. `man coreutils ls`)
+    #[arg(value_name = "PAGE")]
+    page: Option<String>,
+}
+
+impl ManCmd {
+    fn run(self, paths: &platform::Paths) -> Result<(), String> {
+        // Defaults: a missing package is unpin's own manual; a missing page is
+        // the package name (`man tree` ⇒ page `tree`). Resolved here so the
+        // page default can borrow the (already-defaulted) package name.
+        let pkg = self.pkg.as_deref().unwrap_or("unpin");
+        let page = self.page.as_deref().unwrap_or(pkg);
+        render::man(paths, pkg, page)
+    }
+}
+
+#[derive(Args, Debug)]
+struct ReadmeCmd {
+    /// catalog name, owner/repo, or installed name; omit for unpin's own README. `-` reads markdown from stdin.
+    #[arg(value_name = "PKG")]
+    pkg: Option<String>,
+}
+
+impl ReadmeCmd {
+    fn run(self, paths: &platform::Paths) -> Result<(), String> {
+        render::readme(paths, self.pkg.as_deref().unwrap_or("unpin"))
+    }
+}
+
 // `disable_help_flag`: everything after the package belongs to the package, so
 // `-h`/`--help` must reach the tool (e.g. `unpin owner/repo --help` shows the
 // tool's help, not run's). `run`'s own help stays reachable via `unpin help run`
@@ -276,7 +317,7 @@ enum BundleOp {
 }
 
 impl BundleCmd {
-    fn run(self, paths: &platform::Paths) -> Result<(), String> {
+    fn run(self, paths: &platform::Paths) -> Result<i32, String> {
         match self.op {
             BundleOp::List { pkg } => bundle::list(paths, &pkg),
             BundleOp::Dump { pkg, entry } => bundle::dump(paths, &pkg, &entry),
@@ -369,6 +410,8 @@ const SUBCOMMANDS: &[&str] = &[
     "uninstall",
     "list",
     "info",
+    "man",
+    "readme",
     "clean",
     "run",
     "completion",
@@ -422,11 +465,11 @@ fn classify_help(pre_ddash: &[&str]) -> HelpKind {
 
 /// Parse argv. If the user didn't lead with a subcommand or top-level flag,
 /// try a second pass with `run` injected as the default subcommand — so
-/// `unpin owner/repo [args...]` runs the package, and `unpin man coreutils ls`
-/// dispatches the `man` verb to the `man` package (a catalog name is now run, not
-/// installed; installing is the explicit `unpin install`). On retry failure,
-/// return the original error so clap's error usage line doesn't expose the
-/// injected prefix.
+/// `unpin owner/repo [args...]` runs the package (a bare catalog name is now run,
+/// not installed; installing is the explicit `unpin install`). The doc verbs
+/// `man`/`readme` are real subcommands, so they parse on the first pass and never
+/// reach this injection. On retry failure, return the original error so clap's
+/// error usage line doesn't expose the injected prefix.
 fn parse_args(raw: &[String]) -> Result<Cli, clap::Error> {
     let e1 = match Cli::try_parse_from(raw) {
         Ok(c) => return Ok(c),

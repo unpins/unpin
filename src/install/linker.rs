@@ -812,8 +812,10 @@ mod tests {
     #[test]
     fn catalog_helper_verb_is_kept_resident_not_linked() {
         // A catalog `unpins/unpin-<verb>` package installs (the vdir stays) but
-        // never lands on PATH — that is the whole "doesn't shadow the OS `man`"
-        // guarantee. A foreign `owner/unpin-*` is a normal program and links.
+        // never lands on PATH — that is the whole "doesn't shadow an OS command
+        // of the same bare name" guarantee. A foreign `owner/unpin-*` is a normal
+        // program and links. (`search` stands in for a future package-verb; the
+        // doc verbs man/readme are builtins and never come through here.)
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -828,7 +830,7 @@ mod tests {
             let vdir = paths.version_dir(owner, name, "v1");
             let vbin = vdir.join("bin");
             fs::create_dir_all(&vbin).unwrap();
-            let p = vbin.join("man");
+            let p = vbin.join("search");
             fs::write(&p, b"#!/bin/sh\n").unwrap();
             ensure_executable(&p).unwrap();
             vdir
@@ -837,19 +839,19 @@ mod tests {
         // Catalog helper verb → no PATH link, an explanatory note instead.
         let verb = Spec {
             owner: CATALOG_OWNER.into(),
-            name: "unpin-man".into(),
+            name: "unpin-search".into(),
             version: None,
         };
-        let vdir = mk_vdir(CATALOG_OWNER, "unpin-man");
+        let vdir = mk_vdir(CATALOG_OWNER, "unpin-search");
         let summary = link_all_executables(&paths, &ui, &verb, &vdir, true, AliasMode::No).unwrap();
         assert!(
-            !bin.join("man").exists(),
+            !bin.join("search").exists(),
             "helper verb must not link on PATH"
         );
         assert!(summary.primary.is_empty());
         assert_eq!(summary.notes.len(), 1);
         assert!(
-            summary.notes[0].contains("helper verb") && summary.notes[0].contains("unpin man"),
+            summary.notes[0].contains("helper verb") && summary.notes[0].contains("unpin search"),
             "note: {}",
             summary.notes[0]
         );
@@ -857,13 +859,13 @@ mod tests {
         // Same `unpin-`prefixed name under a foreign owner is a normal program.
         let foreign = Spec {
             owner: "someone".into(),
-            name: "unpin-man".into(),
+            name: "unpin-search".into(),
             version: None,
         };
-        let fvdir = mk_vdir("someone", "unpin-man");
+        let fvdir = mk_vdir("someone", "unpin-search");
         link_all_executables(&paths, &ui, &foreign, &fvdir, true, AliasMode::No).unwrap();
         assert!(
-            bin.join("man").exists(),
+            bin.join("search").exists(),
             "foreign unpin-* should link normally"
         );
     }

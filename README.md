@@ -106,14 +106,17 @@ unpin update [<name>...]     Pull newer releases (all packages if no names)
 unpin uninstall [<name>...]  Uninstall one or more packages (all if no names)
 unpin list                   List installed packages
 unpin info <name>...         Show details for packages (installed or not)
+unpin man [<name>] [page]    Render a program's embedded manual page, paged
+unpin readme [<name>]        Render a program's README, paged
 unpin clean                  Remove dangling links and unused versions
 unpin completion <shell>     Print a shell completion script
 ```
 
 Running without a subcommand runs the program; installing onto `PATH` is the
-explicit `unpin install`. Helper verbs dispatch the same way — `unpin man
-coreutils ls` runs the [`man`](https://github.com/unpins/man) package (a
-patched mandoc) on coreutils' embedded manual.
+explicit `unpin install`. The doc verbs render what a program carries inside
+itself — `unpin man coreutils ls` renders coreutils' embedded manual page and
+`unpin readme htop` renders htop's README. Both are built in, paged, and (for
+`man`) offline; they reflow as you resize the window.
 
 Common flags:
 
