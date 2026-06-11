@@ -532,7 +532,10 @@ pub fn uninstall_many(
     #[cfg(windows)]
     {
         let bin_empty = fs::read_dir(&paths.bin)
-            .map(|it| !it.flatten().any(|e| platform::read_link(&e.path()).is_some()))
+            .map(|it| {
+                !it.flatten()
+                    .any(|e| platform::read_link(&e.path()).is_some())
+            })
             .unwrap_or(false);
         if bin_empty {
             match crate::setup::remove_dir_from_user_path(&paths.bin) {
