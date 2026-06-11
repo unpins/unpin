@@ -154,6 +154,47 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Spawn `cmd` as a janitor that must outlive us — and survive the parent's
+/// environment being torn down.
+///
+/// On Windows a child does *not* die just because the parent exits, so a plain
+/// `spawn()` already survives an interactive run. What kills it is a **job
+/// object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: a child inherits the
+/// parent's job, and when that job closes every process in it is terminated at
+/// once. SSH sessions, WinRM, and some CI runners wrap the whole tree in such a
+/// job, so when the session ends the still-retrying reaper dies before it can
+/// delete unpin's `.exe`. `CREATE_BREAKAWAY_FROM_JOB` takes the child out of the
+/// job; `DETACHED_PROCESS` gives it no console to be tied to; and a null stdio
+/// trio means it holds none of our handles open. The breakaway flag is refused
+/// when the job lacks `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, so we retry without it —
+/// in any non-(kill-on-close) context the child outlives us regardless.
+#[cfg(windows)]
+fn spawn_detached(mut cmd: std::process::Command) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    // From <winbase.h> — kept as literals so we don't widen the windows-sys
+    // feature set just for three constants.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.creation_flags(base | CREATE_BREAKAWAY_FROM_JOB);
+    match cmd.spawn() {
+        Ok(_) => Ok(()),
+        // The job forbids breakaway → CreateProcess refused the flag. Retry
+        // without it: the child still outlives us everywhere except a
+        // kill-on-close job that also bans breakaway, which we can't escape.
+        Err(_) => {
+            cmd.creation_flags(base);
+            cmd.spawn().map(|_| ())
+        }
+    }
+}
+
 /// Re-spawn the just-placed `unpin.exe` as a detached `unpin reap --file
 /// <origin>` that deletes `origin` once we exit and release the file lock.
 /// Best-effort: if the spawn itself fails the stray download just lingers,
@@ -162,11 +203,9 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[cfg(windows)]
 fn spawn_janitor(dest: &Path, origin: &Path) {
     use std::process::Command;
-    let _ = Command::new(dest)
-        .arg("reap")
-        .arg("--file")
-        .arg(origin)
-        .spawn();
+    let mut cmd = Command::new(dest);
+    cmd.arg("reap").arg("--file").arg(origin);
+    let _ = spawn_detached(cmd);
 }
 
 /// Delete `origin`, retrying briefly: the parent that spawned us may not have
@@ -275,8 +314,7 @@ pub fn spawn_dir_janitor(staged: &Path, dir: &Path, files: &[PathBuf]) -> Result
     for f in files {
         cmd.arg("--file").arg(f);
     }
-    cmd.spawn().map_err(|e| format!("spawn janitor: {e}"))?;
-    Ok(())
+    spawn_detached(cmd).map_err(|e| format!("spawn janitor: {e}"))
 }
 
 enum PathOutcome {
