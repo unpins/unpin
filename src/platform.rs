@@ -761,7 +761,7 @@ pub fn read_link(p: &Path) -> Option<PathBuf> {
         // username whose case NTFS folds but `eq_ignore_ascii_case` wouldn't, an
         // 8.3 component, a trailing separator. Canonicalizing both parents
         // collapses all of that to one form so the test can't misfire (a
-        // misfire would either hide a managed link from uninstall/prune or
+        // misfire would either hide a managed link from uninstall/clean or
         // return a sibling alias as the target). The returned path stays the
         // reconstructed, non-verbatim `full` so callers can keep comparing it
         // with `starts_with` against their plain `paths`-derived dirs.

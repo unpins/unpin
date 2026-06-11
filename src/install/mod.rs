@@ -30,7 +30,7 @@ pub use spec::{Spec, parse_spec};
 
 /// Sibling-staging dirs created by the extract pipeline (`<tag>.part`)
 /// live alongside real version dirs in `repo_dir/`. Reads that enumerate
-/// installed versions for the user (list/info/prune/remove) need to skip
+/// installed versions for the user (list/info/clean/uninstall) need to skip
 /// them — otherwise a half-finished extract or a SIGKILL'd run shows up
 /// as a phantom version named e.g. `v0.1.0.part`. The string check has
 /// to match what `pipeline::part_dir_for` produces (just appends `.part`).
@@ -203,7 +203,7 @@ pub(super) fn prompt_yes_no(question: &str) -> bool {
 /// process panic, *and* SIGINT (ctrl-c).
 ///
 /// Hold this for the smallest window that fully covers the destructive
-/// operation: pipeline.rs holds one from preflight through linking; prune
+/// operation: pipeline.rs holds one from preflight through linking; clean
 /// and uninstall_one each grab one for the duration of their `remove_dir_all`
 /// pass. Reads (info, list) deliberately skip the lock — they tolerate the
 /// occasional racy result instead of paying for serialization.
@@ -775,14 +775,14 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn prune(paths: &Paths) -> Result<(), String> {
+pub fn clean(paths: &Paths) -> Result<(), String> {
     let mut removed = 0usize;
     let mut skipped: Vec<String> = Vec::new();
 
     let bin = &paths.bin;
     let root = &paths.data;
     // Phase 1: catch dangling symlinks that already existed before
-    // this prune run (e.g. user deleted a binary by hand). Must run BEFORE
+    // this clean run (e.g. user deleted a binary by hand). Must run BEFORE
     // phase 2 — otherwise phase 2's "live links" calculation would treat
     // those dangling pointers as anchors and refuse to remove their vdirs.
     //
@@ -813,11 +813,11 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
     for (owner, repo) in installed_repos(paths) {
         let rdir = paths.repo_dir(&owner, &repo);
         // Take the lock for this repo before scanning + removing version
-        // dirs. Without this prune races with a concurrent `install`/`update`
+        // dirs. Without this clean races with a concurrent `install`/`update`
         // in Phase B: the in-flight vdir exists on disk but has no link in
         // bin_dir yet (linking is Phase C), so the linked_targets check
         // above would classify it as orphan and remove_dir_all would
-        // happily nuke the extraction in progress. With the lock, prune
+        // happily nuke the extraction in progress. With the lock, clean
         // either gets exclusive access or skips that repo entirely until
         // the install finishes.
         let _lock = match RepoLock::acquire(&rdir) {
@@ -864,7 +864,7 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
     }
 
     // Phase 3: orphan-vdir removal above just broke any alias symlinks
-    // pointing into those vdirs (Unix). Re-sweep so prune cleans in one
+    // pointing into those vdirs (Unix). Re-sweep so clean reclaims them in one
     // invocation instead of leaving newly-dangling entries for the next run.
     // On Windows this is a natural no-op — hardlinks never dangle, and a
     // vdir with any live hardlink in bin_dir was anchored and kept above.
@@ -883,9 +883,9 @@ pub fn prune(paths: &Paths) -> Result<(), String> {
         );
     }
     if removed > 0 {
-        println!("Pruned {removed} item(s)");
+        println!("Cleaned {removed} item(s)");
     } else if skipped.is_empty() {
-        println!("Nothing to prune");
+        println!("Nothing to clean");
     }
     Ok(())
 }

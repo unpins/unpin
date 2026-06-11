@@ -50,7 +50,7 @@ enum Cmd {
     /// Show details about one or more packages (installed or remote).
     Info(InfoCmd),
     /// Remove dangling links and unused version dirs from the unpin cache.
-    Prune,
+    Clean,
     /// Run a package's binary without installing it (no entry added to PATH). Default command — `unpin owner/repo` is equivalent to `unpin run owner/repo`.
     Run(RunCmd),
     /// Print a shell completion script. Pipe it to your shell's completion directory (see README).
@@ -74,7 +74,7 @@ impl Cmd {
             Cmd::Uninstall(c) => c.run(paths).map(|()| 0),
             Cmd::List => install::list(paths).map(|()| 0),
             Cmd::Info(c) => c.run(paths).map(|()| 0),
-            Cmd::Prune => install::prune(paths).map(|()| 0),
+            Cmd::Clean => install::clean(paths).map(|()| 0),
             Cmd::Run(c) => c.run(paths),
             Cmd::Completion(c) => c.run().map(|()| 0),
             Cmd::Bundle(c) => c.run(paths).map(|()| 0),
@@ -366,7 +366,7 @@ const SUBCOMMANDS: &[&str] = &[
     "uninstall",
     "list",
     "info",
-    "prune",
+    "clean",
     "run",
     "completion",
     "bundle",

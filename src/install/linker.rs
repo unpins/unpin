@@ -423,7 +423,7 @@ pub fn link_all_executables(
     // re-issue (e.g. an alias `lzma` that v1 had and v2 dropped). They were
     // already physically removed by the pre-link sweep above — this is just
     // the name diff so the user sees the dropped entry in the summary. Their
-    // removal is also what lets `prune` reclaim the older vdir later.
+    // removal is also what lets `clean` reclaim the older vdir later.
     //
     // The diff against `refreshed` (created this run) can't mis-report a name
     // as removed while a file still sits at its path: an `existing_managed`
@@ -591,7 +591,7 @@ fn link_aliases_for(
     }
 
     // No sidecar manifest written — the binary itself is the authoritative
-    // source for which aliases this version declared. `remove`/`prune`
+    // source for which aliases this version declared. `uninstall`/`clean`
     // introspect the installed links via `read_link` when they need the list.
     if !declined.is_empty() {
         notes.push(format!(
@@ -638,7 +638,7 @@ fn link_alias(
 }
 
 /// Sweep `bin_dir` for symlinks whose target lives under `root` but no
-/// longer exists on disk. Used by `prune` before AND after orphan-vdir
+/// longer exists on disk. Used by `clean` before AND after orphan-vdir
 /// removal: the second call catches alias symlinks that just became dangling
 /// when their owning vdir was wiped. On Windows this is naturally a no-op:
 /// a hardlink keeps its file alive, so `read_link` either resolves to a

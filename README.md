@@ -106,7 +106,7 @@ unpin update [<name>...]     Pull newer releases (all packages if no names)
 unpin uninstall [<name>...]  Uninstall one or more packages (all if no names)
 unpin list                   List installed packages
 unpin info <name>...         Show details for packages (installed or not)
-unpin prune                  Drop old versions, keep the active one
+unpin clean                  Remove dangling links and unused versions
 unpin completion <shell>     Print a shell completion script
 ```
 

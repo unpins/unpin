@@ -27,7 +27,7 @@ pub struct Ctx {
 impl Ctx {
     /// Load config, resolve auth, build HTTP client with the configured
     /// timeout. Only called for commands that hit GitHub (install, update,
-    /// run, info) — local-only commands (list, remove, prune, completion)
+    /// run, info) — local-only commands (list, uninstall, clean, completion)
     /// skip this so they don't pay for `gh auth token` shell-out etc.
     pub fn new(verbose: bool, paths: Paths) -> Self {
         let cfg = Config::load(&paths.config);

@@ -19,6 +19,9 @@ Versioning](https://semver.org).
   `unpin --help`.
 
 ### Changed
+- **`prune` is renamed to `clean`.** Same behavior — remove dangling links and
+  unused version dirs. No alias is kept; update any scripts that called
+  `unpin prune`.
 - **Windows: programs go on `PATH` as real `<name>.exe` NTFS hardlinks**, not
   `.cmd` wrappers. They now resolve everywhere an `.exe` does — cmd,
   PowerShell, git-bash/MSYS, WSL interop — and `unpin list`/`info` can show
