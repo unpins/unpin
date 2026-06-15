@@ -468,36 +468,38 @@ pub fn uninstall_many(
     paths: &Paths,
     names: &[String],
     assume_yes: bool,
-    keep_unpin: bool,
+    all: bool,
     quiet: bool,
 ) -> Result<(), String> {
     let targets: Vec<String> = if names.is_empty() {
-        let mut all = installed_repos(paths);
-        if all.is_empty() {
+        let mut repos = installed_repos(paths);
+        if repos.is_empty() {
             if !quiet {
                 println!("No packages installed");
             }
             return Ok(());
         }
-        // unpin self-installs as a managed package, so a bare `uninstall`
-        // sweeps it up with everything else — including the command the user
-        // is running. `--keep-unpin` drops it from the batch; otherwise we
-        // flag it inline and the confirmation question spells out the stakes.
+        // unpin self-installs as a managed package, so it shows up in the
+        // sweep alongside everything else — including the command the user is
+        // running. A bare `uninstall` keeps unpin; `--all` opts into removing
+        // it too, and the confirmation question spells out the stakes.
         let me = self_spec();
         let is_self = |o: &str, r: &str| me.owner == o && me.name == r;
-        if keep_unpin {
-            all.retain(|(o, r)| !is_self(o, r));
-            if all.is_empty() {
+        let self_installed = repos.iter().any(|(o, r)| is_self(o, r));
+        if !all {
+            repos.retain(|(o, r)| !is_self(o, r));
+            if repos.is_empty() {
                 if !quiet {
-                    println!("Nothing to uninstall (only unpin itself is installed).");
+                    println!(
+                        "Nothing to uninstall (only unpin itself is installed; use --all to remove it)."
+                    );
                 }
                 return Ok(());
             }
         }
-        let includes_self = all.iter().any(|(o, r)| is_self(o, r));
+        let includes_self = all && self_installed;
         // A quiet uninstall-all can't show the confirmation, and clearing every
-        // package (unpin included) is destructive — refuse unless `-y` already
-        // settled it.
+        // package is destructive — refuse unless `-y` already settled it.
         if quiet && !assume_yes {
             return Err(
                 "refusing to uninstall all packages under --quiet without --yes".into(),
@@ -506,9 +508,9 @@ pub fn uninstall_many(
         if !quiet {
             println!(
                 "This will uninstall all {} installed package(s):",
-                all.len()
+                repos.len()
             );
-            for (owner, repo) in &all {
+            for (owner, repo) in &repos {
                 let mark = if is_self(owner, repo) {
                     "  (unpin itself)"
                 } else {
@@ -516,10 +518,8 @@ pub fn uninstall_many(
                 };
                 println!("  {owner}/{repo}{mark}");
             }
-            if includes_self {
-                println!(
-                    "Tip: `unpin uninstall --keep-unpin` removes everything except unpin itself."
-                );
+            if !all && self_installed {
+                println!("unpin itself is kept; `unpin uninstall --all` removes it too.");
             }
         }
         let question = if includes_self {
@@ -530,7 +530,7 @@ pub fn uninstall_many(
         if !assume_yes && !prompt_yes_no(question) {
             return Err("aborted".into());
         }
-        all.into_iter().map(|(o, r)| format!("{o}/{r}")).collect()
+        repos.into_iter().map(|(o, r)| format!("{o}/{r}")).collect()
     } else {
         // Raw-string dedup so `uninstall tree tree` doesn't try to remove the
         // package twice (second call would error "not installed" since the

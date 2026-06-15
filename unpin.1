@@ -66,9 +66,11 @@ Update one, several, or (with no arguments) all installed packages.
 .TP
 .BI uninstall " [NAME...]"
 Uninstall one, several, or (with no arguments, after confirmation) all
-installed packages. With no names,
-.B \-\-keep\-unpin
-uninstalls everything except unpin itself.
+installed packages. A bare
+.B uninstall
+keeps unpin itself;
+.B \-\-all
+removes it along with everything else.
 .TP
 .B list
 List installed packages.
