@@ -3,6 +3,8 @@
 Notable changes to `unpin`. This project follows [Semantic
 Versioning](https://semver.org).
 
+## [Unreleased]
+
 ## [0.4.0] — 2026-06-15 (developer-only)
 
 ### Added
