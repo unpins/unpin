@@ -32,9 +32,15 @@
 
       src = nixpkgs.lib.cleanSourceWith {
         src = ./.;
+        # The src is the whole tree, so anything the cargo build never reads has to
+        # be filtered out or a docs-only (or flake-only) commit re-hashes the
+        # binary on every target. .github was already here for that reason.
         filter = path: _:
           let base = baseNameOf (toString path); in
-          !(builtins.elem base [ "target" "result" "result-win" ".github" ]);
+          !(builtins.elem base [
+            "target" "result" "result-win" ".github" "CHANGELOG.md"
+            "flake.nix" "flake.lock"
+          ]);
       };
 
       # SRI hash of the one git Cargo.lock dep, mandoc-sys (the roff→ANSI
