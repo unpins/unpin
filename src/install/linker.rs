@@ -410,7 +410,7 @@ pub fn link_all_executables(
         // alias-bearing primaries would just contribute both lists. The
         // catalog-only gate is enforced inside `link_aliases_for`.
         let alias_outcome = link_aliases_for(
-            paths, ui, &rdir, &refreshed, target, spec, alias_mode, assume_yes,
+            paths, ui, &rdir, &refreshed, target, short, spec, alias_mode, assume_yes,
         )?;
         for a in &alias_outcome.linked {
             refreshed.push(bin.join(platform::alias_link_filename(a)));
@@ -478,6 +478,7 @@ fn link_aliases_for(
     rdir: &Path,
     claimed: &[PathBuf],
     primary: &Path,
+    primary_name: &str,
     spec: &Spec,
     alias_mode: AliasMode,
     assume_yes: bool,
@@ -486,6 +487,13 @@ fn link_aliases_for(
         None => return Ok(AliasOutcome::default()),
         Some(m) => m.aliases(),
     };
+    // A multicall binary announces every name it answers to, its own included —
+    // the payload carries the dispatcher's whole table, so builder and installer
+    // read one list instead of two that differ by a name. The slot for that name
+    // is the binary itself, which `link_binary` just took; linking it again would
+    // self-collide and report "provided by more than one binary in this package".
+    // Filter before the counts below, so the notes and the prompt say the truth.
+    let declared: Vec<String> = declared.into_iter().filter(|n| n != primary_name).collect();
     if declared.is_empty() {
         return Ok(AliasOutcome::default());
     }
@@ -923,6 +931,7 @@ mod tests {
             &rdir,
             &[],
             &primary,
+            "tool",
             &spec,
             AliasMode::Yes,
             true,
@@ -943,6 +952,7 @@ mod tests {
             &rdir,
             &[],
             &primary,
+            "tool",
             &spec,
             AliasMode::Yes,
             false,
@@ -955,6 +965,72 @@ mod tests {
         assert!(out.linked.contains(&"xzcat".to_string()));
         assert!(!bin.join("sudo").exists(), "sudo link must not be created");
         assert!(bin.join("xzcat").exists());
+    }
+
+    /// A multicall payload announces the dispatcher's whole table, the binary's
+    /// own name included (mtools answers to `mtools`, `mkmanifest` and 24 m*
+    /// names). That name's slot belongs to the binary, so it must not come back
+    /// as an alias — doing so self-collides and reports "provided by more than
+    /// one binary in this package", which is false.
+    #[cfg(unix)]
+    #[test]
+    fn alias_matching_the_binarys_own_name_is_dropped() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let paths = Paths {
+            data: tmp.path().join("data"),
+            bin: bin.clone(),
+            config: tmp.path().join("config"),
+        };
+        let spec = Spec {
+            owner: CATALOG_OWNER.into(),
+            name: "mtools".into(),
+            version: None,
+        };
+        let rdir = paths.repo_dir(CATALOG_OWNER, "mtools");
+
+        let vbin = paths.version_dir(CATALOG_OWNER, "mtools", "v1").join("bin");
+        fs::create_dir_all(&vbin).unwrap();
+        let primary = vbin.join("mtools");
+        let mut bytes = b"\x7fELF not-really-an-elf ".to_vec();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("unpin/aliases", opts).unwrap();
+            zw.write_all(b"mtools\nmkmanifest\nmdir\n").unwrap();
+            bytes.extend_from_slice(&zw.finish().unwrap().into_inner());
+        }
+        fs::write(&primary, &bytes).unwrap();
+        ensure_executable(&primary).unwrap();
+
+        let out = link_aliases_for(
+            &paths,
+            &Ui::Plain,
+            &rdir,
+            &[bin.join("mtools")],
+            &primary,
+            "mtools",
+            &spec,
+            AliasMode::Yes,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            !out.linked.contains(&"mtools".to_string()),
+            "the binary's own name must not be linked as an alias"
+        );
+        assert!(out.linked.contains(&"mkmanifest".to_string()));
+        assert!(out.linked.contains(&"mdir".to_string()));
+        assert!(
+            out.notes.is_empty(),
+            "dropping the self-name is routine, not worth a note: {:?}",
+            out.notes
+        );
     }
 
     #[test]
