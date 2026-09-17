@@ -44,6 +44,22 @@ pub struct Release {
     pub published_at: String,
     #[nserde(default)]
     pub assets: Vec<Asset>,
+    /// `https://github.com/<owner>/<repo>/releases/tag/<tag>`, with the repo
+    /// spelled as GitHub stores it whatever spelling the request used.
+    #[nserde(default)]
+    pub html_url: String,
+}
+
+impl Release {
+    /// The `(owner, repo)` this release belongs to, spelled as on GitHub, or
+    /// `None` when `html_url` is missing or not a github.com release link.
+    pub fn repo_spelling(&self) -> Option<(&str, &str)> {
+        let rest = self.html_url.strip_prefix("https://github.com/")?;
+        let mut parts = rest.split('/');
+        let owner = parts.next().filter(|s| !s.is_empty())?;
+        let repo = parts.next().filter(|s| !s.is_empty())?;
+        (parts.next() == Some("releases")).then_some((owner, repo))
+    }
 }
 
 #[derive(DeJson, Debug, Clone)]

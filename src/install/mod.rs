@@ -57,36 +57,56 @@ fn has_real_version(rdir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The directory entry under `dir` named `name`, ignoring ASCII case: the exact
-/// spelling when it exists, else the single case-insensitive match. Only
-/// directories count. Several matches that differ only in case (left by
-/// earlier versions on a case-sensitive filesystem) are ambiguous: `None`.
-fn stored_dir_name(dir: &Path, name: &str) -> Option<String> {
-    if dir.join(name).is_dir() {
-        return Some(name.to_owned());
-    }
-    let mut hits = fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.eq_ignore_ascii_case(name));
-    let first = hits.next()?;
-    hits.next().is_none().then_some(first)
+/// Whether `dir` holds a directory named exactly `name`. `dir.join(name)`
+/// alone is not enough: macOS and Windows filesystems ignore case, so a
+/// `unpins/Tree` lookup would open the `unpins/tree` package.
+fn has_dir_named(dir: &Path, name: &str) -> bool {
+    fs::read_dir(dir)
+        .map(|it| {
+            it.flatten().any(|e| {
+                e.file_name() == name && e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
-/// `spec` spelled the way its package is already stored, so a second spelling
-/// (`BurntSushi/ripgrep` then `burntsushi/ripgrep`) reuses the package instead
-/// of creating another one. GitHub names are case-insensitive; the directory
-/// names under the data dir are not, on Linux. Unchanged when nothing matches.
-pub(super) fn stored_spelling(paths: &Paths, mut spec: Spec) -> Spec {
-    if let Some(owner) = stored_dir_name(&paths.data, &spec.owner) {
-        if let Some(name) = stored_dir_name(&paths.data.join(&owner), &spec.name) {
-            spec.name = name;
-        }
-        spec.owner = owner;
+/// Whether `owner/repo` is stored under exactly that spelling.
+fn repo_dir_exact(paths: &Paths, owner: &str, repo: &str) -> bool {
+    has_dir_named(&paths.data, owner) && has_dir_named(&paths.data.join(owner), repo)
+}
+
+/// A name is accepted only as spelled on GitHub. When `input` names no
+/// installed package but differs only in case from one that is (`Tree` for
+/// `tree`), say which one instead of a bare "not installed". `owner` is `None`
+/// for a bare name, which matches a repo of any owner.
+fn check_installed_spelling(
+    paths: &Paths,
+    input: &str,
+    owner: Option<&str>,
+    repo: &str,
+) -> Result<(), String> {
+    let mut hits: Vec<String> = installed_repos(paths)
+        .into_iter()
+        .filter(|(o, r)| {
+            r.eq_ignore_ascii_case(repo) && owner.is_none_or(|w| o.eq_ignore_ascii_case(w))
+        })
+        .map(|(o, r)| {
+            if owner.is_some() {
+                format!("{o}/{r}")
+            } else {
+                r
+            }
+        })
+        .collect();
+    hits.sort();
+    hits.dedup();
+    if hits.is_empty() {
+        return Ok(());
     }
-    spec
+    Err(format!(
+        "`{input}` is not installed (did you mean `{}`?)",
+        hits.join("` or `")
+    ))
 }
 
 /// Keep the first occurrence of each `same`-class in `items`, preserving
@@ -133,21 +153,12 @@ fn dedup_keep_first_noting<T>(
 fn resolve_installed(paths: &Paths, name: &str) -> Result<Option<(String, String)>, String> {
     if let Some((owner, repo)) = name.split_once('/') {
         if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
-            let spec = stored_spelling(
-                paths,
-                Spec {
-                    owner: owner.to_owned(),
-                    name: repo.to_owned(),
-                    version: None,
-                },
-            );
-            return Ok(
-                if has_real_version(&paths.repo_dir(&spec.owner, &spec.name)) {
-                    Some((spec.owner, spec.name))
-                } else {
-                    None
-                },
-            );
+            if repo_dir_exact(paths, owner, repo) && has_real_version(&paths.repo_dir(owner, repo))
+            {
+                return Ok(Some((owner.to_owned(), repo.to_owned())));
+            }
+            check_installed_spelling(paths, name, Some(owner), repo)?;
+            return Ok(None);
         }
         return Err(format!("invalid name: `{name}`"));
     }
@@ -172,7 +183,7 @@ fn resolve_installed(paths: &Paths, name: &str) -> Result<Option<(String, String
                 continue;
             }
             let repo = repo_entry.file_name().to_string_lossy().into_owned();
-            if !repo.eq_ignore_ascii_case(name) {
+            if repo != name {
                 continue;
             }
             if !has_real_version(&repo_entry.path()) {
@@ -183,6 +194,9 @@ fn resolve_installed(paths: &Paths, name: &str) -> Result<Option<(String, String
             }
             found = Some((owner.clone(), repo));
         }
+    }
+    if found.is_none() {
+        check_installed_spelling(paths, name, None, name)?;
     }
     Ok(found)
 }
@@ -323,13 +337,41 @@ fn fetch_release_typed(ctx: &Ctx, spec: &Spec) -> Result<Release, github::FetchE
     // `../../tmp/x` would otherwise let the upstream escape `data_dir/`.
     validate_path_component(&release.tag_name, "tag from upstream release")
         .map_err(github::FetchError::Other)?;
+    check_repo_spelling(spec, &release).map_err(github::FetchError::Other)?;
     Ok(release)
+}
+
+/// GitHub resolves `unpins/Tree` to the `unpins/tree` release, but a package is
+/// accepted only as GitHub spells it: the name is also its directory and its
+/// identity in `list`, and a second spelling would be a second copy of the same
+/// package. The release's own link carries the stored spelling.
+fn check_repo_spelling(spec: &Spec, release: &Release) -> Result<(), String> {
+    let Some((owner, repo)) = release.repo_spelling() else {
+        return Ok(());
+    };
+    if owner == spec.owner && repo == spec.name {
+        return Ok(());
+    }
+    let typed = |s: &Spec| match &s.version {
+        Some(v) => format!("{}@{v}", s.display()),
+        None => s.display(),
+    };
+    let right = Spec {
+        owner: owner.to_owned(),
+        name: repo.to_owned(),
+        version: spec.version.clone(),
+    };
+    Err(format!(
+        "no package named `{}` (did you mean `{}`?)",
+        typed(spec),
+        typed(&right)
+    ))
 }
 
 pub fn install_many(ctx: &Ctx, opts: &InstallOptions, inputs: &[String]) -> Result<(), String> {
     let parsed: Vec<(String, Spec)> = inputs
         .iter()
-        .map(|s| parse_spec(s).map(|sp| (s.clone(), stored_spelling(&ctx.paths, sp))))
+        .map(|s| parse_spec(s).map(|sp| (s.clone(), sp)))
         .collect::<Result<_, _>>()?;
     // Dedup by parsed Spec so `install tree unpins/tree` collapses — both
     // normalize to the same target and a parallel run would otherwise race
@@ -913,7 +955,7 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let spec = stored_spelling(&ctx.paths, parse_spec(input)?);
+    let spec = parse_spec(input)?;
     let release = fetch_release(ctx, &spec)?;
     println!("Repo:    {}", spec.repo());
     println!("Version: {} (latest)", release.tag_name);
@@ -1108,7 +1150,7 @@ pub fn run(
     assume_yes: bool,
     refresh: bool,
 ) -> Result<i32, String> {
-    let spec = stored_spelling(&ctx.paths, parse_spec(input)?);
+    let spec = parse_spec(input)?;
 
     // Verb-dispatch fallback (docs/helper-verbs.md): a *bare* catalog name that
     // isn't a published program is retried as the `unpins/unpin-<name>` helper
@@ -1225,6 +1267,9 @@ pub fn run(
 /// (incomplete ones stay as `.part`), so its presence is enough — `run_binary`
 /// does the actual executable selection.
 fn cached_run_target(paths: &Paths, spec: &Spec) -> Option<PathBuf> {
+    if !repo_dir_exact(paths, &spec.owner, &spec.name) {
+        return None;
+    }
     let rdir = paths.repo_dir(&spec.owner, &spec.name);
     let mut versions: Vec<(PathBuf, std::time::SystemTime)> = fs::read_dir(&rdir)
         .ok()?
@@ -1487,66 +1532,91 @@ mod tests {
     }
 
     #[test]
-    fn stored_spelling_reuses_the_package_on_disk() {
+    fn installed_names_match_only_their_exact_spelling() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_data(tmp.path());
-        let spec = |o: &str, n: &str| Spec {
-            owner: o.into(),
-            name: n.into(),
-            version: None,
-        };
-        let spelled = |sp: Spec| (sp.owner, sp.name);
-        // Nothing stored: the spelling is kept as typed.
-        assert_eq!(
-            spelled(stored_spelling(&paths, spec("BurntSushi", "ripgrep"))),
-            ("BurntSushi".into(), "ripgrep".into())
-        );
+        fs::create_dir_all(paths.version_dir("unpins", "tree", "v2")).unwrap();
         fs::create_dir_all(paths.version_dir("BurntSushi", "ripgrep", "15.1.0")).unwrap();
-        // Another spelling of the same repo lands on the stored one.
-        assert_eq!(
-            spelled(stored_spelling(&paths, spec("burntsushi", "RIPGREP"))),
-            ("BurntSushi".into(), "ripgrep".into())
-        );
-        // A different repo of the stored owner keeps its own name.
-        assert_eq!(
-            spelled(stored_spelling(&paths, spec("burntsushi", "xsv"))),
-            ("BurntSushi".into(), "xsv".into())
-        );
-        // Case twins left on a case-sensitive filesystem: the exact spelling
-        // wins, and a third spelling is ambiguous and kept as typed.
-        fs::create_dir_all(paths.version_dir("BurntSushi", "RipGrep", "15.1.0")).unwrap();
-        assert_eq!(
-            spelled(stored_spelling(&paths, spec("BurntSushi", "RipGrep"))),
-            ("BurntSushi".into(), "RipGrep".into())
-        );
-        if !paths.repo_dir("BurntSushi", "RIPGREP").is_dir() {
+        for (name, want) in [
+            ("tree", ("unpins", "tree")),
+            ("unpins/tree", ("unpins", "tree")),
+            ("ripgrep", ("BurntSushi", "ripgrep")),
+            ("BurntSushi/ripgrep", ("BurntSushi", "ripgrep")),
+        ] {
             assert_eq!(
-                spelled(stored_spelling(&paths, spec("BurntSushi", "RIPGREP"))),
-                ("BurntSushi".into(), "RIPGREP".into())
+                resolve_installed(&paths, name).unwrap(),
+                Some((want.0.into(), want.1.into())),
+                "{name}"
             );
         }
+        // Another spelling is refused, naming the package it most likely meant.
+        for (name, meant) in [
+            ("Tree", "`tree`"),
+            ("UNPINS/tree", "`unpins/tree`"),
+            ("unpins/Tree", "`unpins/tree`"),
+            ("RipGrep", "`ripgrep`"),
+            ("burntsushi/ripgrep", "`BurntSushi/ripgrep`"),
+        ] {
+            let err = resolve_installed(&paths, name).unwrap_err();
+            assert!(
+                err.contains(&format!("did you mean {meant}?")),
+                "{name}: {err}"
+            );
+        }
+        // Nothing similar installed: plain "not installed".
+        assert_eq!(resolve_installed(&paths, "htop").unwrap(), None);
+        assert_eq!(resolve_installed(&paths, "unpins/htop").unwrap(), None);
     }
 
     #[test]
-    fn installed_name_lookup_ignores_case() {
+    fn exact_bare_name_is_not_ambiguous_with_a_case_twin() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_data(tmp.path());
-        fs::create_dir_all(paths.version_dir("unpins", "xvnc", "v1")).unwrap();
-        fs::create_dir_all(paths.version_dir("BurntSushi", "ripgrep", "15.1.0")).unwrap();
-        for name in ["XVNC", "unpins/Xvnc", "Unpins/xvnc"] {
-            assert_eq!(
-                resolve_installed(&paths, name).unwrap(),
-                Some(("unpins".into(), "xvnc".into())),
-                "{name}"
-            );
+        fs::create_dir_all(paths.version_dir("a", "Foo", "v1")).unwrap();
+        fs::create_dir_all(paths.version_dir("b", "foo", "v1")).unwrap();
+        assert_eq!(
+            resolve_installed(&paths, "foo").unwrap(),
+            Some(("b".into(), "foo".into()))
+        );
+        assert_eq!(
+            resolve_installed(&paths, "Foo").unwrap(),
+            Some(("a".into(), "Foo".into()))
+        );
+    }
+
+    #[test]
+    fn release_must_match_the_typed_spelling() {
+        let release = |url: &str| Release {
+            tag_name: "v2".into(),
+            published_at: String::new(),
+            assets: Vec::new(),
+            html_url: url.into(),
+        };
+        let spec = |s: &str| parse_spec(s).unwrap();
+        let tree = release("https://github.com/unpins/tree/releases/tag/v2");
+        assert!(check_repo_spelling(&spec("tree"), &tree).is_ok());
+        assert!(check_repo_spelling(&spec("unpins/tree@v2"), &tree).is_ok());
+        for (typed, meant) in [
+            ("Tree", "no package named `Tree` (did you mean `tree`?)"),
+            (
+                "TREE@v2",
+                "no package named `TREE@v2` (did you mean `tree@v2`?)",
+            ),
+            (
+                "UNPINS/tree",
+                "no package named `UNPINS/tree` (did you mean `tree`?)",
+            ),
+        ] {
+            assert_eq!(check_repo_spelling(&spec(typed), &tree).unwrap_err(), meant);
         }
-        for name in ["RipGrep", "burntsushi/RIPGREP"] {
-            assert_eq!(
-                resolve_installed(&paths, name).unwrap(),
-                Some(("BurntSushi".into(), "ripgrep".into())),
-                "{name}"
-            );
-        }
+        let rg = release("https://github.com/BurntSushi/ripgrep/releases/tag/15.1.0");
+        assert!(check_repo_spelling(&spec("BurntSushi/ripgrep"), &rg).is_ok());
+        assert_eq!(
+            check_repo_spelling(&spec("burntsushi/ripgrep"), &rg).unwrap_err(),
+            "no package named `burntsushi/ripgrep` (did you mean `BurntSushi/ripgrep`?)"
+        );
+        // No usable link (not a github.com release): nothing to compare against.
+        assert!(check_repo_spelling(&spec("Tree"), &release("")).is_ok());
     }
 
     #[test]

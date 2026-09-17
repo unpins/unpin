@@ -6,12 +6,11 @@ Versioning](https://semver.org).
 ## [Unreleased]
 
 ### Fixed
-- A package name typed with different capitals (`unpin Tree`, `unpin TREE`,
-  `unpin install UNPINS/tree`) was treated as a separate package: another
-  download, another `list` entry, and an install that took over the other's
-  commands. Names now match regardless of case.
-- `unpin man <pkg>` did not find a page whose name differs from the package
-  only in case (`unpin man xvnc` for `Xvnc.1`).
+- A package name typed with different capitals than its GitHub repository
+  (`unpin install Tree`, `unpin install UNPINS/tree`) installed a second copy
+  of the package, with its own `list` entry, which took over the first one's
+  commands. Such a name is now refused in every command, with the right
+  spelling suggested ("did you mean `tree`?").
 - After `unpin clean` removed a package's only version, `info` and
   `uninstall` still reported it as installed while `list` did not.
 - Building unpin for Windows with a MinGW-w64 12 toolchain failed with

@@ -79,7 +79,6 @@ pub fn man(paths: &Paths, pkg: &str, page_name: &str) -> Result<(), String> {
         return Err(format!("`{pkg}` has no embedded manual"));
     }
 
-    let page_name = match_case(&ents, page_name);
     let entry_path = resolve(&ents, page_name, "en").map_err(|e| {
         // The requested page isn't here. A multicall package is named for its
         // bundle, not any one page (e.g. `binutils` ships `ar`, `ld`, …), so a
@@ -160,25 +159,6 @@ fn parse_entry(e: &meta::Entry) -> Option<Entry> {
         path: e.path.clone(),
         redirect,
     })
-}
-
-/// The page name to look up. An exact name wins; otherwise, when exactly one
-/// page name matches ignoring ASCII case, that one. The default page is the
-/// package name, which is lowercase, while some pages are not — `unpin man xvnc`
-/// must find `Xvnc.1`. Two pages that differ only in case stay ambiguous, so
-/// the request is left as typed and fails with the list of names.
-fn match_case<'a>(ents: &'a [Entry], name: &'a str) -> &'a str {
-    if ents.iter().any(|e| e.name == name) {
-        return name;
-    }
-    let mut hits = ents
-        .iter()
-        .map(|e| e.name.as_str())
-        .filter(|n| n.eq_ignore_ascii_case(name));
-    match hits.next() {
-        Some(first) if hits.all(|n| n == first) => first,
-        _ => name,
-    }
 }
 
 /// Pick the best page for (name, section, lang): prefer `lang`, fall back to
@@ -298,26 +278,6 @@ mod tests {
         assert!(parse_entry(&me("unpin/aliases", false, b"foo")).is_none());
         assert!(parse_entry(&me("unpin/man/a/b/c.1", false, b"9")).is_none()); // nested
         assert!(parse_entry(&me("unpin/man/noext", false, b"9")).is_none()); // no section
-    }
-
-    #[test]
-    fn matches_page_name_case_when_unambiguous() {
-        let ents = vec![
-            ent("unpin/man/Xvnc.1", None),
-            ent("unpin/man/vncpasswd.1", None),
-            ent("unpin/man/Foo.1", None),
-            ent("unpin/man/foo.3", None),
-            ent("unpin/man/FOO.5", None),
-        ];
-        // Only a case-folded match exists: take it.
-        assert_eq!(match_case(&ents, "xvnc"), "Xvnc");
-        // An exact name always wins, even with case variants around.
-        assert_eq!(match_case(&ents, "foo"), "foo");
-        assert_eq!(match_case(&ents, "vncpasswd"), "vncpasswd");
-        // Several names differ only in case: ambiguous, left as typed.
-        assert_eq!(match_case(&ents, "fOO"), "fOO");
-        // No match at all: left as typed (the caller lists what exists).
-        assert_eq!(match_case(&ents, "nope"), "nope");
     }
 
     #[test]

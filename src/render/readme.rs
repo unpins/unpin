@@ -12,6 +12,7 @@
 
 use std::io::Read;
 
+use nanoserde::DeJson;
 use termimad::MadSkin;
 
 use super::{Reflow, page};
@@ -87,19 +88,13 @@ fn embedded(paths: &Paths, target: &str) -> Option<String> {
 /// casing or extension.
 fn repo_readme(pkg: &str) -> Result<String, String> {
     let (owner, repo) = split_repo(pkg);
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/readme");
-    let mut req = minreq::get(&url)
-        // `raw` media type returns the file bytes directly, not base64 JSON.
-        .with_header("Accept", "application/vnd.github.raw+json")
-        .with_header("User-Agent", "unpin")
-        .with_timeout(30);
-    if let Some(tok) = token() {
-        req = req.with_header("Authorization", format!("Bearer {tok}"));
-    }
-
-    let resp = req
-        .send()
-        .map_err(|e| format!("fetching {owner}/{repo} README: {e}"))?;
+    check_spelling(pkg, &owner, &repo)?;
+    // `raw` media type returns the file bytes directly, not base64 JSON.
+    let resp = api_get(
+        &format!("https://api.github.com/repos/{owner}/{repo}/readme"),
+        "application/vnd.github.raw+json",
+    )
+    .map_err(|e| format!("fetching {owner}/{repo} README: {e}"))?;
     match resp.status_code {
         200 => resp
             .as_str()
@@ -114,6 +109,64 @@ fn repo_readme(pkg: &str) -> Result<String, String> {
             "GitHub returned HTTP {c} for {owner}/{repo} README"
         )),
     }
+}
+
+fn api_get(url: &str, accept: &str) -> Result<minreq::Response, minreq::Error> {
+    let mut req = minreq::get(url)
+        .with_header("Accept", accept)
+        .with_header("User-Agent", "unpin")
+        .with_timeout(30);
+    if let Some(tok) = token() {
+        req = req.with_header("Authorization", format!("Bearer {tok}"));
+    }
+    req.send()
+}
+
+#[derive(DeJson)]
+struct RepoInfo {
+    full_name: String,
+}
+
+/// GitHub answers `unpins/Tree` with the `unpins/tree` README, but a package is
+/// named only as GitHub spells it, as in `unpin install`. Any failure to learn
+/// the spelling is left to the README fetch to report.
+fn check_spelling(pkg: &str, owner: &str, repo: &str) -> Result<(), String> {
+    let Ok(resp) = api_get(
+        &format!("https://api.github.com/repos/{owner}/{repo}"),
+        "application/vnd.github+json",
+    ) else {
+        return Ok(());
+    };
+    if resp.status_code != 200 {
+        return Ok(());
+    }
+    let Some(info) = resp
+        .as_str()
+        .ok()
+        .and_then(|b| RepoInfo::deserialize_json(b).ok())
+    else {
+        return Ok(());
+    };
+    match misspelling(pkg, owner, repo, &info.full_name) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// The error for `pkg` (resolved to `owner/repo`) when GitHub spells the repo
+/// `full_name`, or `None` when the spellings agree.
+fn misspelling(pkg: &str, owner: &str, repo: &str, full_name: &str) -> Option<String> {
+    if full_name == format!("{owner}/{repo}") {
+        return None;
+    }
+    let bare = !pkg.split('@').next().unwrap_or(pkg).contains('/');
+    let right = match full_name.split_once('/') {
+        Some(("unpins", name)) if bare => name,
+        _ => full_name,
+    };
+    Some(format!(
+        "no package named `{pkg}` (did you mean `{right}`?)"
+    ))
 }
 
 /// `owner/repo` → `(owner, repo)`; a bare name → `("unpins", name)`. Any
@@ -136,7 +189,26 @@ fn token() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_repo;
+    use super::{misspelling, split_repo};
+
+    #[test]
+    fn repo_spelling_must_match_github() {
+        assert_eq!(misspelling("tree", "unpins", "tree", "unpins/tree"), None);
+        assert_eq!(
+            misspelling("Tree", "unpins", "Tree", "unpins/tree").as_deref(),
+            Some("no package named `Tree` (did you mean `tree`?)")
+        );
+        assert_eq!(
+            misspelling(
+                "burntsushi/ripgrep",
+                "burntsushi",
+                "ripgrep",
+                "BurntSushi/ripgrep"
+            )
+            .as_deref(),
+            Some("no package named `burntsushi/ripgrep` (did you mean `BurntSushi/ripgrep`?)")
+        );
+    }
 
     #[test]
     fn bare_name_defaults_to_the_unpins_owner() {
