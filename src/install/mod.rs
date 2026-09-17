@@ -39,6 +39,56 @@ fn is_part_dir_name(name: &str) -> bool {
     name.ends_with(".part")
 }
 
+/// `true` if `rdir` holds at least one real (non-`.part`) version dir — the
+/// single definition of "this repo is installed", shared by `list`,
+/// `installed_repos`, and `resolve_installed` so they never disagree. A repo
+/// dir left holding only a stray `.unpin.lock` or a crashed `.part` (e.g. a
+/// `run`-cached version that `clean` later swept, or an install that failed
+/// after taking the lock) is *not* a package and must not surface in
+/// `list`/`uninstall`/`info`.
+fn has_real_version(rdir: &Path) -> bool {
+    fs::read_dir(rdir)
+        .map(|it| {
+            it.flatten().any(|e| {
+                e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && !is_part_dir_name(&e.file_name().to_string_lossy())
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The directory entry under `dir` named `name`, ignoring ASCII case: the exact
+/// spelling when it exists, else the single case-insensitive match. Only
+/// directories count. Several matches that differ only in case (left by
+/// earlier versions on a case-sensitive filesystem) are ambiguous: `None`.
+fn stored_dir_name(dir: &Path, name: &str) -> Option<String> {
+    if dir.join(name).is_dir() {
+        return Some(name.to_owned());
+    }
+    let mut hits = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.eq_ignore_ascii_case(name));
+    let first = hits.next()?;
+    hits.next().is_none().then_some(first)
+}
+
+/// `spec` spelled the way its package is already stored, so a second spelling
+/// (`BurntSushi/ripgrep` then `burntsushi/ripgrep`) reuses the package instead
+/// of creating another one. GitHub names are case-insensitive; the directory
+/// names under the data dir are not, on Linux. Unchanged when nothing matches.
+pub(super) fn stored_spelling(paths: &Paths, mut spec: Spec) -> Spec {
+    if let Some(owner) = stored_dir_name(&paths.data, &spec.owner) {
+        if let Some(name) = stored_dir_name(&paths.data.join(&owner), &spec.name) {
+            spec.name = name;
+        }
+        spec.owner = owner;
+    }
+    spec
+}
+
 /// Keep the first occurrence of each `same`-class in `items`, preserving
 /// input order. Shared by every multi-arg subcommand (install/update/info/
 /// remove) so they handle `cmd foo foo` (or `cmd tree unpins/tree`)
@@ -83,11 +133,21 @@ fn dedup_keep_first_noting<T>(
 fn resolve_installed(paths: &Paths, name: &str) -> Result<Option<(String, String)>, String> {
     if let Some((owner, repo)) = name.split_once('/') {
         if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
-            return Ok(if paths.repo_dir(owner, repo).is_dir() {
-                Some((owner.to_owned(), repo.to_owned()))
-            } else {
-                None
-            });
+            let spec = stored_spelling(
+                paths,
+                Spec {
+                    owner: owner.to_owned(),
+                    name: repo.to_owned(),
+                    version: None,
+                },
+            );
+            return Ok(
+                if has_real_version(&paths.repo_dir(&spec.owner, &spec.name)) {
+                    Some((spec.owner, spec.name))
+                } else {
+                    None
+                },
+            );
         }
         return Err(format!("invalid name: `{name}`"));
     }
@@ -112,7 +172,10 @@ fn resolve_installed(paths: &Paths, name: &str) -> Result<Option<(String, String
                 continue;
             }
             let repo = repo_entry.file_name().to_string_lossy().into_owned();
-            if repo != name {
+            if !repo.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            if !has_real_version(&repo_entry.path()) {
                 continue;
             }
             if found.is_some() {
@@ -266,7 +329,7 @@ fn fetch_release_typed(ctx: &Ctx, spec: &Spec) -> Result<Release, github::FetchE
 pub fn install_many(ctx: &Ctx, opts: &InstallOptions, inputs: &[String]) -> Result<(), String> {
     let parsed: Vec<(String, Spec)> = inputs
         .iter()
-        .map(|s| parse_spec(s).map(|sp| (s.clone(), sp)))
+        .map(|s| parse_spec(s).map(|sp| (s.clone(), stored_spelling(&ctx.paths, sp))))
         .collect::<Result<_, _>>()?;
     // Dedup by parsed Spec so `install tree unpins/tree` collapses — both
     // normalize to the same target and a parallel run would otherwise race
@@ -501,9 +564,7 @@ pub fn uninstall_many(
         // A quiet uninstall-all can't show the confirmation, and clearing every
         // package is destructive — refuse unless `-y` already settled it.
         if quiet && !assume_yes {
-            return Err(
-                "refusing to uninstall all packages under --quiet without --yes".into(),
-            );
+            return Err("refusing to uninstall all packages under --quiet without --yes".into());
         }
         if !quiet {
             println!(
@@ -729,7 +790,11 @@ pub fn update(ctx: &Ctx, opts: &InstallOptions, names: &[String]) -> Result<(), 
     run_pipeline_v2(ctx, opts, PipelineMode::Update, requests, Vec::new())
 }
 
-fn installed_repos(paths: &Paths) -> Vec<(String, String)> {
+/// Every `owner/repo` dir under the data root, *including* ones left empty (a
+/// repo dir holding only `.unpin.lock`, or only `.part` cruft). Only `clean`
+/// wants this view — it needs to see and prune those empties. Everything
+/// user-facing goes through [`installed_repos`], which filters them out.
+fn all_repo_dirs(paths: &Paths) -> Vec<(String, String)> {
     let root = &paths.data;
     let mut out = Vec::new();
     let entries = match fs::read_dir(root) {
@@ -756,6 +821,17 @@ fn installed_repos(paths: &Paths) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Installed packages: repo dirs that hold at least one real version. This is
+/// the list `uninstall` (bare sweep) and `update` (bare) iterate, kept in sync
+/// with what `list` shows — an empty repo dir is not a package (see
+/// [`has_real_version`]).
+fn installed_repos(paths: &Paths) -> Vec<(String, String)> {
+    all_repo_dirs(paths)
+        .into_iter()
+        .filter(|(o, r)| has_real_version(&paths.repo_dir(o, r)))
+        .collect()
 }
 
 pub fn info_many(ctx: &Ctx, inputs: &[String]) -> Result<(), String> {
@@ -837,7 +913,7 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let spec = parse_spec(input)?;
+    let spec = stored_spelling(&ctx.paths, parse_spec(input)?);
     let release = fetch_release(ctx, &spec)?;
     println!("Repo:    {}", spec.repo());
     println!("Version: {} (latest)", release.tag_name);
@@ -906,7 +982,7 @@ pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
         })
         .unwrap_or_default();
 
-    for (owner, repo) in installed_repos(paths) {
+    for (owner, repo) in all_repo_dirs(paths) {
         let rdir = paths.repo_dir(&owner, &repo);
         // Take the lock for this repo before scanning + removing version
         // dirs. Without this clean races with a concurrent `install`/`update`
@@ -958,9 +1034,19 @@ pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
                 removed += 1;
             }
         }
-        // Clean up now-empty repo and owner dirs.
-        let _ = fs::remove_dir(&rdir);
-        let _ = fs::remove_dir(paths.data.join(&owner));
+        // Prune the repo dir if no real version is left in it. We use
+        // remove_dir_all, not remove_dir: the `.unpin.lock` we still hold lives
+        // *inside* rdir, so remove_dir (which needs an empty dir) would fail and
+        // strand the empty repo dir — which then shows up as a phantom package
+        // in `uninstall`/`info` even though `list` (rightly) hides it. Same
+        // trick uninstall_one uses: std opens the lock share-delete on Windows
+        // and unlinks it on Unix, so the wipe succeeds while the lock is held;
+        // the guard's own Drop::remove_file then no-ops. Guarded by
+        // has_real_version so a kept/linked version is never touched.
+        if !has_real_version(&rdir) {
+            let _ = fs::remove_dir_all(&rdir);
+            let _ = fs::remove_dir(paths.data.join(&owner));
+        }
     }
 
     // Phase 3: orphan-vdir removal above just broke any alias symlinks
@@ -1022,7 +1108,7 @@ pub fn run(
     assume_yes: bool,
     refresh: bool,
 ) -> Result<i32, String> {
-    let spec = parse_spec(input)?;
+    let spec = stored_spelling(&ctx.paths, parse_spec(input)?);
 
     // Verb-dispatch fallback (docs/helper-verbs.md): a *bare* catalog name that
     // isn't a published program is retried as the `unpins/unpin-<name>` helper
@@ -1378,19 +1464,137 @@ mod tests {
     }
 
     #[test]
-    fn is_installed_tracks_the_repo_dir() {
+    fn is_installed_requires_a_real_version() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_data(tmp.path());
         // Nothing on disk → not installed (drives the doc verbs' install hint).
         assert!(!is_installed(&paths, "htop").unwrap());
         assert!(!is_installed(&paths, "unpins/htop").unwrap());
-        // A bare repo dir is enough for "installed" (a linked version is a later,
-        // separate check), for both the bare and qualified spellings.
+        // An empty repo dir — or one holding only a `.part` — is NOT a package.
+        // This is the case `clean` used to strand (lock file left behind), which
+        // made `uninstall`/`info` see a phantom that `list` rightly hid.
         fs::create_dir_all(paths.repo_dir("unpins", "htop")).unwrap();
+        assert!(!is_installed(&paths, "htop").unwrap());
+        assert!(!is_installed(&paths, "unpins/htop").unwrap());
+        fs::create_dir_all(paths.repo_dir("unpins", "htop").join("v3.0.0.part")).unwrap();
+        assert!(!is_installed(&paths, "htop").unwrap());
+        // A real version dir makes it installed, for both spellings.
+        fs::create_dir_all(paths.version_dir("unpins", "htop", "v3.4.0")).unwrap();
         assert!(is_installed(&paths, "htop").unwrap());
         assert!(is_installed(&paths, "unpins/htop").unwrap());
         // A malformed name is a hard error, not a quiet "false".
         assert!(is_installed(&paths, "a/b/c").is_err());
+    }
+
+    #[test]
+    fn stored_spelling_reuses_the_package_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        let spec = |o: &str, n: &str| Spec {
+            owner: o.into(),
+            name: n.into(),
+            version: None,
+        };
+        let spelled = |sp: Spec| (sp.owner, sp.name);
+        // Nothing stored: the spelling is kept as typed.
+        assert_eq!(
+            spelled(stored_spelling(&paths, spec("BurntSushi", "ripgrep"))),
+            ("BurntSushi".into(), "ripgrep".into())
+        );
+        fs::create_dir_all(paths.version_dir("BurntSushi", "ripgrep", "15.1.0")).unwrap();
+        // Another spelling of the same repo lands on the stored one.
+        assert_eq!(
+            spelled(stored_spelling(&paths, spec("burntsushi", "RIPGREP"))),
+            ("BurntSushi".into(), "ripgrep".into())
+        );
+        // A different repo of the stored owner keeps its own name.
+        assert_eq!(
+            spelled(stored_spelling(&paths, spec("burntsushi", "xsv"))),
+            ("BurntSushi".into(), "xsv".into())
+        );
+        // Case twins left on a case-sensitive filesystem: the exact spelling
+        // wins, and a third spelling is ambiguous and kept as typed.
+        fs::create_dir_all(paths.version_dir("BurntSushi", "RipGrep", "15.1.0")).unwrap();
+        assert_eq!(
+            spelled(stored_spelling(&paths, spec("BurntSushi", "RipGrep"))),
+            ("BurntSushi".into(), "RipGrep".into())
+        );
+        if !paths.repo_dir("BurntSushi", "RIPGREP").is_dir() {
+            assert_eq!(
+                spelled(stored_spelling(&paths, spec("BurntSushi", "RIPGREP"))),
+                ("BurntSushi".into(), "RIPGREP".into())
+            );
+        }
+    }
+
+    #[test]
+    fn installed_name_lookup_ignores_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        fs::create_dir_all(paths.version_dir("unpins", "xvnc", "v1")).unwrap();
+        fs::create_dir_all(paths.version_dir("BurntSushi", "ripgrep", "15.1.0")).unwrap();
+        for name in ["XVNC", "unpins/Xvnc", "Unpins/xvnc"] {
+            assert_eq!(
+                resolve_installed(&paths, name).unwrap(),
+                Some(("unpins".into(), "xvnc".into())),
+                "{name}"
+            );
+        }
+        for name in ["RipGrep", "burntsushi/RIPGREP"] {
+            assert_eq!(
+                resolve_installed(&paths, name).unwrap(),
+                Some(("BurntSushi".into(), "ripgrep".into())),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_repos_skips_empty_repo_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        // A real package, plus a stranded-empty repo dir (what a buggy `clean`
+        // left for `run`-cached `bash` after sweeping its only version).
+        fs::create_dir_all(paths.version_dir("unpins", "htop", "v3.4.0")).unwrap();
+        fs::create_dir_all(paths.repo_dir("unpins", "bash")).unwrap();
+        // The bare-uninstall / update sweep agrees with `list`: only htop.
+        assert_eq!(
+            installed_repos(&paths),
+            vec![("unpins".to_owned(), "htop".to_owned())]
+        );
+        // The raw view `clean` uses still sees the empty dir so it can prune it.
+        let mut all = all_repo_dirs(&paths);
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                ("unpins".to_owned(), "bash".to_owned()),
+                ("unpins".to_owned(), "htop".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn clean_prunes_a_stranded_empty_repo_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        fs::create_dir_all(&paths.bin).unwrap();
+        // Simulate `unpin run bash` (cached, never linked) + a `clean` that
+        // swept the version but, before the fix, stranded the empty repo dir
+        // holding only `.unpin.lock`.
+        let rdir = paths.repo_dir("unpins", "bash");
+        fs::create_dir_all(&rdir).unwrap();
+        fs::write(rdir.join(".unpin.lock"), "pid=1\n").unwrap();
+        assert!(rdir.is_dir());
+
+        clean(&paths, true).unwrap();
+
+        // The phantom is gone: the repo dir (and its now-empty owner dir) are
+        // removed, and nothing resolves it as installed anymore.
+        assert!(!rdir.exists());
+        assert!(!paths.data.join("unpins").exists());
+        assert!(!is_installed(&paths, "bash").unwrap());
+        assert!(installed_repos(&paths).is_empty());
     }
 
     #[test]

@@ -60,6 +60,9 @@ pub fn parse_spec(input: &str) -> Result<Spec, String> {
         }
         validate_path_component(owner, "owner")?;
         validate_path_component(name, "name")?;
+        if owner.eq_ignore_ascii_case(CATALOG_OWNER) {
+            return Ok(catalog_spec(name, version));
+        }
         return Ok(Spec {
             owner: owner.to_owned(),
             name: name.to_owned(),
@@ -70,11 +73,23 @@ pub fn parse_spec(input: &str) -> Result<Spec, String> {
         return Err("empty package name".into());
     }
     validate_path_component(base, "name")?;
-    Ok(Spec {
+    Ok(catalog_spec(base, version))
+}
+
+/// A catalog package, spelled the one way it is stored. GitHub names are
+/// case-insensitive, so `Tree`, `TREE` and `UNPINS/tree` all fetch the same
+/// release — but the name is also a directory, and without folding each
+/// spelling became a separate package (a second download, a second `list`
+/// row, and an `install` that silently took over the other's links; an
+/// `UNPINS/` owner also missed the catalog alias gate). Every catalog repo
+/// name is lowercase. Third-party names keep their spelling here; the install
+/// code matches them against what is already on disk.
+fn catalog_spec(name: &str, version: Option<String>) -> Spec {
+    Spec {
         owner: CATALOG_OWNER.to_owned(),
-        name: base.to_owned(),
+        name: name.to_ascii_lowercase(),
         version,
-    })
+    }
 }
 
 /// Reject strings that aren't safe to use as a single filesystem-path
@@ -134,6 +149,28 @@ mod tests {
         assert_eq!(s.owner, "unpins");
         assert_eq!(s.name, "sgleam");
         assert_eq!(s.version.as_deref(), Some("v0.7.0"));
+    }
+
+    #[test]
+    fn parse_spec_folds_catalog_case() {
+        for input in ["Tree", "TREE", "unpins/Tree", "UNPINS/tree", "Unpins/TrEe"] {
+            let s = parse_spec(input).unwrap();
+            assert_eq!(
+                (s.owner.as_str(), s.name.as_str()),
+                ("unpins", "tree"),
+                "{input}"
+            );
+        }
+        // The version keeps its spelling; a third-party name keeps its own.
+        assert_eq!(
+            parse_spec("Tree@V2.3").unwrap().version.as_deref(),
+            Some("V2.3")
+        );
+        let s = parse_spec("BurntSushi/RipGrep").unwrap();
+        assert_eq!(
+            (s.owner.as_str(), s.name.as_str()),
+            ("BurntSushi", "RipGrep")
+        );
     }
 
     #[test]

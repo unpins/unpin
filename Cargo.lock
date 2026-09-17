@@ -767,7 +767,7 @@ dependencies = [
 [[package]]
 name = "mandoc-sys"
 version = "0.1.0"
-source = "git+https://github.com/unpins/mandoc-sys?rev=d7a8e18ebb5f2d37a698a5d867096dc73d21e68e#d7a8e18ebb5f2d37a698a5d867096dc73d21e68e"
+source = "git+https://github.com/unpins/mandoc-sys?rev=c19442c3f925a828952654722ebc0d35ae665e0d#c19442c3f925a828952654722ebc0d35ae665e0d"
 dependencies = [
  "cc",
 ]

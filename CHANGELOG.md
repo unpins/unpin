@@ -5,6 +5,18 @@ Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+- A package name typed with different capitals (`unpin Tree`, `unpin TREE`,
+  `unpin install UNPINS/tree`) was treated as a separate package: another
+  download, another `list` entry, and an install that took over the other's
+  commands. Names now match regardless of case.
+- `unpin man <pkg>` did not find a page whose name differs from the package
+  only in case (`unpin man xvnc` for `Xvnc.1`).
+- After `unpin clean` removed a package's only version, `info` and
+  `uninstall` still reported it as installed while `list` did not.
+- Building unpin for Windows with a MinGW-w64 12 toolchain failed with
+  "redefinition of 'vasprintf'".
+
 ## [0.4.0] — 2026-06-15 (developer-only)
 
 ### Added

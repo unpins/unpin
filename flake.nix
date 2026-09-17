@@ -48,7 +48,7 @@
       # from the lock's checksums, but a git source carries none, so its hash is
       # pinned here. Bump alongside the `rev` in Cargo.toml.
       cargoLockOutputHashes = {
-        "mandoc-sys-0.1.0" = "sha256-JKKB0pAwjdUp81IxmTX9gRHaQUre4aavZlWn2c6HGgE=";
+        "mandoc-sys-0.1.0" = "sha256-kT08yCfj44rJqKUFtYTtHr9Jzo2x//4qefvXZnRSfsI=";
       };
 
       mkUnpin = { rustPlatform, env ? {}, auditable ? true }:
