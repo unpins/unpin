@@ -149,15 +149,31 @@ fn dedup_keep_first_noting<T>(
 }
 
 /// Search the data dir for a repo matching `name`. Accepts "owner/repo" or a
-/// bare repo name (searches all owners; ambiguous match is an error).
+/// bare repo name (searches all owners; ambiguous match is an error). A name
+/// that differs only in case from an installed package is an error naming it:
+/// for these offline lookups, "not installed" would be the only other answer.
 fn resolve_installed(paths: &Paths, name: &str) -> Result<Option<(String, String)>, String> {
+    let found = find_installed(paths, name)?;
+    if found.is_none() {
+        match name.split_once('/') {
+            Some((owner, repo)) => check_installed_spelling(paths, name, Some(owner), repo)?,
+            None => check_installed_spelling(paths, name, None, name)?,
+        }
+    }
+    Ok(found)
+}
+
+/// [`resolve_installed`] without the case suggestion, for a caller that has an
+/// answer of its own for a name that is not installed: `info` looks it up on
+/// GitHub, where a bare `tree` is `unpins/tree` even with a third-party `Tree`
+/// installed.
+fn find_installed(paths: &Paths, name: &str) -> Result<Option<(String, String)>, String> {
     if let Some((owner, repo)) = name.split_once('/') {
         if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
             if repo_dir_exact(paths, owner, repo) && has_real_version(&paths.repo_dir(owner, repo))
             {
                 return Ok(Some((owner.to_owned(), repo.to_owned())));
             }
-            check_installed_spelling(paths, name, Some(owner), repo)?;
             return Ok(None);
         }
         return Err(format!("invalid name: `{name}`"));
@@ -194,9 +210,6 @@ fn resolve_installed(paths: &Paths, name: &str) -> Result<Option<(String, String
             }
             found = Some((owner.clone(), repo));
         }
-    }
-    if found.is_none() {
-        check_installed_spelling(paths, name, None, name)?;
     }
     Ok(found)
 }
@@ -901,7 +914,7 @@ pub fn info_many(ctx: &Ctx, inputs: &[String]) -> Result<(), String> {
 }
 
 fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
-    if let Some((owner, repo)) = resolve_installed(&ctx.paths, input)? {
+    if let Some((owner, repo)) = find_installed(&ctx.paths, input)? {
         let rdir = ctx.paths.repo_dir(&owner, &repo);
         let mut versions: Vec<String> = fs::read_dir(&rdir)
             .map_err(|e| format!("read {}: {e}", rdir.display()))?
@@ -1566,6 +1579,18 @@ mod tests {
         // Nothing similar installed: plain "not installed".
         assert_eq!(resolve_installed(&paths, "htop").unwrap(), None);
         assert_eq!(resolve_installed(&paths, "unpins/htop").unwrap(), None);
+    }
+
+    #[test]
+    fn info_lookup_of_a_case_twin_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        fs::create_dir_all(paths.version_dir("someone", "Tree", "v1")).unwrap();
+        // `info tree` must reach GitHub for `unpins/tree`, not stop at `Tree`.
+        assert_eq!(find_installed(&paths, "tree").unwrap(), None);
+        assert_eq!(find_installed(&paths, "unpins/tree").unwrap(), None);
+        // The offline commands still point at the installed twin.
+        assert!(resolve_installed(&paths, "tree").is_err());
     }
 
     #[test]
