@@ -7,8 +7,10 @@
   };
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     unpins-lib.url = "github:unpins/nix-lib";
+    # Built on the catalog's one nixpkgs pin, not a channel of its own: the
+    # release notes report this input as the base the binary was built on.
+    nixpkgs.follows = "unpins-lib/nixpkgs";
     # rustup-distributed toolchain. Pulls `rust-std-<triple>` as a binary
     # download for each cross target — avoids the multi-hour cross-rustc
     # bootstrap that pkgsCross.<x>.rustPlatform triggers for musl targets
