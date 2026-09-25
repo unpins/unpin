@@ -159,20 +159,13 @@ fn misspelling(pkg: &str, owner: &str, repo: &str, full_name: &str) -> Option<St
     if full_name == format!("{owner}/{repo}") {
         return None;
     }
-    let (name, version) = match pkg.split_once('@') {
-        Some((n, v)) => (n, Some(v)),
-        None => (pkg, None),
-    };
+    let (name, version) = pkg.split_at(pkg.find('@').unwrap_or(pkg.len()));
     let right = match full_name.split_once('/') {
         Some(("unpins", repo)) if !name.contains('/') => repo,
         _ => full_name,
     };
-    let right = match version {
-        Some(v) => format!("{right}@{v}"),
-        None => right.to_owned(),
-    };
     Some(format!(
-        "no package named `{pkg}` (did you mean `{right}`?)"
+        "no package named `{pkg}` (did you mean `{right}{version}`?)"
     ))
 }
 

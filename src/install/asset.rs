@@ -516,15 +516,16 @@ mod tests {
         }
     }
 
+    fn mk_asset(name: &str) -> Asset {
+        Asset {
+            name: name.into(),
+            browser_download_url: "u".into(),
+            size: 0,
+        }
+    }
+
     fn mk_assets(names: &[&str]) -> Vec<Asset> {
-        names
-            .iter()
-            .map(|n| Asset {
-                name: (*n).into(),
-                browser_download_url: "u".into(),
-                size: 0,
-            })
-            .collect()
+        names.iter().map(|n| mk_asset(n)).collect()
     }
 
     /// Check `narrow_assets`' auto-pick for the host against `want`, a table of
@@ -722,22 +723,17 @@ mod tests {
 
     #[test]
     fn toolchain_preference_narrows_to_preferred_subset() {
-        let mk = |n: &str| Asset {
-            name: n.into(),
-            browser_download_url: "u".into(),
-            size: 0,
-        };
         // Windows split — preference passed explicitly, so this is
         // host-independent (the cfg table is exercised via narrow_assets below).
-        let gnu = mk("ripgrep-15.1.0-x86_64-pc-windows-gnu.zip");
-        let msvc = mk("ripgrep-15.1.0-x86_64-pc-windows-msvc.zip");
+        let gnu = mk_asset("ripgrep-15.1.0-x86_64-pc-windows-gnu.zip");
+        let msvc = mk_asset("ripgrep-15.1.0-x86_64-pc-windows-msvc.zip");
         let got = apply_toolchain_preference(vec![&gnu, &msvc], &["msvc"]);
         assert_eq!(got.len(), 1);
         assert!(got[0].name.contains("msvc"), "got: {}", got[0].name);
 
         // Linux split.
-        let lg = mk("fd-x86_64-unknown-linux-gnu.tar.gz");
-        let lm = mk("fd-x86_64-unknown-linux-musl.tar.gz");
+        let lg = mk_asset("fd-x86_64-unknown-linux-gnu.tar.gz");
+        let lm = mk_asset("fd-x86_64-unknown-linux-musl.tar.gz");
         let got = apply_toolchain_preference(vec![&lg, &lm], &["musl"]);
         assert_eq!(got.len(), 1);
         assert!(got[0].name.contains("musl"), "got: {}", got[0].name);
@@ -745,13 +741,8 @@ mod tests {
 
     #[test]
     fn toolchain_preference_is_a_noop_when_it_cannot_disambiguate() {
-        let mk = |n: &str| Asset {
-            name: n.into(),
-            browser_download_url: "u".into(),
-            size: 0,
-        };
-        let a = mk("tool-x86_64-linux-gnu.tar.gz");
-        let b = mk("tool-x86_64-linux-uclibc.tar.gz");
+        let a = mk_asset("tool-x86_64-linux-gnu.tar.gz");
+        let b = mk_asset("tool-x86_64-linux-uclibc.tar.gz");
         // No candidate carries the preferred token → unchanged, so a repo that
         // ships only non-preferred builds still installs (just stays ambiguous).
         assert_eq!(apply_toolchain_preference(vec![&a, &b], &["musl"]).len(), 2);
@@ -779,11 +770,7 @@ mod tests {
 
     #[test]
     fn find_companion_returns_none_when_absent() {
-        let assets = vec![Asset {
-            name: "tree-2.2.1-x86_64-linux.zst".into(),
-            browser_download_url: "u".into(),
-            size: 0,
-        }];
+        let assets = mk_assets(&["tree-2.2.1-x86_64-linux.zst"]);
         assert!(find_companion("tree", "v2.2.1", &assets).is_none());
     }
 
