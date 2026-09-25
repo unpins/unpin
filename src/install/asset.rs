@@ -366,6 +366,15 @@ mod tests {
         )
     }
 
+    /// An arch the host can't run.
+    fn foreign_arch() -> &'static str {
+        if host_tags().1 == "x86_64" {
+            "aarch64"
+        } else {
+            "x86_64"
+        }
+    }
+
     #[test]
     fn classify_picks_up_other_os_assets() {
         let (host_os, arch) = host_tags();
@@ -383,14 +392,9 @@ mod tests {
 
     #[test]
     fn classify_filters_other_arch() {
-        let (os, arch) = host_tags();
-        let other = if arch == "x86_64" {
-            "aarch64"
-        } else {
-            "x86_64"
-        };
+        let os = host_tags().0;
         assert_eq!(
-            classify_excluded(&format!("tool-{os}-{other}.tar.gz")),
+            classify_excluded(&format!("tool-{os}-{}.tar.gz", foreign_arch())),
             Some("other arch")
         );
     }
@@ -399,7 +403,7 @@ mod tests {
     fn classify_excludes_auxiliary() {
         // Tagged for the host's OS: another OS's tag is excluded first, as
         // "other platform".
-        let os = platform::current_os_keys()[0];
+        let os = host_tags().0;
         assert_eq!(
             classify_excluded(&format!("rg-14.1.0-{os}.tar.gz.sha256")),
             Some("auxiliary")
@@ -423,10 +427,7 @@ mod tests {
 
     #[test]
     fn classify_accepts_bare_zst_binary() {
-        let (os, arch) = (
-            platform::current_os_keys()[0],
-            platform::current_arch_keys()[0],
-        );
+        let (os, arch) = host_tags();
         assert_eq!(
             classify_excluded(&format!("gvim-9.2.0-{arch}-{os}.zst")),
             None
@@ -459,10 +460,7 @@ mod tests {
     #[test]
     fn classify_accepts_current_os_asset() {
         // The host's own OS and arch: another arch is excluded, as "other arch".
-        let (os, arch) = (
-            platform::current_os_keys()[0],
-            platform::current_arch_keys()[0],
-        );
+        let (os, arch) = host_tags();
         assert_eq!(
             classify_excluded(&format!("rg-14.1.0-{arch}-{os}.tar.gz")),
             None
@@ -653,12 +651,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn narrow_prefers_the_portable_toolchain_for_a_multivariant_repo() {
-        let arch = platform::current_arch_keys()[0];
-        let other = if arch == "x86_64" {
-            "aarch64"
-        } else {
-            "x86_64"
-        };
+        let (arch, other) = (host_tags().1, foreign_arch());
         let (os, ext, preferred, other_toolchain) = if cfg!(windows) {
             ("pc-windows", "zip", "msvc", "gnu")
         } else {
