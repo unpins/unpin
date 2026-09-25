@@ -1068,6 +1068,22 @@ pub fn is_same_file(a: &Path, b: &Path) -> bool {
     matches!((file_id(a), file_id(b)), (Some(x), Some(y)) if x == y)
 }
 
+/// Run `cmd` as the rest of this process: its exit code is ours, and
+/// ctrl-c is its own. Unix replaces this process; elsewhere main waits.
+pub fn run_foreground(cmd: &mut std::process::Command) -> io::Result<i32> {
+    crate::sigint::foreground(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            Err(cmd.exec())
+        }
+        #[cfg(not(unix))]
+        {
+            cmd.status().map(|s| s.code().unwrap_or(1))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

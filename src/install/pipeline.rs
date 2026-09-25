@@ -182,9 +182,8 @@ fn prepare_workspace_dirs(
     // write. Holding it through a prompt would force a parallel install on the
     // same package to error out while the user is at coffee.
     let lock = RepoLock::acquire(&paths.repo_dir(&spec.owner, &spec.name))?;
-    // Counted as in flight, so an interrupt waits instead of cutting it short.
-    let _flight = crate::sigint::InFlight::new();
-    crate::sigint::check()?;
+    // In flight, so an interrupt waits instead of cutting it short.
+    let _flight = crate::sigint::InFlight::enter()?;
     // --pick (or incomplete cache) on a cached version: wipe before re-extracting.
     // Also wipe a leftover `.part` from a previous run that got SIGKILL'd between
     // extract and rename — without this the second attempt would start from a
@@ -331,18 +330,19 @@ pub fn do_extract(ctx: &Ctx, job: &ExtractJob, ui: &Ui, sinks: &DlSinks) -> Resu
     let rdir = ctx.paths.repo_dir(&job.spec.owner, &job.spec.name);
     fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
     crate::sigint::push_cleanup(&job.extract_dir);
-    let flight = crate::sigint::InFlight::new();
-    let mut guard = CleanupGuard::arm(job.extract_dir.clone());
-    let result = crate::sigint::check()
-        .and_then(|()| extract_and_publish(job, primary_asset, ctx, ui, sinks));
-    if result.is_ok() {
-        guard.disarm();
-    }
-    // The interrupt handler waits on the in-flight count, so `.part` goes
-    // before leaving it; unregistered even on failure, since the caller then
-    // releases the lock and another process may reuse this `.part`.
-    drop(guard);
-    drop(flight);
+    let result = crate::sigint::InFlight::enter().and_then(|flight| {
+        let mut guard = CleanupGuard::arm(job.extract_dir.clone());
+        let result = extract_and_publish(job, primary_asset, ctx, ui, sinks);
+        if result.is_ok() {
+            guard.disarm();
+        }
+        // The interrupt handler waits on the in-flight count: `.part` goes first.
+        drop(guard);
+        drop(flight);
+        result
+    });
+    // Even on failure: the caller then releases the lock, and another process
+    // may reuse this `.part`.
     crate::sigint::pop_cleanup(&job.extract_dir);
     result
 }

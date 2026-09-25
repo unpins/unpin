@@ -1374,27 +1374,7 @@ fn run_binary(spec: &Spec, vdir: &Path, args: &[String], assume_yes: bool) -> Re
 
     let mut cmd = Command::new(&bin);
     cmd.args(args);
-    let status = crate::sigint::with_child(|| cmd.status())
-        .map_err(|e| format!("exec {}: {e}", bin.display()))?;
-    match status.code() {
-        Some(code) => Ok(code),
-        None => {
-            // Unix: child terminated by signal. Mirror shell convention 128+sig
-            // so callers (CI, shell scripts) see a non-zero exit. On Windows
-            // status.code() is always Some(_), so this branch is Unix-only in
-            // practice — fall back to 1 anywhere else.
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::ExitStatusExt;
-                let sig = status.signal().unwrap_or(0);
-                Ok(128 + sig)
-            }
-            #[cfg(not(unix))]
-            {
-                Ok(1)
-            }
-        }
-    }
+    platform::run_foreground(&mut cmd).map_err(|e| format!("exec {}: {e}", bin.display()))
 }
 
 #[cfg(test)]
