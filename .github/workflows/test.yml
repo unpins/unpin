@@ -38,6 +38,7 @@ jobs:
           rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
           rustup default stable
       - name: Build the test binary
+        shell: bash  # -o pipefail: a failed build must not reach `cp` as ''
         run: |
           exe=$(cargo test --locked --target x86_64-pc-windows-gnu --no-run --message-format=json \
             | jq -r 'select(.profile.test == true) | .executable')
