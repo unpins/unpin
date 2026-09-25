@@ -159,10 +159,17 @@ fn misspelling(pkg: &str, owner: &str, repo: &str, full_name: &str) -> Option<St
     if full_name == format!("{owner}/{repo}") {
         return None;
     }
-    let bare = !pkg.split('@').next().unwrap_or(pkg).contains('/');
+    let (name, version) = match pkg.split_once('@') {
+        Some((n, v)) => (n, Some(v)),
+        None => (pkg, None),
+    };
     let right = match full_name.split_once('/') {
-        Some(("unpins", name)) if bare => name,
+        Some(("unpins", repo)) if !name.contains('/') => repo,
         _ => full_name,
+    };
+    let right = match version {
+        Some(v) => format!("{right}@{v}"),
+        None => right.to_owned(),
     };
     Some(format!(
         "no package named `{pkg}` (did you mean `{right}`?)"
@@ -197,6 +204,11 @@ mod tests {
         assert_eq!(
             misspelling("Tree", "unpins", "Tree", "unpins/tree").as_deref(),
             Some("no package named `Tree` (did you mean `tree`?)")
+        );
+        // A version is kept, as `unpin install` does.
+        assert_eq!(
+            misspelling("Tree@v1", "unpins", "Tree", "unpins/tree").as_deref(),
+            Some("no package named `Tree@v1` (did you mean `tree@v1`?)")
         );
         assert_eq!(
             misspelling(
