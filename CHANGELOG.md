@@ -10,11 +10,23 @@ Versioning](https://semver.org).
   (`unpin install Tree`, `unpin install UNPINS/tree`) installed a second copy
   of the package, with its own `list` entry, which took over the first one's
   commands. Such a name is now refused in every command, with the right
-  spelling suggested ("did you mean `tree`?").
+  spelling suggested ("did you mean `tree`?"). A copy already installed under
+  another spelling, or under the old name of a repository since renamed on
+  GitHub, no longer updates: reinstall it under the current name
+  (`unpin uninstall Tree && unpin install tree`).
 - After `unpin clean` removed a package's only version, `info` and
   `uninstall` still reported it as installed while `list` did not.
 - Building unpin for Windows with a MinGW-w64 12 toolchain failed with
   "redefinition of 'vasprintf'".
+- Two `unpin` processes working on the same package could both proceed at
+  once — often on Windows, rarely elsewhere — and `clean` could remove a
+  version the self-install had just placed. An interrupted or failed install
+  no longer leaves empty directories or lock files behind.
+- Installing a multicall package (e.g. `mtools`) no longer warns that its
+  own name "is provided by more than one binary in this package".
+
+### Security
+- Built on nixpkgs 26.05 (was 25.11), with the catalog's musl CVE patches.
 
 ## [0.4.0] — 2026-06-15 (developer-only)
 
