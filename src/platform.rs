@@ -108,15 +108,28 @@ pub fn on_disk_spelling(p: &Path) -> PathBuf {
 #[cfg(windows)]
 pub fn names_dir(entry: &str, dir: &Path) -> bool {
     let entry = expand_env(entry, |k| std::env::var(k).ok());
-    let entry = Path::new(entry.trim_end_matches('\\'));
-    // Only a likely match is resolved: an entry on a dead network drive can
-    // take seconds.
-    entry.as_os_str().eq_ignore_ascii_case(dir.as_os_str())
-        || entry
-            .file_name()
-            .zip(dir.file_name())
-            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
-            && on_disk_spelling(entry) == dir
+    same_dir(Path::new(entry.trim_end_matches('\\')), dir)
+}
+
+/// Whether the PATH entry `entry` is `dir`, spelled another way.
+pub fn same_dir(entry: &Path, dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // Only a likely match is resolved: an entry on a dead network drive
+        // can take seconds.
+        entry.as_os_str().eq_ignore_ascii_case(dir.as_os_str())
+            || entry
+                .file_name()
+                .zip(dir.file_name())
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                && on_disk_spelling(entry) == on_disk_spelling(dir)
+    }
+    // A symlink may give the dir another last name.
+    #[cfg(not(windows))]
+    {
+        entry == dir
+            || fs::canonicalize(entry).is_ok_and(|e| fs::canonicalize(dir).is_ok_and(|d| e == d))
+    }
 }
 
 /// `%NAME%` replaced by `var(NAME)`, as Windows expands a `REG_EXPAND_SZ`; an
@@ -1240,6 +1253,19 @@ mod tests {
         assert_eq!(expand_env("%%HOME%", var), r"%C:\Users\u");
         assert_eq!(expand_env("a%NOPE%HOME%b", var), r"a%NOPEC:\Users\ub");
         assert_eq!(expand_env("plain", var), "plain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_dir_follows_a_symlink_with_another_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bin, other) = (tmp.path().join("bin"), tmp.path().join("other"));
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&bin, tmp.path().join("alias")).unwrap();
+        assert!(same_dir(&bin, &bin));
+        assert!(same_dir(&tmp.path().join("alias"), &bin));
+        assert!(!same_dir(&other, &bin));
     }
 
     #[cfg(windows)]

@@ -394,9 +394,7 @@ fn bin_on_path(bin: &Path) -> bool {
     let Some(path) = env::var_os("PATH") else {
         return false;
     };
-    let target = fs::canonicalize(bin).ok();
-    env::split_paths(&path)
-        .any(|p| p == bin || (target.is_some() && fs::canonicalize(&p).ok() == target))
+    env::split_paths(&path).any(|p| platform::same_dir(&p, bin))
 }
 
 /// A small yes/no prompt, defaulting to **yes** (this is the recommended
