@@ -59,10 +59,13 @@ impl Paths {
             // package data goes under the `packages\` subdirectory.
             let local = nonempty_env("LOCALAPPDATA").ok_or_else(|| missing("LOCALAPPDATA"))?;
             let appdata = nonempty_env("APPDATA").ok_or_else(|| missing("APPDATA"))?;
+            let local = on_disk_spelling(Path::new(&local));
             Ok(Paths {
-                data: PathBuf::from(&local).join("unpin").join("packages"),
-                bin: PathBuf::from(local).join("unpin"),
-                config: PathBuf::from(appdata).join("unpin").join("config"),
+                data: local.join("unpin").join("packages"),
+                bin: local.join("unpin"),
+                config: on_disk_spelling(Path::new(&appdata))
+                    .join("unpin")
+                    .join("config"),
             })
         }
     }
@@ -84,6 +87,37 @@ fn nonempty_env(key: &str) -> Option<String> {
         Ok(v) if !v.is_empty() => Some(v),
         _ => None,
     }
+}
+
+/// `p` as the filesystem spells it: long names instead of 8.3 ones, and the
+/// on-disk case. That is the spelling [`read_link`] returns, which callers
+/// compare with `starts_with` against [`Paths`]: a mismatch hides a managed
+/// link, and `clean` then removes the version it points at. (On Unix a
+/// symlink's target is spelled as it was written.) Unchanged if `p` can't be
+/// resolved.
+#[cfg(windows)]
+pub fn on_disk_spelling(p: &Path) -> PathBuf {
+    fs::canonicalize(p).map_or_else(|_| p.to_owned(), |c| strip_verbatim(&c))
+}
+
+/// `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share\x` → `\\srv\share\x`.
+#[cfg(windows)]
+fn strip_verbatim(p: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut parts = p.components();
+    let plain = match parts.next() {
+        Some(Component::Prefix(pre)) => match pre.kind() {
+            Prefix::VerbatimDisk(d) => format!("{}:", d as char),
+            Prefix::VerbatimUNC(srv, share) => {
+                format!(r"\\{}\{}", srv.to_string_lossy(), share.to_string_lossy())
+            }
+            _ => return p.to_owned(),
+        },
+        _ => return p.to_owned(),
+    };
+    let mut out = PathBuf::from(plain);
+    out.push(parts.as_path());
+    out
 }
 
 #[cfg(windows)]
@@ -1022,6 +1056,35 @@ pub fn is_same_file(a: &Path, b: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_drops_only_the_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\a\b")),
+            Path::new(r"C:\a\b")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\srv\share\a")),
+            Path::new(r"\\srv\share\a")
+        );
+        assert_eq!(strip_verbatim(Path::new(r"C:\a")), Path::new(r"C:\a"));
+    }
+
+    // A data dir spelled differently from the disk (here the case; 8.3 names
+    // behave the same) must still own the links read_link finds.
+    #[cfg(windows)]
+    #[test]
+    fn read_link_targets_start_with_the_on_disk_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("Data").join("bin")).unwrap();
+        let data = on_disk_spelling(&tmp.path().join("DATA"));
+        assert!(data.ends_with("Data"));
+        let exe = data.join("tree.exe");
+        fs::write(&exe, "").unwrap();
+        let link = data.join("bin").join("tree.exe");
+        create_link(&exe, &link).unwrap();
+        assert!(read_link(&link).unwrap().starts_with(&data));
+    }
     // ---- create_alias_link ----
 
     #[cfg(unix)]

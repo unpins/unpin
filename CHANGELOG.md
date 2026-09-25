@@ -26,6 +26,9 @@ Versioning](https://semver.org).
   clean` removes them.
 - Installing a multicall package (e.g. `mtools`) no longer warns that its
   own name "is provided by more than one binary in this package".
+- Windows: when `%LOCALAPPDATA%` was spelled differently from the disk (an
+  8.3 short name, or other capitals), `unpin clean` removed installed
+  versions as orphans.
 
 ### Security
 - Built on nixpkgs 26.05 (was 25.11), with the catalog's musl CVE patches.

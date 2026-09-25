@@ -1514,6 +1514,9 @@ mod tests {
     }
 
     fn paths_with_data(tmp: &Path) -> Paths {
+        // As `Paths::resolve` spells them (the CI runner's %TEMP% is 8.3).
+        #[cfg(windows)]
+        let tmp = &platform::on_disk_spelling(tmp);
         Paths {
             data: tmp.join("data"),
             bin: tmp.join("bin"),
