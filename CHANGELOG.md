@@ -20,8 +20,10 @@ Versioning](https://semver.org).
   "redefinition of 'vasprintf'".
 - Two `unpin` processes working on the same package could both proceed at
   once — often on Windows, rarely elsewhere — and `clean` could remove a
-  version the self-install had just placed. An interrupted or failed install
-  no longer leaves empty directories or lock files behind.
+  version the self-install had just placed. A failed install no longer
+  leaves empty directories or lock files behind, nor does an interrupted one
+  except on Windows, where the next operation on that package or `unpin
+  clean` removes them.
 - Installing a multicall package (e.g. `mtools`) no longer warns that its
   own name "is provided by more than one binary in this package".
 
