@@ -120,13 +120,30 @@ fn part_dir_for(vdir: &Path) -> PathBuf {
     vdir.with_file_name(name)
 }
 
-/// Remove a version dir, moved aside first: a removal cut short must not
-/// leave a partial version that reads as installed.
+/// Remove a version dir and its `.part`, the version moved aside first: a
+/// removal cut short must not leave a partial version that reads as installed.
 pub(super) fn remove_version(vdir: &Path) -> Result<(), String> {
     let part = part_dir_for(vdir);
     remove_part(&part)?;
+    if !vdir.is_dir() {
+        return Ok(());
+    }
     fs::rename(vdir, &part).map_err(|e| format!("move {} aside: {e}", vdir.display()))?;
     remove_part(&part)
+}
+
+/// Remove a repo dir, each version as [`remove_version`] does.
+pub(crate) fn remove_repo(rdir: &Path) -> Result<(), String> {
+    let versions = fs::read_dir(rdir).map_err(|e| format!("read {}: {e}", rdir.display()))?;
+    for v in versions.flatten() {
+        let name = v.file_name();
+        if v.file_type().is_ok_and(|t| t.is_dir())
+            && !super::is_part_dir_name(&name.to_string_lossy())
+        {
+            remove_version(&v.path())?;
+        }
+    }
+    fs::remove_dir_all(rdir).map_err(|e| format!("remove {}: {e}", rdir.display()))
 }
 
 /// Remove a `.part` dir. An interrupt stops the removal and finishes it
@@ -216,12 +233,7 @@ fn resolve_checksum_for(
 /// Acquire the per-repo lock and tear down any leftover staging from a
 /// previous attempt. The lock is held by the returned `RepoLock`; callers
 /// place it in `ExtractJob._lock` so it lives through extract + linking.
-fn prepare_workspace_dirs(
-    paths: &Paths,
-    spec: &Spec,
-    vdir: &Path,
-    extract_dir: &Path,
-) -> Result<RepoLock, String> {
+fn prepare_workspace_dirs(paths: &Paths, spec: &Spec, vdir: &Path) -> Result<RepoLock, String> {
     // Acquire the cross-process lock *after* every user prompt (asset picker
     // AND the missing-checksum confirm) and *before* the first destructive
     // write. Holding it through a prompt would force a parallel install on the
@@ -232,10 +244,7 @@ fn prepare_workspace_dirs(
     // extract and rename — without this the second attempt would start from a
     // half-populated tree and `archive::extract` would error on the first entry
     // that collides.
-    remove_part(extract_dir)?;
-    if vdir.is_dir() {
-        remove_version(vdir)?;
-    }
+    remove_version(vdir)?;
     Ok(lock)
 }
 
@@ -312,7 +321,7 @@ pub fn preflight_extract(
     // All prompts are done — now take the lock and clear stale staging, the
     // smallest window that still fully covers the destructive extract.
     let extract_dir = part_dir_for(&vdir);
-    let lock = prepare_workspace_dirs(&ctx.paths, &spec, &vdir, &extract_dir)?;
+    let lock = prepare_workspace_dirs(&ctx.paths, &spec, &vdir)?;
     Ok(ExtractJob {
         spec,
         release,
@@ -354,30 +363,21 @@ fn join_or_resume<T>(h: thread::ScopedJoinHandle<'_, T>) -> T {
 /// morphs it through Linking → Installed; the single-package `run` path calls
 /// `Reporter::done_*` / `download_failed`).
 ///
-/// Per-job cleanup (sigint hook + CleanupGuard) is armed against the
-/// `.part` directory and only disarmed once `fs::rename(.part → vdir)`
-/// succeeds. A failed or interrupted extract removes `.part`; one killed
-/// outright leaves only `.part` on disk, so the next `vdir.is_dir()` cache
-/// check correctly classifies the package as not installed.
+/// A failed or interrupted extract removes `.part`; one killed outright leaves
+/// only `.part` on disk, so the next `vdir.is_dir()` cache check correctly
+/// classifies the package as not installed.
 pub fn do_extract(ctx: &Ctx, job: &ExtractJob, ui: &Ui, sinks: &DlSinks) -> Result<(), String> {
     let Some(primary_asset) = job.asset.as_ref() else {
         return Ok(()); // cached
     };
-    crate::sigint::check()?;
     let rdir = ctx.paths.repo_dir(&job.spec.owner, &job.spec.name);
     fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
     crate::sigint::push_cleanup(&job.extract_dir);
-    let result = crate::sigint::InFlight::enter().and_then(|flight| {
-        let mut guard = CleanupGuard::arm(job.extract_dir.clone());
-        let result = extract_and_publish(job, primary_asset, ctx, ui, sinks);
-        if result.is_ok() {
-            guard.disarm();
-        }
-        // The interrupt handler waits on the in-flight count: `.part` goes first.
-        drop(guard);
-        drop(flight);
-        result
-    });
+    let result = crate::sigint::InFlight::enter()
+        .and_then(|_flight| extract_and_publish(job, primary_asset, ctx, ui, sinks));
+    if result.is_err() {
+        let _ = remove_part(&job.extract_dir);
+    }
     // Even on failure: the caller then releases the lock, and another process
     // may reuse this `.part`.
     crate::sigint::pop_cleanup(&job.extract_dir);
@@ -398,8 +398,7 @@ fn extract_and_publish(
     {
         // Run primary + companion in parallel. They write disjoint subtrees
         // (bin/ vs share/), so there's no contention; the join below
-        // propagates the first error. CleanupGuard wipes the .part dir for
-        // a clean retry. Each leg gets its own `Ui` clone — the live handle's
+        // propagates the first error. Each leg gets its own `Ui` clone — the live handle's
         // mpsc sender is `Send` but not `Sync`, so the two scoped threads
         // can't share a borrow of it.
         let (ui_p, ui_c) = (ui.clone(), ui.clone());
@@ -446,8 +445,7 @@ fn extract_and_publish(
         )
     };
 
-    // Also catches a cancel the drain in `download_extract_verify` swallowed.
-    result.and_then(|()| crate::sigint::check()).and_then(|()| {
+    result.and_then(|()| {
         // Atomic publish step. The two paths are siblings under the same
         // parent dir (same filesystem on every supported OS), so rename is
         // a metadata-only operation — no half-rename window. After this
@@ -499,7 +497,7 @@ fn download_extract_verify(
     // Defensive: every extractor today drains its input to EOF, but make
     // the byte count and the hash reflect the whole response regardless
     // of which path was taken — cheap insurance for future formats.
-    let _ = io::copy(&mut hashing, &mut io::sink());
+    io::copy(&mut hashing, &mut io::sink()).map_err(|e| format!("read {}: {e}", asset.name))?;
     let got_bytes = sink.loaded();
     let got = hashing.finalize_hex();
     if let Some(expected) = expected_sha256 {
@@ -545,26 +543,6 @@ pub(super) fn finalize_primary_row(
     match result {
         Ok(()) => reporter.clear(idx),
         Err(e) => reporter.download_failed(idx, bytes, e.clone()),
-    }
-}
-
-struct CleanupGuard {
-    path: PathBuf,
-    armed: bool,
-}
-impl CleanupGuard {
-    fn arm(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_dir_all(&self.path);
-        }
     }
 }
 
@@ -1260,7 +1238,7 @@ fn check_replace_active(
 fn into_extract_job(paths: &Paths, spec: Spec, data: ResolutionData) -> Result<ExtractJob, String> {
     let vdir = paths.version_dir(&spec.owner, &spec.name, &data.release.tag_name);
     let extract_dir = part_dir_for(&vdir);
-    let lock = prepare_workspace_dirs(paths, &spec, &vdir, &extract_dir)?;
+    let lock = prepare_workspace_dirs(paths, &spec, &vdir)?;
     Ok(ExtractJob {
         spec,
         release: data.release,

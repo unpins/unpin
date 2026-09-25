@@ -24,6 +24,7 @@ use linker::{
     walk_binary_candidates,
 };
 pub use pipeline::InstallOptions;
+pub(crate) use pipeline::remove_repo;
 use pipeline::{do_extract, finalize_primary_row, preflight_extract, run_pipeline_v2};
 use prompt::{PromptResult, plain_pick};
 use spec::validate_path_component;
@@ -296,13 +297,7 @@ pub(super) fn prompt_yes_no(question: &str) -> bool {
     matches!(line.trim_start().chars().next(), Some('y' | 'Y'))
 }
 
-// Held for the smallest window that fully covers the destructive operation:
-// pipeline.rs holds one from preflight through linking; clean and uninstall_one
-// each grab one for their `remove_dir_all` pass; the self-install holds one
-// from placing its binary through linking. Reads (info, list) deliberately
-// skip it — they tolerate the occasional racy result instead of paying for
-// serialization.
-pub(crate) use platform::InstallLock as RepoLock;
+pub(crate) use platform::RepoLock;
 
 pub(super) fn fetch_release(ctx: &Ctx, spec: &Spec) -> Result<Release, String> {
     fetch_release_typed(ctx, spec).map_err(Into::into)
@@ -753,10 +748,7 @@ fn uninstall_one(paths: &Paths, name: &str, quiet: bool) -> Result<(), String> {
             }
             return Ok(());
         }
-        for v in &versions {
-            pipeline::remove_version(&rdir.join(v))?;
-        }
-        fs::remove_dir_all(&rdir).map_err(|e| format!("remove {}: {e}", rdir.display()))?;
+        remove_repo(&rdir)?;
     }
 
     if !quiet {
@@ -1037,7 +1029,7 @@ pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
         // Releasing it also removes a lock file a killed process left behind,
         // with or without a repo dir. 0.4 kept the lock inside the repo dir,
         // and never removed it.
-        let _ = fs::remove_file(rdir.join(".unpin.lock"));
+        let _ = fs::remove_file(platform::legacy_install_lock_path(&rdir));
         // Listed up front: removing a version adds its `.part` to the dir.
         let versions: Vec<_> = match fs::read_dir(&rdir) {
             Ok(e) => e.flatten().collect(),
@@ -1475,7 +1467,6 @@ mod tests {
 
     fn paths_with_data(tmp: &Path) -> Paths {
         // As `Paths::resolve` spells them (the CI runner's %TEMP% is 8.3).
-        #[cfg(windows)]
         let tmp = &platform::on_disk_spelling(tmp);
         Paths {
             data: tmp.join("data"),
@@ -1666,12 +1657,12 @@ mod tests {
         fs::create_dir_all(exe.parent().unwrap()).unwrap();
         fs::write(&exe, "").unwrap();
         platform::create_link(&exe, &paths.bin.join("tree")).unwrap();
-        fs::write(rdir.join(".unpin.lock"), "").unwrap();
+        fs::write(platform::legacy_install_lock_path(&rdir), "").unwrap();
 
         clean(&paths, true).unwrap();
 
         assert!(exe.exists());
-        assert!(!rdir.join(".unpin.lock").exists());
+        assert!(!platform::legacy_install_lock_path(&rdir).exists());
     }
 
     #[test]

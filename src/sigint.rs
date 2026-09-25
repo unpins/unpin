@@ -24,16 +24,8 @@ static CLEANUP: Mutex<State> = Mutex::new(State {
     child: false,
 });
 
-/// Lock `CLEANUP`, recovering the guard if the mutex was poisoned.
-///
-/// A poisoned mutex means some thread panicked while holding this lock. The
-/// guarded value is a `Vec` of *transient* entries (`.part` dirs and
-/// held locks) with no cross-field invariant a half-finished
-/// `push`/`drain`/`retain` could corrupt, so the contents are always
-/// well-formed regardless of where a panic landed. Refusing the lock on poison
-/// (the old `if let Ok(g)`) would have silently disabled cleanup — the
-/// interrupt handler would skip it and leak `.part`/`.lock` litter. Recovering
-/// keeps the cleanup path working, which is the one path where it matters most.
+/// Lock `CLEANUP`, recovering it if poisoned: the entries have no invariant a
+/// panic can break, and refusing the lock would skip the cleanup on ctrl-c.
 fn lock_cleanup() -> MutexGuard<'static, State> {
     CLEANUP.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -130,11 +122,7 @@ pub fn cancelled() -> bool {
 
 /// `Err` once cancelled, for the extraction's checkpoints.
 pub fn check() -> Result<(), String> {
-    if cancelled() {
-        Err("interrupted".into())
-    } else {
-        Ok(())
-    }
+    check_io().map_err(|e| e.to_string())
 }
 
 /// The same, for readers and writers. Not `ErrorKind::Interrupted`, which
@@ -152,12 +140,9 @@ pub fn check_io() -> std::io::Result<()> {
 pub struct InFlight(());
 impl InFlight {
     pub fn enter() -> Result<Self, String> {
-        let before = STOP.fetch_add(1, SeqCst);
+        STOP.fetch_add(1, SeqCst);
         let this = Self(());
-        if before & CANCELLED != 0 {
-            return Err("interrupted".into());
-        }
-        Ok(this)
+        check().map(|()| this)
     }
 }
 impl Drop for InFlight {
@@ -214,8 +199,7 @@ mod tests {
 
     #[test]
     fn cleanup_survives_a_poisoned_mutex() {
-        // Poison CLEANUP: panic while holding the guard (its Drop marks the
-        // mutex poisoned during unwinding). The thread's panic message on
+        // Poison CLEANUP: panic while holding the guard. The panic message on
         // stderr is expected test noise.
         let _ = std::thread::spawn(|| {
             let _g = lock_cleanup();
@@ -223,9 +207,6 @@ mod tests {
         })
         .join();
 
-        // With the old `if let Ok(g) = CLEANUP.lock()`, every call below would
-        // silently no-op and the interrupt handler would skip cleanup. With
-        // poison recovery, registration still works end to end.
         let p = PathBuf::from("unpin-poison-test.part");
         let registered = |c: &Cleanup| matches!(c, Cleanup::Dir(d) if *d == p);
         push_cleanup(&p);

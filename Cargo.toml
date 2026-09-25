@@ -36,8 +36,9 @@ cap-std = { version = "4.0.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # Hardlink-name enumeration (FindFirstFileNameW) and file identity
-# (GetFileInformationByHandle) for the bin-dir hardlink bookkeeping.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+# (GetFileInformationByHandle) for the bin-dir hardlink bookkeeping; the
+# user Path in the registry, and the WM_SETTINGCHANGE that announces it.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile = "3"

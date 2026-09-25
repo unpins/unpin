@@ -434,7 +434,7 @@ pub fn link_all_executables(
     // rather than taking a declinable prompt. A foreign file the user might
     // decline never pointed into rdir, so it was never in `existing_managed`.
     // Anything left here is genuinely gone. (A concurrent external swap in the
-    // sweep→classify window is the only gap, and InstallLock serializes us.)
+    // sweep→classify window is the only gap, and RepoLock serializes us.)
     let mut orphans = Vec::new();
     for old in &existing_managed {
         if !refreshed.iter().any(|r| r == old) {

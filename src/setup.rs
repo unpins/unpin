@@ -245,7 +245,7 @@ fn janitor_delete_dir(dir: &Path) {
     use std::time::Duration;
     for _ in 0..50 {
         if let Ok(_lock) = install::RepoLock::acquire(dir)
-            && (!dir.exists() || fs::remove_dir_all(dir).is_ok())
+            && (!dir.exists() || install::remove_repo(dir).is_ok())
         {
             return;
         }
@@ -564,8 +564,9 @@ fn plan_path_change(bin: &Path) -> Result<PathPlan, String> {
 
 #[cfg(windows)]
 fn apply_path_change(bin: &Path) -> Result<PathOutcome, String> {
-    let (path, kind) = read_user_path()?;
-    if path.split(';').any(|e| names_dir(e, bin)) {
+    let (path, expand) =
+        platform::read_user_path().map_err(|e| format!("read your user PATH: {e}"))?;
+    if path.split(';').any(|e| platform::names_dir(e, bin)) {
         return Ok(PathOutcome::Added(format!(
             "{} was already in your user PATH. Open a new terminal to use it.",
             bin.display()
@@ -578,7 +579,7 @@ fn apply_path_change(bin: &Path) -> Result<PathOutcome, String> {
     } else {
         format!("{path};{bin_disp}")
     };
-    write_user_path(&new, &kind)?;
+    platform::write_user_path(&new, expand).map_err(|e| format!("update your user PATH: {e}"))?;
     Ok(PathOutcome::Added(format!(
         "Added {bin_disp} to your user PATH. Open a new terminal to use it."
     )))
@@ -593,124 +594,18 @@ fn apply_path_change(bin: &Path) -> Result<PathOutcome, String> {
 /// so the profile edit is left in place there.
 #[cfg(windows)]
 pub fn remove_dir_from_user_path(dir: &Path) -> Result<bool, String> {
-    let (path, kind) = read_user_path()?;
+    let (path, expand) =
+        platform::read_user_path().map_err(|e| format!("read your user PATH: {e}"))?;
     let kept: Vec<&str> = path
         .split(';')
-        .filter(|e| !e.is_empty() && !names_dir(e, dir))
+        .filter(|e| !e.is_empty() && !platform::names_dir(e, dir))
         .collect();
     let new = kept.join(";");
     if new == path {
         return Ok(false);
     }
-    write_user_path(&new, &kind)?;
+    platform::write_user_path(&new, expand).map_err(|e| format!("update your user PATH: {e}"))?;
     Ok(true)
-}
-
-/// Whether a user `Path` entry names `dir`, however it is spelled: `%VAR%`s,
-/// another case, a trailing `\`, an 8.3 name or a junction.
-#[cfg(windows)]
-fn names_dir(entry: &str, dir: &Path) -> bool {
-    let entry = expand_env(entry, |k| std::env::var(k).ok());
-    let entry = Path::new(entry.trim_end_matches('\\'));
-    let same = |a: &Path, b: &Path| a.as_os_str().eq_ignore_ascii_case(b.as_os_str());
-    // Only a likely match is resolved: an entry on a dead network drive can
-    // take seconds.
-    same(entry, dir)
-        || entry
-            .file_name()
-            .zip(dir.file_name())
-            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
-            && crate::platform::on_disk_spelling(entry) == dir
-}
-
-/// `%NAME%` replaced by `var(NAME)`, as Windows expands a `REG_EXPAND_SZ`; an
-/// unknown name is left as written.
-// Only Windows calls it; its tests run everywhere.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn expand_env(s: &str, var: impl Fn(&str) -> Option<String>) -> String {
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find('%') {
-        out.push_str(&rest[..i]);
-        let after = &rest[i + 1..];
-        match after.find('%') {
-            Some(j) => match var(&after[..j]) {
-                Some(v) if j > 0 => {
-                    out.push_str(&v);
-                    rest = &after[j + 1..];
-                }
-                // Not a variable: keep the `%` and rescan from the next one.
-                _ => {
-                    out.push('%');
-                    rest = after;
-                }
-            },
-            None => {
-                out.push('%');
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// The user `Path` as stored — `%VAR%`s unexpanded — and its registry type.
-/// `[Environment]::GetEnvironmentVariable` would expand them, and writing that
-/// back freezes them.
-#[cfg(windows)]
-fn read_user_path() -> Result<(String, String), String> {
-    let out = powershell(
-        "$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment'); \
-         if ($k -and $k.GetValueNames() -contains 'Path') { \
-             $k.GetValueKind('Path').ToString(); \
-             $k.GetValue('Path', '', 'DoNotExpandEnvironmentNames') \
-         } else { 'ExpandString'; '' }",
-    )?;
-    let mut lines = out.lines();
-    let kind = lines.next().unwrap_or_default().trim().to_owned();
-    let path = lines
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('\r')
-        .to_owned();
-    if kind != "String" && kind != "ExpandString" {
-        return Err(format!("your user PATH is a registry {kind}, not a string"));
-    }
-    Ok((path, kind))
-}
-
-/// Store `path` as the user `Path`, keeping its registry type, and tell running
-/// programs so new terminals see it.
-#[cfg(windows)]
-fn write_user_path(path: &str, kind: &str) -> Result<(), String> {
-    // PowerShell single-quoted literal: the only escape is `'` → `''`.
-    let escaped = path.replace('\'', "''");
-    // Removing a variable that isn't there changes nothing, but broadcasts the
-    // WM_SETTINGCHANGE a raw registry write doesn't.
-    powershell(&format!(
-        "$k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment'); \
-         $k.SetValue('Path', '{escaped}', '{kind}'); \
-         [Environment]::SetEnvironmentVariable('unpin-no-such-variable', $null, 'User')"
-    ))
-    .map(drop)
-}
-
-/// Run `script` in Windows PowerShell; its stdout, read as UTF-8.
-#[cfg(windows)]
-fn powershell(script: &str) -> Result<String, String> {
-    let script = format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; {script}");
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map_err(|e| format!("run powershell to update PATH: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "powershell failed to update PATH: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(all(test, unix))]
@@ -792,35 +687,5 @@ mod tests {
             bin
         ));
         assert!(!profile_has_path_entry("", bin));
-    }
-}
-
-#[cfg(all(test, windows))]
-mod windows_tests {
-    use super::*;
-
-    #[test]
-    fn names_dir_ignores_case_and_a_trailing_backslash() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = crate::platform::on_disk_spelling(tmp.path());
-        let spelled = format!("{}\\", dir.display()).to_uppercase();
-        assert!(names_dir(&spelled, &dir));
-        assert!(!names_dir(&format!("{}x", dir.display()), &dir));
-    }
-}
-
-#[cfg(test)]
-mod expand_tests {
-    use super::expand_env;
-
-    #[test]
-    fn expand_env_replaces_known_names_and_keeps_the_rest() {
-        let var = |k: &str| (k == "HOME").then(|| r"C:\Users\u".to_owned());
-        assert_eq!(expand_env(r"%HOME%\bin", var), r"C:\Users\u\bin");
-        assert_eq!(expand_env(r"%NOPE%\bin", var), r"%NOPE%\bin");
-        assert_eq!(expand_env("100%", var), "100%");
-        assert_eq!(expand_env("%%HOME%", var), r"%C:\Users\u");
-        assert_eq!(expand_env("a%NOPE%HOME%b", var), "a%NOPEC:\\Users\\ub");
-        assert_eq!(expand_env("plain", var), "plain");
     }
 }

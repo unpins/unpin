@@ -92,12 +92,157 @@ fn nonempty_env(key: &str) -> Option<String> {
 /// `p` as the filesystem spells it: long names instead of 8.3 ones, and the
 /// on-disk case. That is the spelling [`read_link`] returns, which callers
 /// compare with `starts_with` against [`Paths`]: a mismatch hides a managed
-/// link, and `clean` then removes the version it points at. (On Unix a
-/// symlink's target is spelled as it was written.) Unchanged if `p` can't be
-/// resolved.
-#[cfg(windows)]
+/// link, and `clean` then removes the version it points at. Unchanged if `p`
+/// can't be resolved, and on Unix, where a symlink's target is spelled as it
+/// was written.
+#[cfg(any(windows, test))]
 pub fn on_disk_spelling(p: &Path) -> PathBuf {
-    fs::canonicalize(p).map_or_else(|_| p.to_owned(), |c| strip_verbatim(&c))
+    #[cfg(windows)]
+    return fs::canonicalize(p).map_or_else(|_| p.to_owned(), |c| strip_verbatim(&c));
+    #[cfg(not(windows))]
+    p.to_owned()
+}
+
+/// Whether a user `Path` entry names `dir`, however it is spelled: `%VAR%`s,
+/// another case, a trailing `\`, an 8.3 name or a junction.
+#[cfg(windows)]
+pub fn names_dir(entry: &str, dir: &Path) -> bool {
+    let entry = expand_env(entry, |k| std::env::var(k).ok());
+    let entry = Path::new(entry.trim_end_matches('\\'));
+    // Only a likely match is resolved: an entry on a dead network drive can
+    // take seconds.
+    entry.as_os_str().eq_ignore_ascii_case(dir.as_os_str())
+        || entry
+            .file_name()
+            .zip(dir.file_name())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+            && on_disk_spelling(entry) == dir
+}
+
+/// `%NAME%` replaced by `var(NAME)`, as Windows expands a `REG_EXPAND_SZ`; an
+/// unknown name is left as written.
+#[cfg(any(windows, test))]
+fn expand_env(s: &str, var: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let known = after
+            .find('%')
+            .filter(|&j| j > 0)
+            .and_then(|j| Some((j, var(&after[..j])?)));
+        match known {
+            Some((j, v)) => {
+                out.push_str(&v);
+                rest = &after[j + 1..];
+            }
+            // Not a variable: keep the `%` and rescan from the next one.
+            None => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+
+/// The user `Path` as the registry stores it — `%VAR%`s unexpanded — and
+/// whether it is a `REG_EXPAND_SZ`; empty (and expandable) when unset.
+#[cfg(windows)]
+pub fn read_user_path() -> io::Result<(String, bool)> {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, REG_EXPAND_SZ, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+        RegGetValueW,
+    };
+    let (key, name) = (wide("Environment"), wide("Path"));
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    // The first call, with no buffer, asks for the size.
+    let mut buf: Vec<u16> = Vec::new();
+    loop {
+        let mut kind = 0;
+        let mut bytes = (buf.len() * 2) as u32;
+        let data = if buf.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buf.as_mut_ptr().cast()
+        };
+        // SAFETY: `data` is null or `bytes` long; the names are NUL-terminated.
+        let rc = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                name.as_ptr(),
+                flags,
+                &mut kind,
+                data,
+                &mut bytes,
+            )
+        };
+        match rc {
+            ERROR_SUCCESS if !buf.is_empty() => {
+                buf.truncate(bytes as usize / 2);
+                while buf.last() == Some(&0) {
+                    buf.pop();
+                }
+                let path = String::from_utf16(&buf)
+                    .map_err(|_| io::Error::other("it is not valid Unicode"))?;
+                return Ok((path, kind == REG_EXPAND_SZ));
+            }
+            ERROR_SUCCESS | ERROR_MORE_DATA => buf.resize(bytes as usize / 2 + 1, 0),
+            ERROR_FILE_NOT_FOUND => return Ok((String::new(), true)),
+            e => return Err(io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+}
+
+/// Store `path` as the user `Path`, and tell running programs so that new
+/// terminals see it.
+#[cfg(windows)]
+pub fn write_user_path(path: &str, expand: bool) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, REG_EXPAND_SZ, REG_SZ, RegSetKeyValueW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+    };
+    let (key, name, data) = (wide("Environment"), wide("Path"), wide(path));
+    let kind = if expand { REG_EXPAND_SZ } else { REG_SZ };
+    // SAFETY: every pointer is to a live NUL-terminated buffer of the given size.
+    let rc = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            kind,
+            data.as_ptr().cast(),
+            (data.len() * 2) as u32,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(rc as i32));
+    }
+    // SAFETY: `key` names the changed section, as WM_SETTINGCHANGE expects.
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            key.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            1000,
+            std::ptr::null_mut(),
+        )
+    };
+    Ok(())
 }
 
 /// `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share\x` → `\\srv\share\x`.
@@ -823,8 +968,13 @@ fn names_same_file(file: &fs::File, path: &Path) -> bool {
 
 /// Per-package lock, held while a package's repo dir is changed. Dropping it
 /// releases the lock and removes its file (see [`HeldFile`]).
+///
+/// Held for the smallest window that fully covers the destructive operation:
+/// the pipeline from preflight through linking, clean and uninstall for their
+/// removals, the self-install from placing its binary through linking. Reads
+/// (info, list) skip it and tolerate the occasional racy result.
 #[derive(Debug)]
-pub struct InstallLock {
+pub struct RepoLock {
     _held: crate::sigint::Held,
 }
 
@@ -847,13 +997,19 @@ pub fn install_lock_repo(file_name: &str) -> Option<&str> {
         .filter(|r| !r.is_empty())
 }
 
-/// Acquire the exclusive lock of the package whose repo dir is `repo_dir`,
-/// without waiting. Two `unpin` processes touching the same package serialize
-/// here; different packages run fully in parallel. The repo dir itself is not
-/// created — the caller does that once it holds the lock. Releasing the lock
-/// also removes the repo dir if it is empty, and then the owner dir if that is.
-impl InstallLock {
-    pub fn acquire(repo_dir: &Path) -> Result<InstallLock, String> {
+/// Where 0.4 kept the lock: inside the repo dir, and never removed.
+pub fn legacy_install_lock_path(repo_dir: &Path) -> PathBuf {
+    repo_dir.join(".unpin.lock")
+}
+
+impl RepoLock {
+    /// Acquire the exclusive lock of the package whose repo dir is `repo_dir`,
+    /// without waiting. Two `unpin` processes touching the same package
+    /// serialize here; different packages run fully in parallel. The repo dir
+    /// itself is not created — the caller does that once it holds the lock.
+    /// Releasing the lock also removes the repo dir if it is empty, and then
+    /// the owner dir if that is.
+    pub fn acquire(repo_dir: &Path) -> Result<RepoLock, String> {
         let lock_path = install_lock_path(repo_dir);
         let Some(held) = acquire_lock_file(&lock_path, Some(repo_dir), None::<fn()>)? else {
             return Err(format!(
@@ -871,19 +1027,19 @@ impl InstallLock {
             let _ = f.seek(SeekFrom::Start(0));
             let _ = writeln!(f, "pid={}", std::process::id());
         }
-        Ok(InstallLock {
+        Ok(RepoLock {
             _held: crate::sigint::hold(held),
         })
     }
 }
 
 /// Process-wide exclusive lock guarding mutations of the shared `bin_dir`
-/// (link create + orphan cleanup). The per-package [`InstallLock`]
+/// (link create + orphan cleanup). The per-package [`RepoLock`]
 /// only covers a repo's own `repo_dir`; `bin_dir` is shared across every
 /// package, so without this two `unpin` processes installing *different*
 /// packages could interleave their link writes (lost links, an orphan sweep
 /// deleting the other's fresh link). Its file exists only while it is held,
-/// like [`InstallLock`]'s (see [`HeldFile`]).
+/// like [`RepoLock`]'s (see [`HeldFile`]).
 #[derive(Debug)]
 pub struct LinksLock {
     _held: crate::sigint::Held,
@@ -1076,6 +1232,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn expand_env_replaces_known_names_and_keeps_the_rest() {
+        let var = |k: &str| (k == "HOME").then(|| r"C:\Users\u".to_owned());
+        assert_eq!(expand_env(r"%HOME%\bin", var), r"C:\Users\u\bin");
+        assert_eq!(expand_env(r"%NOPE%\bin", var), r"%NOPE%\bin");
+        assert_eq!(expand_env("100%", var), "100%");
+        assert_eq!(expand_env("%%HOME%", var), r"%C:\Users\u");
+        assert_eq!(expand_env("a%NOPE%HOME%b", var), r"a%NOPEC:\Users\ub");
+        assert_eq!(expand_env("plain", var), "plain");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn names_dir_ignores_case_and_a_trailing_backslash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = on_disk_spelling(tmp.path());
+        let spelled = format!("{}\\", dir.display()).to_uppercase();
+        assert!(names_dir(&spelled, &dir));
+        assert!(!names_dir(&format!("{}x", dir.display()), &dir));
+    }
+
+    #[test]
     fn install_lock_repo_needs_a_name() {
         assert_eq!(install_lock_repo("htop~lock"), Some("htop"));
         assert_eq!(install_lock_repo("~lock"), None);
@@ -1210,13 +1387,13 @@ mod tests {
         assert_eq!(f, "rg.exe");
     }
 
-    // ---- InstallLock ----
+    // ---- RepoLock ----
 
     #[test]
     fn install_lock_lives_beside_the_repo_dir_and_drop_removes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
-        let lock = InstallLock::acquire(&repo).unwrap();
+        let lock = RepoLock::acquire(&repo).unwrap();
         let lock_path = tmp.path().join("owner/name~lock");
         assert!(lock_path.exists());
         // The repo dir is the caller's to create, and can go while held.
@@ -1232,13 +1409,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
         // An install that created its repo dir and then failed.
-        let lock = InstallLock::acquire(&repo).unwrap();
+        let lock = RepoLock::acquire(&repo).unwrap();
         fs::create_dir_all(&repo).unwrap();
         drop(lock);
         assert!(!repo.exists());
         assert!(!tmp.path().join("owner").exists());
         // One that left a version behind keeps it.
-        let lock = InstallLock::acquire(&repo).unwrap();
+        let lock = RepoLock::acquire(&repo).unwrap();
         fs::create_dir_all(repo.join("v1")).unwrap();
         drop(lock);
         assert!(repo.join("v1").is_dir());
@@ -1249,7 +1426,7 @@ mod tests {
     fn install_lock_release_keeps_an_owner_dir_still_in_use() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("owner/other")).unwrap();
-        drop(InstallLock::acquire(&tmp.path().join("owner/name")).unwrap());
+        drop(RepoLock::acquire(&tmp.path().join("owner/name")).unwrap());
         assert!(tmp.path().join("owner/other").is_dir());
     }
 
@@ -1257,8 +1434,8 @@ mod tests {
     fn install_lock_second_acquire_fails_while_first_held() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
-        let lock = InstallLock::acquire(&repo).unwrap();
-        let err = InstallLock::acquire(&repo).unwrap_err();
+        let lock = RepoLock::acquire(&repo).unwrap();
+        let err = RepoLock::acquire(&repo).unwrap_err();
         assert!(err.contains("in progress"), "got: {err}");
         // Giving up must not remove the holder's file.
         assert!(install_lock_path(&repo).exists());
@@ -1274,9 +1451,9 @@ mod tests {
         // released → second acquire succeeds.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
-        let first = InstallLock::acquire(&repo).unwrap();
+        let first = RepoLock::acquire(&repo).unwrap();
         drop(first);
-        let _second = InstallLock::acquire(&repo).unwrap();
+        let _second = RepoLock::acquire(&repo).unwrap();
         assert!(install_lock_path(&repo).exists());
     }
 
@@ -1290,7 +1467,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("owner")).unwrap();
         let lock_path = install_lock_path(&repo);
         fs::write(&lock_path, "pid=99999\n").unwrap();
-        drop(InstallLock::acquire(&repo).unwrap());
+        drop(RepoLock::acquire(&repo).unwrap());
         assert!(!lock_path.exists());
     }
 
@@ -1337,7 +1514,7 @@ mod tests {
     fn install_lock_excludes_under_contention() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
-        assert!(assert_exclusive(|| InstallLock::acquire(&repo).ok()) > 0);
+        assert!(assert_exclusive(|| RepoLock::acquire(&repo).ok()) > 0);
         assert!(!install_lock_path(&repo).exists());
     }
 
