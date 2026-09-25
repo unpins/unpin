@@ -21,9 +21,12 @@ Versioning](https://semver.org).
 - Two `unpin` processes working on the same package could both proceed at
   once — often on Windows, rarely elsewhere — and `clean` could remove a
   version the self-install had just placed. A failed or interrupted install
-  no longer leaves lock files or empty directories behind. (On Windows, one
-  interrupted while extracting still leaves its `.part` folder, which the
-  next install of that package or `unpin clean` removes.)
+  no longer leaves lock files, empty directories or (on Windows) its `.part`
+  folder behind, and a ctrl-c after one package had failed could remove
+  another `unpin`'s install of that package while it was running.
+- ctrl-c while `unpin run` waits for its program goes to the program
+  alone, and its exit code is unpin's. unpin used to exit under it, leaving
+  a program that handles ctrl-c (vim, a Python prompt) running on its own.
 - Installing a multicall package (e.g. `mtools`) no longer warns that its
   own name "is provided by more than one binary in this package".
 - Windows: when `%LOCALAPPDATA%` was spelled differently from the disk (an

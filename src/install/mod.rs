@@ -1374,8 +1374,7 @@ fn run_binary(spec: &Spec, vdir: &Path, args: &[String], assume_yes: bool) -> Re
 
     let mut cmd = Command::new(&bin);
     cmd.args(args);
-    let status = cmd
-        .status()
+    let status = crate::sigint::with_child(|| cmd.status())
         .map_err(|e| format!("exec {}: {e}", bin.display()))?;
     match status.code() {
         Some(code) => Ok(code),

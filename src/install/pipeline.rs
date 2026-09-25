@@ -182,17 +182,23 @@ fn prepare_workspace_dirs(
     // write. Holding it through a prompt would force a parallel install on the
     // same package to error out while the user is at coffee.
     let lock = RepoLock::acquire(&paths.repo_dir(&spec.owner, &spec.name))?;
+    // Counted as in flight, so an interrupt waits instead of cutting it short.
+    let _flight = crate::sigint::InFlight::new();
+    crate::sigint::check()?;
     // --pick (or incomplete cache) on a cached version: wipe before re-extracting.
     // Also wipe a leftover `.part` from a previous run that got SIGKILL'd between
     // extract and rename — without this the second attempt would start from a
     // half-populated tree and `archive::extract` would error on the first entry
     // that collides.
-    if vdir.is_dir() {
-        fs::remove_dir_all(vdir).map_err(|e| format!("remove {}: {e}", vdir.display()))?;
-    }
     if extract_dir.is_dir() {
         fs::remove_dir_all(extract_dir)
             .map_err(|e| format!("remove {}: {e}", extract_dir.display()))?;
+    }
+    // Moved aside first: a removal cut short must not leave a partial vdir
+    // that reads as installed.
+    if vdir.is_dir() {
+        fs::rename(vdir, extract_dir).map_err(|e| format!("remove {}: {e}", vdir.display()))?;
+        fs::remove_dir_all(extract_dir).map_err(|e| format!("remove {}: {e}", vdir.display()))?;
     }
     Ok(lock)
 }
@@ -314,18 +320,41 @@ fn join_or_resume<T>(h: thread::ScopedJoinHandle<'_, T>) -> T {
 ///
 /// Per-job cleanup (sigint hook + CleanupGuard) is armed against the
 /// `.part` directory and only disarmed once `fs::rename(.part → vdir)`
-/// succeeds. A failed extract — or a process-wide ctrl-c — leaves only
-/// `.part` on disk, so the next `vdir.is_dir()` cache check correctly
-/// classifies the package as not installed.
+/// succeeds. A failed or interrupted extract removes `.part`; one killed
+/// outright leaves only `.part` on disk, so the next `vdir.is_dir()` cache
+/// check correctly classifies the package as not installed.
 pub fn do_extract(ctx: &Ctx, job: &ExtractJob, ui: &Ui, sinks: &DlSinks) -> Result<(), String> {
     let Some(primary_asset) = job.asset.as_ref() else {
         return Ok(()); // cached
     };
+    crate::sigint::check()?;
     let rdir = ctx.paths.repo_dir(&job.spec.owner, &job.spec.name);
     fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
     crate::sigint::push_cleanup(&job.extract_dir);
+    let flight = crate::sigint::InFlight::new();
     let mut guard = CleanupGuard::arm(job.extract_dir.clone());
+    let result = crate::sigint::check()
+        .and_then(|()| extract_and_publish(job, primary_asset, ctx, ui, sinks));
+    if result.is_ok() {
+        guard.disarm();
+    }
+    // The interrupt handler waits on the in-flight count, so `.part` goes
+    // before leaving it; unregistered even on failure, since the caller then
+    // releases the lock and another process may reuse this `.part`.
+    drop(guard);
+    drop(flight);
+    crate::sigint::pop_cleanup(&job.extract_dir);
+    result
+}
 
+/// Download and extract into `.part`, then rename it to the vdir.
+fn extract_and_publish(
+    job: &ExtractJob,
+    primary_asset: &Asset,
+    ctx: &Ctx,
+    ui: &Ui,
+    sinks: &DlSinks,
+) -> Result<(), String> {
     let repo = job.spec.repo();
     let result = if let (Some(companion), Some((cid, csink))) =
         (job.companion.as_ref(), sinks.companion.as_ref())
@@ -380,7 +409,8 @@ pub fn do_extract(ctx: &Ctx, job: &ExtractJob, ui: &Ui, sinks: &DlSinks) -> Resu
         )
     };
 
-    let result = result.and_then(|()| {
+    // Also catches a cancel the drain in `download_extract_verify` swallowed.
+    result.and_then(|()| crate::sigint::check()).and_then(|()| {
         // Atomic publish step. The two paths are siblings under the same
         // parent dir (same filesystem on every supported OS), so rename is
         // a metadata-only operation — no half-rename window. After this
@@ -392,12 +422,7 @@ pub fn do_extract(ctx: &Ctx, job: &ExtractJob, ui: &Ui, sinks: &DlSinks) -> Resu
                 job.vdir.display()
             )
         })
-    });
-    if result.is_ok() {
-        crate::sigint::pop_cleanup(&job.extract_dir);
-        guard.disarm();
-    }
-    result
+    })
 }
 
 /// One download → extract → verify step against one [`ByteSink`]. **Row
@@ -531,6 +556,7 @@ impl<R: io::Read> HashingReader<R> {
 impl<R: io::Read> io::Read for HashingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         use sha2::Digest;
+        crate::sigint::check_io()?;
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.hasher.update(&buf[..n]);

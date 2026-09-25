@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), String> {
@@ -75,13 +75,18 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
 ///
 /// Returns the same error shape as the `fs::File::create` path it replaced,
 /// so callers don't need to change error matching.
+///
+/// The `Dir` is closed once `name` is resolved, before the download streams
+/// in: on Windows an open directory handle keeps `dir` from being removed.
 fn write_untrusted_name<R: Read>(dir: &Path, name: &str, mut reader: R) -> Result<(), String> {
     let capdir = cap_std::fs::Dir::open_ambient_dir(dir, cap_std::ambient_authority())
         .map_err(|e| format!("open {}: {e}", dir.display()))?;
     let mut out = capdir
         .create(name)
         .map_err(|e| format!("create {}/{name}: {e}", dir.display()))?;
-    io::copy(&mut reader, &mut out).map_err(|e| format!("write {}/{name}: {e}", dir.display()))?;
+    drop(capdir);
+    io::copy(&mut reader, &mut Cancellable(&mut out))
+        .map_err(|e| format!("write {}/{name}: {e}", dir.display()))?;
     // Chmod via the open file's fd (capability-scoped): even if `name`
     // would have escaped, we already failed at `capdir.create`. Going
     // through the std-path `set_permissions(dir.join(name))` here would
@@ -95,6 +100,19 @@ fn write_untrusted_name<R: Read>(dir: &Path, name: &str, mut reader: R) -> Resul
             .map_err(|e| format!("chmod {}/{name}: {e}", dir.display()))?;
     }
     Ok(())
+}
+
+/// Fails its writes once an interrupt cancels the install: a zip
+/// decompresses from memory, and one read can expand into many writes.
+struct Cancellable<W>(W);
+impl<W: Write> Write for Cancellable<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        crate::sigint::check_io()?;
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 /// Clear whatever's at `path` so a fresh entry of a different kind can take
@@ -184,6 +202,7 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
 
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries().map_err(|e| format!("read tar: {e}"))? {
+        crate::sigint::check()?;
         let mut entry = entry.map_err(|e| format!("read tar entry: {e}"))?;
         let path = entry
             .path()
@@ -232,7 +251,7 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<(), String> {
                 let mut out = dir
                     .create(&path)
                     .map_err(|e| format!("create {}: {e}", path.display()))?;
-                io::copy(&mut entry, &mut out)
+                io::copy(&mut entry, &mut Cancellable(&mut out))
                     .map_err(|e| format!("write {}: {e}", path.display()))?;
                 #[cfg(unix)]
                 if let Some(m) = mode {
@@ -346,6 +365,7 @@ fn unpack_zip<R: Read>(mut reader: R, dest: &Path) -> Result<(), String> {
     let mut dir_entries: Vec<(PathBuf, Option<u32>)> = Vec::new();
 
     for i in 0..zip.len() {
+        crate::sigint::check()?;
         let mut entry = zip
             .by_index(i)
             .map_err(|e| format!("read zip entry: {e}"))?;
@@ -373,7 +393,8 @@ fn unpack_zip<R: Read>(mut reader: R, dest: &Path) -> Result<(), String> {
         // io::copy drains the entry through the zip crate's Crc32 reader, so a
         // corrupt entry surfaces as a CRC error here rather than silently
         // writing garbage.
-        io::copy(&mut entry, &mut out).map_err(|e| format!("write {}: {e}", rel.display()))?;
+        io::copy(&mut entry, &mut Cancellable(&mut out))
+            .map_err(|e| format!("write {}: {e}", rel.display()))?;
         file_entries.push((rel, mode));
     }
 

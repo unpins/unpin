@@ -253,7 +253,7 @@ mod minreq_backend {
                 }
             });
 
-            match head_rx.recv_timeout(window) {
+            match recv_unless_cancelled(&head_rx, window) {
                 Ok(Head::Ready(status, content_length)) => Ok(Box::new(PumpStream {
                     body_rx,
                     buf: Vec::new(),
@@ -268,8 +268,32 @@ mod minreq_backend {
                     window.as_secs()
                 )),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    crate::sigint::check()?;
                     Err(format!("HTTP GET {url}: connection closed before response"))
                 }
+            }
+        }
+    }
+
+    /// `recv_timeout`, woken every 100 ms to give up once an interrupt
+    /// cancels the install, which it reports as a disconnect.
+    pub(super) fn recv_unless_cancelled<T>(
+        rx: &mpsc::Receiver<T>,
+        window: Duration,
+    ) -> Result<T, mpsc::RecvTimeoutError> {
+        let slice = Duration::from_millis(100);
+        // No deadline if the window overflows it (a huge `http_timeout`).
+        let deadline = std::time::Instant::now().checked_add(window);
+        loop {
+            if crate::sigint::cancelled() {
+                return Err(mpsc::RecvTimeoutError::Disconnected);
+            }
+            let left = deadline.map_or(slice, |d| {
+                d.saturating_duration_since(std::time::Instant::now())
+            });
+            match rx.recv_timeout(left.min(slice)) {
+                Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() => {}
+                r => return r,
             }
         }
     }
@@ -277,7 +301,7 @@ mod minreq_backend {
     impl Read for PumpStream {
         fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
             if self.pos >= self.buf.len() {
-                match self.body_rx.recv_timeout(self.window) {
+                match recv_unless_cancelled(&self.body_rx, self.window) {
                     Ok(Ok(chunk)) => {
                         self.buf = chunk;
                         self.pos = 0;
@@ -290,7 +314,10 @@ mod minreq_backend {
                         ));
                     }
                     // Pump finished and dropped its sender → end of body.
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        crate::sigint::check_io()?;
+                        return Ok(0);
+                    }
                 }
             }
             let remaining = &self.buf[self.pos..];
@@ -317,6 +344,28 @@ mod tests {
     use std::io;
     use std::io::Write;
     use std::net::TcpListener;
+
+    #[test]
+    fn a_sliced_wait_keeps_the_whole_window() {
+        use minreq_backend::recv_unless_cancelled as recv;
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::{Duration, Instant};
+        let (tx, rx) = mpsc::channel();
+        let t = Instant::now();
+        assert_eq!(
+            recv(&rx, Duration::from_millis(250)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        assert!(t.elapsed() >= Duration::from_millis(250));
+        assert_eq!(recv(&rx, Duration::ZERO), Err(RecvTimeoutError::Timeout));
+        tx.send(7).unwrap();
+        assert_eq!(recv(&rx, Duration::from_secs(u64::MAX)), Ok(7));
+        drop(tx);
+        assert_eq!(
+            recv(&rx, Duration::from_secs(1)),
+            Err(RecvTimeoutError::Disconnected)
+        );
+    }
 
     /// Spin up a one-shot loopback server that replies 200 with a body of
     /// `body_len` bytes. Returns the port. Write errors are swallowed so the

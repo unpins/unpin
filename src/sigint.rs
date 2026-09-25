@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering::{self, SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 /// What the interrupt handler cleans up on the way out.
 enum Cleanup {
@@ -36,31 +38,143 @@ pub fn install() {
     // thread. Do not "harden" this into a signal-safe form; that would break
     // the cleanup it exists to do.
     let _ = ctrlc::set_handler(|| {
-        // The guard is held until `exit`, so a lock's own release (which
-        // unregisters it first) blocks here instead of racing this loop.
+        // The guard is held until `exit`, so every lock taken or released,
+        // and every `.part` registered, blocks here instead of racing us.
         let mut cleanup = lock_cleanup();
-        // Dirs first, locks last: removing a lock file releases it to the next
-        // process, which must not find our half-written `.part` or have it
-        // removed from under it.
-        for c in cleanup.iter() {
-            if let Cleanup::Dir(p) = c {
-                let _ = std::fs::remove_dir_all(p);
-            }
+        if EXIT.compare_exchange(0, BY_SIGNAL, SeqCst, SeqCst).is_err() {
+            // Main is exiting with its own code, or waits for a child that
+            // got this ctrl-c too and decides for itself.
+            return;
         }
         // If a live progress block is on screen, its render thread paints the
         // final frame (finished rows kept, in-progress cleared) and leaves the
         // cursor on a fresh line; we then print the message. With no live UI we
         // add a leading newline to break from whatever was on the line. Either
-        // way "interrupted" is printed exactly once, here.
+        // way "interrupted" is printed exactly once, here. Frozen before
+        // cancelling, so the cancelled legs' errors never reach the screen.
         if crate::progress::interrupt_freeze() {
             eprintln!("unpin: interrupted");
         } else {
             eprintln!("\nunpin: interrupted");
         }
-        // Dropping each lock releases it.
-        cleanup.clear();
+        // A leg's open directory handles keep its `.part` from being removed
+        // on Windows: let each one stop and remove its own first.
+        CANCELLED.store(true, SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let stopped = loop {
+            if IN_FLIGHT.load(SeqCst) == 0 {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Dirs before locks: releasing a lock hands the repo to the next
+        // process, which must not find our `.part` or have it removed.
+        for c in cleanup.iter() {
+            if let Cleanup::Dir(p) = c
+                && !remove_dir_patiently(p)
+            {
+                eprintln!(
+                    "unpin: left {}; the next install or 'unpin clean' removes it",
+                    p.display()
+                );
+            }
+        }
+        // Dropping each lock releases it. If a leg may still be writing under
+        // one, leave them to the OS, which releases them once it is gone.
+        if stopped {
+            cleanup.clear();
+        }
         std::process::exit(130);
     });
+}
+
+const BY_MAIN: u8 = 1;
+const BY_SIGNAL: u8 = 2;
+const CHILD: u8 = 3;
+/// Who exits the process: main with its code, or the handler with 130.
+/// While a child runs, neither: an interrupt is the child's to handle.
+static EXIT: AtomicU8 = AtomicU8::new(0);
+
+/// Run `f`, which waits for a child sharing our terminal, as main's last
+/// step: the child gets the same ctrl-c, and its exit code becomes ours.
+pub fn with_child<T>(f: impl FnOnce() -> T) -> T {
+    if EXIT.compare_exchange(0, CHILD, SeqCst, SeqCst).is_err() {
+        loop {
+            std::thread::park();
+        }
+    }
+    let r = f();
+    EXIT.store(BY_MAIN, SeqCst);
+    r
+}
+
+/// Called by main just before it exits: if an interrupt got there first,
+/// wait for the handler's exit instead.
+pub fn claim_exit() {
+    if let Err(BY_SIGNAL) = EXIT.compare_exchange(0, BY_MAIN, SeqCst, SeqCst) {
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// Retries for a while: Defender or the indexer can hold a new file briefly.
+fn remove_dir_patiently(p: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match std::fs::remove_dir_all(p) {
+            Ok(()) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => return false,
+        }
+    }
+}
+
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Set once an interrupt asked the extractions to stop.
+pub fn cancelled() -> bool {
+    CANCELLED.load(SeqCst)
+}
+
+/// `Err` once cancelled, for the extraction's checkpoints.
+pub fn check() -> Result<(), String> {
+    if cancelled() {
+        Err("interrupted".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// The same, for readers and writers. Not `ErrorKind::Interrupted`, which
+/// `io::copy` and friends retry.
+pub fn check_io() -> std::io::Result<()> {
+    if cancelled() {
+        Err(std::io::Error::other("interrupted"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Work on a `.part` or vdir the handler waits for before removing dirs.
+/// Check `cancelled` after taking it: the handler sets the flag, then reads
+/// the count.
+pub struct InFlight(());
+impl InFlight {
+    pub fn new() -> Self {
+        IN_FLIGHT.fetch_add(1, SeqCst);
+        Self(())
+    }
+}
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, SeqCst);
+    }
 }
 
 /// Register a `.part` dir to remove if interrupted.
@@ -125,6 +239,14 @@ mod tests {
         assert!(lock_cleanup().iter().any(registered));
         pop_cleanup(&p);
         assert!(!lock_cleanup().iter().any(registered));
+    }
+
+    #[test]
+    fn a_child_hands_the_exit_to_main() {
+        assert_eq!(with_child(|| EXIT.load(SeqCst)), CHILD);
+        assert_eq!(EXIT.load(SeqCst), BY_MAIN);
+        claim_exit(); // returns: main's exit is already claimed
+        EXIT.store(0, SeqCst);
     }
 
     #[test]

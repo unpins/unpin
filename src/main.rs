@@ -542,7 +542,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match cli.command.run(&paths) {
+    let result = cli.command.run(&paths);
+    sigint::claim_exit();
+    match result {
         Ok(0) => ExitCode::SUCCESS,
         // Child exit codes are 8-bit on Unix (waitpid masks the low byte); on
         // Windows they fit a DWORD but ExitCode caps at u8 anyway. Truncating
