@@ -1040,6 +1040,8 @@ pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
                 continue;
             }
         };
+        // 0.4 kept the lock inside the repo dir, and never removed it.
+        let _ = fs::remove_file(rdir.join(".unpin.lock"));
         let versions = match fs::read_dir(&rdir) {
             Ok(e) => e,
             Err(_) => continue,
@@ -1689,6 +1691,24 @@ mod tests {
         assert!(!paths.data.join("unpins").exists());
         assert!(!is_installed(&paths, "bash").unwrap());
         assert!(installed_repos(&paths).is_empty());
+    }
+
+    #[test]
+    fn clean_removes_a_0_4_lock_from_a_kept_repo_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        fs::create_dir_all(&paths.bin).unwrap();
+        let rdir = paths.repo_dir("unpins", "tree");
+        let exe = rdir.join("v2.2.1").join("bin").join("tree");
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, "").unwrap();
+        platform::create_link(&exe, &paths.bin.join("tree")).unwrap();
+        fs::write(rdir.join(".unpin.lock"), "").unwrap();
+
+        clean(&paths, true).unwrap();
+
+        assert!(exe.exists());
+        assert!(!rdir.join(".unpin.lock").exists());
     }
 
     #[test]
