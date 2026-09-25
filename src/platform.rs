@@ -621,27 +621,32 @@ impl Drop for HeldFile {
         };
         crate::sigint::pop_cleanup(&self.path);
         // Still held, so no other process is filling it.
-        if let Some(repo_dir) = &self.repo_dir {
-            let _ = fs::remove_dir(repo_dir);
-        }
+        remove_repo_dir_if_empty(self.repo_dir.as_deref());
+        let package = self.repo_dir.is_some();
+        // Unix: unlinked while still held; Windows: only once closed. unlock()
+        // can fail (e.g. the handle already invalidated); closing releases it.
         #[cfg(unix)]
-        {
-            let _ = fs::remove_file(&self.path);
-            drop(file);
-        }
+        remove_lock_file(&self.path, package);
         #[cfg(windows)]
-        {
-            // unlock() can fail (e.g. the handle already invalidated); closing
-            // it releases the lock regardless.
-            let _ = file.unlock();
-            drop(file);
-            let _ = fs::remove_file(&self.path);
-        }
-        if self.repo_dir.is_some()
-            && let Some(owner) = self.path.parent()
-        {
-            let _ = fs::remove_dir(owner);
-        }
+        let _ = file.unlock();
+        drop(file);
+        #[cfg(windows)]
+        remove_lock_file(&self.path, package);
+    }
+}
+
+fn remove_repo_dir_if_empty(repo_dir: Option<&Path>) {
+    if let Some(repo_dir) = repo_dir {
+        let _ = fs::remove_dir(repo_dir);
+    }
+}
+
+/// Remove a released lock's file and, for a package lock, its owner dir once
+/// that is empty.
+fn remove_lock_file(path: &Path, package: bool) {
+    let _ = fs::remove_file(path);
+    if package && let Some(owner) = path.parent() {
+        let _ = fs::remove_dir(owner);
     }
 }
 
@@ -650,31 +655,19 @@ impl Drop for HeldFile {
 /// the lock file can't be removed while this process still has it open; the
 /// next acquire and release of it removes it.
 pub fn release_on_interrupt(lock: &Path, repo_dir: Option<&Path>) {
-    if let Some(repo_dir) = repo_dir {
-        let _ = fs::remove_dir(repo_dir);
-    }
-    let _ = fs::remove_file(lock);
-    if repo_dir.is_some()
-        && let Some(owner) = lock.parent()
-    {
-        let _ = fs::remove_dir(owner);
-    }
+    remove_repo_dir_if_empty(repo_dir);
+    remove_lock_file(lock, repo_dir.is_some());
 }
 
 /// Close a lock file this process opened but does not hold. On Unix the name
 /// belongs to its holder and must be left alone; on Windows the last handle to
 /// close removes it, and this may be the last one.
-fn give_up_lock_file(file: fs::File, path: &Path, prune_owner: bool) {
+fn give_up_lock_file(file: fs::File, path: &Path, package: bool) {
     drop(file);
     #[cfg(windows)]
-    {
-        let _ = fs::remove_file(path);
-        if prune_owner && let Some(owner) = path.parent() {
-            let _ = fs::remove_dir(owner);
-        }
-    }
+    remove_lock_file(path, package);
     #[cfg(not(windows))]
-    let _ = (path, prune_owner);
+    let _ = (path, package);
 }
 
 fn open_lock_file(path: &Path) -> io::Result<fs::File> {
@@ -691,10 +684,10 @@ fn open_lock_file(path: &Path) -> io::Result<fs::File> {
     opts.open(path)
 }
 
-/// An open error that means the file is changing hands, not that it can't be
-/// opened: its parent dir was pruned between `create_dir_all` and the open, or
-/// (Windows) another process is deleting it (32, sharing violation) or it is
-/// pending deletion (5, access denied). Both Windows codes were measured under
+/// A create/open error that means the file or its dir is changing hands, not
+/// that it can't be opened: the dir was pruned between `create_dir_all` and the
+/// open, or (Windows) another process is deleting the file (32, sharing
+/// violation) or it or the dir is pending deletion (5, access denied). Both Windows codes were measured under
 /// contention on Windows 10 NTFS, not only with an indexer in the way.
 fn transient_open_error(e: &io::Error) -> bool {
     if e.kind() == io::ErrorKind::NotFound {
@@ -709,6 +702,11 @@ fn transient_open_error(e: &io::Error) -> bool {
 /// How long a transient open error is retried before it is reported.
 const LOCK_OPEN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How many times in a row a file locked without waiting may turn out to be
+/// unlinked.
+#[cfg(unix)]
+const LOCK_MOVED_LIMIT: u32 = 100;
+
 /// Take the lock at `path`. `repo_dir` is the package a package lock guards
 /// (see [`HeldFile::repo_dir`]). `block` is `None` for a non-blocking attempt
 /// (`Ok(None)` when another process holds it), or the notice to run once
@@ -719,49 +717,70 @@ fn acquire_lock_file<F: FnOnce()>(
     mut block: Option<F>,
 ) -> Result<Option<HeldFile>, String> {
     let blocking = block.is_some();
-    let prune_owner = repo_dir.is_some();
+    let package = repo_dir.is_some();
     let parent = path.parent().unwrap_or(Path::new("."));
     let mut give_up_at = None;
+    #[cfg(unix)]
+    let mut moved = 0;
     loop {
-        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-        let file = match open_lock_file(path) {
+        let opened = fs::create_dir_all(parent)
+            .map_err(|e| (format!("create {}", parent.display()), e))
+            .and_then(|()| {
+                open_lock_file(path).map_err(|e| (format!("open lock {}", path.display()), e))
+            });
+        let file = match opened {
             Ok(f) => f,
-            Err(e) if transient_open_error(&e) => {
+            Err((what, e)) => {
                 let at = *give_up_at
                     .get_or_insert_with(|| std::time::Instant::now() + LOCK_OPEN_PATIENCE);
-                if std::time::Instant::now() >= at {
-                    return Err(format!("open lock {}: {e}", path.display()));
+                if !transient_open_error(&e) || std::time::Instant::now() >= at {
+                    return Err(format!("{what}: {e}"));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
-            Err(e) => return Err(format!("open lock {}: {e}", path.display())),
         };
+        let mut waited = false;
         let locked = match file.try_lock() {
             Ok(()) => Ok(()),
             Err(fs::TryLockError::WouldBlock) if blocking => {
                 if let Some(on_wait) = block.take() {
                     on_wait();
                 }
+                waited = true;
                 file.lock()
             }
             Err(fs::TryLockError::WouldBlock) => {
-                give_up_lock_file(file, path, prune_owner);
+                give_up_lock_file(file, path, package);
                 return Ok(None);
             }
             Err(fs::TryLockError::Error(e)) => Err(e),
         };
         if let Err(e) = locked {
-            give_up_lock_file(file, path, prune_owner);
+            give_up_lock_file(file, path, package);
             return Err(format!("lock {}: {e}", path.display()));
         }
         // Locked an inode its holder had already unlinked: that holder is gone,
         // and whoever comes next will lock the file now at `path`, not this one.
+        // Without a wait, that takes another holder's whole turn between our
+        // open and lock, so a streak of those means the filesystem's inode
+        // numbers aren't stable (some FUSE and network mounts) and the check
+        // can never pass. After a wait it is the normal hand-over.
         #[cfg(unix)]
         if !names_same_file(&file, path) {
+            moved = if waited { 0 } else { moved + 1 };
+            if moved == LOCK_MOVED_LIMIT {
+                return Err(format!(
+                    "lock {}: the file keeps changing identity; is the data dir on \
+                     a filesystem without stable inode numbers?",
+                    path.display()
+                ));
+            }
             give_up_at = None;
             continue;
         }
+        #[cfg(not(unix))]
+        let _ = waited;
         crate::sigint::push_lock_cleanup(path, repo_dir);
         return Ok(Some(HeldFile {
             file: Some(file),
