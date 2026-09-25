@@ -296,28 +296,13 @@ pub(super) fn prompt_yes_no(question: &str) -> bool {
     matches!(line.trim_start().chars().next(), Some('y' | 'Y'))
 }
 
-/// Cross-process lock of one package, at `<owner>/<repo>~lock` beside its repo
-/// dir (see [`platform::acquire_install_lock`]). The lock file exists only while
-/// held — removed on Drop, panic, and SIGINT — and releasing it prunes the owner
-/// dir once nothing else is in it.
-///
-/// Hold this for the smallest window that fully covers the destructive
-/// operation: pipeline.rs holds one from preflight through linking; clean
-/// and uninstall_one each grab one for the duration of their `remove_dir_all`
-/// pass; the self-install holds one from placing its binary through linking.
-/// Reads (info, list) deliberately skip the lock — they tolerate the
-/// occasional racy result instead of paying for serialization.
-pub(crate) struct RepoLock {
-    _inner: platform::InstallLock,
-}
-
-impl RepoLock {
-    pub(crate) fn acquire(repo_dir: &Path) -> Result<Self, String> {
-        Ok(Self {
-            _inner: platform::acquire_install_lock(repo_dir)?,
-        })
-    }
-}
+// Held for the smallest window that fully covers the destructive operation:
+// pipeline.rs holds one from preflight through linking; clean and uninstall_one
+// each grab one for their `remove_dir_all` pass; the self-install holds one
+// from placing its binary through linking. Reads (info, list) deliberately
+// skip it — they tolerate the occasional racy result instead of paying for
+// serialization.
+pub(crate) use platform::InstallLock as RepoLock;
 
 pub(super) fn fetch_release(ctx: &Ctx, spec: &Spec) -> Result<Release, String> {
     fetch_release_typed(ctx, spec).map_err(Into::into)
@@ -831,10 +816,11 @@ pub fn update(ctx: &Ctx, opts: &InstallOptions, names: &[String]) -> Result<(), 
     run_pipeline_v2(ctx, opts, PipelineMode::Update, requests, Vec::new())
 }
 
-/// Every `owner/repo` dir under the data root, *including* ones left empty (a
-/// repo dir, or one holding only `.part` cruft). Only `clean`
-/// wants this view — it needs to see and prune those empties. Everything
-/// user-facing goes through [`installed_repos`], which filters them out.
+/// Every `owner/repo` under the data root, *including* ones left empty (a repo
+/// dir, or one holding only `.part` cruft) and ones with only a lock file (a
+/// process killed before it created the repo dir). Only `clean` wants this
+/// view — it needs to see and prune those. Everything user-facing goes through
+/// [`installed_repos`], which filters them out.
 fn all_repo_dirs(paths: &Paths) -> Vec<(String, String)> {
     let root = &paths.data;
     let mut out = Vec::new();
@@ -852,15 +838,20 @@ fn all_repo_dirs(paths: &Paths) -> Vec<(String, String)> {
             Err(_) => continue,
         };
         for repo_entry in repos.flatten() {
-            if !repo_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let name = repo_entry.file_name().to_string_lossy().into_owned();
+            let repo = if repo_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                name
+            } else if let Some(repo) = platform::install_lock_repo(&name) {
+                repo.to_owned()
+            } else {
                 continue;
-            }
-            out.push((
-                owner.clone(),
-                repo_entry.file_name().to_string_lossy().into_owned(),
-            ));
+            };
+            out.push((owner.clone(), repo));
         }
     }
+    // A repo being installed shows up twice, as its dir and its lock.
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -1040,7 +1031,9 @@ pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
                 continue;
             }
         };
-        // 0.4 kept the lock inside the repo dir, and never removed it.
+        // Releasing it also removes a lock file a killed process left behind,
+        // with or without a repo dir. 0.4 kept the lock inside the repo dir,
+        // and never removed it.
         let _ = fs::remove_file(rdir.join(".unpin.lock"));
         let versions = match fs::read_dir(&rdir) {
             Ok(e) => e,
@@ -1084,23 +1077,6 @@ pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
         // has_real_version so a kept/linked version is never touched.
         if !has_real_version(&rdir) {
             let _ = fs::remove_dir_all(&rdir);
-        }
-    }
-
-    // A lock file outlives its holder only when that process was killed
-    // (SIGKILL, or ctrl-c on Windows, where the handle it still has open blocks
-    // the delete) — possibly before the repo dir existed, so the loop above
-    // never met it. Taking and releasing it removes it; one that is held
-    // belongs to a live unpin and stays.
-    for owner in fs::read_dir(root).into_iter().flatten().flatten() {
-        if !owner.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        for entry in fs::read_dir(owner.path()).into_iter().flatten().flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(repo) = name.strip_suffix("~lock") {
-                let _ = RepoLock::acquire(&owner.path().join(repo));
-            }
         }
     }
 

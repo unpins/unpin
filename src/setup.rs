@@ -43,8 +43,7 @@ pub fn run(paths: &Paths, assume_yes: bool, force: bool, quiet: bool) -> Result<
     // linker creates next to the other packages' links.
     let dest = vdir.join(SELF_NAME);
     let link = paths.bin.join(platform::link_filename(&spec.name));
-    // Held from placing the binary through linking: in between, a `clean` would
-    // see an unlinked version dir and remove it as an orphan.
+    // Held from placing the binary through linking (see `link_installed`).
     let repo_lock = install::RepoLock::acquire(&paths.repo_dir(&spec.owner, &spec.name))?;
 
     if dest.exists() && same_file(&current, &dest) {

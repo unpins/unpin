@@ -20,10 +20,10 @@ Versioning](https://semver.org).
   "redefinition of 'vasprintf'".
 - Two `unpin` processes working on the same package could both proceed at
   once — often on Windows, rarely elsewhere — and `clean` could remove a
-  version the self-install had just placed. A failed install no longer
-  leaves empty directories or lock files behind, nor does an interrupted one
-  except on Windows, where the next operation on that package or `unpin
-  clean` removes them.
+  version the self-install had just placed. A failed or interrupted install
+  no longer leaves lock files or empty directories behind. (On Windows, one
+  interrupted while extracting still leaves its `.part` folder, which the
+  next install of that package or `unpin clean` removes.)
 - Installing a multicall package (e.g. `mtools`) no longer warns that its
   own name "is provided by more than one binary in this package".
 - Windows: when `%LOCALAPPDATA%` was spelled differently from the disk (an
