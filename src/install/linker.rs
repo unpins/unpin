@@ -1110,18 +1110,19 @@ mod tests {
 
         let mut out = Vec::new();
         walk_binary_candidates(v, &mut out).unwrap();
-        let names: Vec<String> = out
-            .iter()
-            .map(|p| p.strip_prefix(v).unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert!(names.contains(&"top-binary".to_string()), "got: {names:?}");
-        assert!(names.contains(&"bin/inner".to_string()), "got: {names:?}");
+        // Compared as paths, not strings: the separator is `\` on Windows.
+        let names: Vec<&Path> = out.iter().map(|p| p.strip_prefix(v).unwrap()).collect();
+        assert!(names.contains(&Path::new("top-binary")), "got: {names:?}");
         assert!(
-            !names.iter().any(|n| n.contains("share/")),
+            names.contains(&Path::new("bin").join("inner").as_path()),
+            "got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("share")),
             "share/ leaked into candidates: {names:?}"
         );
         assert!(
-            !names.iter().any(|n| n.contains("lib/")),
+            !names.iter().any(|n| n.starts_with("lib")),
             "lib/ leaked into candidates: {names:?}"
         );
     }

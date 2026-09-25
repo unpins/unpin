@@ -383,12 +383,15 @@ mod tests {
 
     #[test]
     fn classify_excludes_auxiliary() {
+        // Tagged for the host's OS: another OS's tag is excluded first, as
+        // "other platform".
+        let os = platform::current_os_keys()[0];
         assert_eq!(
-            classify_excluded("rg-14.1.0-linux.tar.gz.sha256"),
+            classify_excluded(&format!("rg-14.1.0-{os}.tar.gz.sha256")),
             Some("auxiliary")
         );
         assert_eq!(
-            classify_excluded("rg-14.1.0-linux.tar.gz.sig"),
+            classify_excluded(&format!("rg-14.1.0-{os}.tar.gz.sig")),
             Some("auxiliary")
         );
         assert_eq!(classify_excluded("rg-14.1.0.deb"), Some("auxiliary"));
