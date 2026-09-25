@@ -358,25 +358,39 @@ fn parse_sha256(text: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// The host's own OS and arch tags, as the catalog spells them.
+    fn host_tags() -> (&'static str, &'static str) {
+        (
+            platform::current_os_keys()[0],
+            platform::current_arch_keys()[0],
+        )
+    }
+
     #[test]
     fn classify_picks_up_other_os_assets() {
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            classify_excluded("tool-darwin-x86_64.tar.gz"),
-            Some("other platform")
-        );
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            classify_excluded("tool-windows-x86_64.zip"),
-            Some("other platform")
-        );
+        let (host_os, arch) = host_tags();
+        for os in ["linux", "darwin", "windows"] {
+            if platform::current_os_keys().contains(&os) {
+                continue;
+            }
+            assert_eq!(
+                classify_excluded(&format!("tool-{os}-{arch}.tar.gz")),
+                Some("other platform"),
+                "{os} on a {host_os} host"
+            );
+        }
     }
 
     #[test]
     fn classify_filters_other_arch() {
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let (os, arch) = host_tags();
+        let other = if arch == "x86_64" {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
         assert_eq!(
-            classify_excluded("tool-linux-aarch64.tar.gz"),
+            classify_excluded(&format!("tool-{os}-{other}.tar.gz")),
             Some("other arch")
         );
     }
@@ -439,7 +453,6 @@ mod tests {
 
     #[test]
     fn classify_rejects_asset_with_no_os_tag() {
-        #[cfg(target_os = "linux")]
         assert_eq!(classify_excluded("tool-generic.tar.gz"), Some("no OS tag"));
     }
 
@@ -484,37 +497,63 @@ mod tests {
 
     // Catalog (unpins) htop ships armv7l/armv6l with the `uname -m` `l` suffix.
     // Boundary matching means `armv7` no longer catches `armv7l`, so other_arch
-    // must carry the `l` variants explicitly; assert the exclusion fires.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    // must carry the `l` variants explicitly. Every catalog arch but the host's
+    // is excluded; the host's is accepted.
     #[test]
-    fn other_arch_excludes_catalog_armv7l_on_x86_64() {
-        assert_eq!(
-            classify_excluded("htop-3.4.1-1-armv7l-linux.zst"),
-            Some("other arch")
-        );
-        // The native asset is still accepted.
-        assert_eq!(classify_excluded("htop-3.4.1-1-x86_64-linux.zst"), None);
+    fn other_arch_excludes_every_catalog_arch_but_the_hosts() {
+        let (os, _) = host_tags();
+        for arch in [
+            "x86_64", "aarch64", "armv7l", "armv6l", "i686", "ppc64le", "riscv64",
+        ] {
+            let want = if platform::current_arch_keys().contains(&arch) {
+                None
+            } else {
+                Some("other arch")
+            };
+            assert_eq!(
+                classify_excluded(&format!("htop-3.4.1-1-{arch}-{os}.zst")),
+                want,
+                "{arch}"
+            );
+        }
     }
 
-    // The dev box and most CI runners are linux/x86_64; gate the end-to-end
-    // resolution check on it so the expected pick is unambiguous.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn mk_assets(names: &[&str]) -> Vec<Asset> {
+        names
+            .iter()
+            .map(|n| Asset {
+                name: (*n).into(),
+                browser_download_url: "u".into(),
+                size: 0,
+            })
+            .collect()
+    }
+
+    /// Check `narrow_assets`' auto-pick for the host against `want`, a table of
+    /// `(os, arch, pick)` in `std::env::consts` terms. `None` means the release
+    /// has no build for that host, which must be an error, not a wrong pick. A
+    /// host missing from the table is not checked.
+    fn assert_pick(assets: &[Asset], repo: &str, want: &[(&str, &str, Option<&str>)]) {
+        let host = (std::env::consts::OS, std::env::consts::ARCH);
+        let Some(&(_, _, want)) = want.iter().find(|(o, a, _)| (*o, *a) == host) else {
+            return;
+        };
+        let got = narrow_assets(assets, repo, false, false);
+        match want {
+            Some(name) => {
+                let got = got.unwrap();
+                let names: Vec<_> = got.iter().map(|a| &a.name).collect();
+                assert_eq!(names, [name], "{repo} on {host:?}");
+            }
+            None => assert!(got.is_err(), "{repo} on {host:?}: {got:?}"),
+        }
+    }
+
     #[test]
     fn narrow_assets_picks_the_right_real_world_asset() {
-        let mk = |names: &[&str]| -> Vec<Asset> {
-            names
-                .iter()
-                .map(|n| Asset {
-                    name: (*n).into(),
-                    browser_download_url: "u".into(),
-                    size: 0,
-                })
-                .collect()
-        };
-
         // ripgrep 15.1.0 (Rust target-triple naming), incl. the s390x asset
         // whose arch isn't in our tables — Tier-1 must still narrow to musl.
-        let rg = mk(&[
+        let rg = mk_assets(&[
             "ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz",
             "ripgrep-15.1.0-armv7-unknown-linux-gnueabihf.tar.gz",
             "ripgrep-15.1.0-i686-unknown-linux-gnu.tar.gz",
@@ -524,20 +563,36 @@ mod tests {
             "ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz",
             "ripgrep_15.1.0-1_amd64.deb",
         ]);
-        let got = narrow_assets(&rg, "ripgrep", false, false).unwrap();
-        assert_eq!(
-            got.len(),
-            1,
-            "candidates: {:?}",
-            got.iter().map(|a| &a.name).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            got[0].name,
-            "ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz"
+        assert_pick(
+            &rg,
+            "ripgrep",
+            &[
+                (
+                    "linux",
+                    "x86_64",
+                    Some("ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz"),
+                ),
+                (
+                    "linux",
+                    "aarch64",
+                    Some("ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz"),
+                ),
+                (
+                    "macos",
+                    "x86_64",
+                    Some("ripgrep-15.1.0-x86_64-apple-darwin.tar.gz"),
+                ),
+                ("macos", "aarch64", None),
+                (
+                    "windows",
+                    "x86_64",
+                    Some("ripgrep-15.1.0-x86_64-pc-windows-msvc.zip"),
+                ),
+            ],
         );
 
         // pandoc 3.9.0.2 (os-amd64 / Debian-style naming).
-        let pd = mk(&[
+        let pd = mk_assets(&[
             "pandoc-3.9.0.2-1-amd64.deb",
             "pandoc-3.9.0.2-arm64-macOS.zip",
             "pandoc-3.9.0.2-linux-amd64.tar.gz",
@@ -545,18 +600,29 @@ mod tests {
             "pandoc-3.9.0.2-windows-x86_64.zip",
             "pandoc.wasm.zip",
         ]);
-        let got = narrow_assets(&pd, "pandoc", false, false).unwrap();
-        assert_eq!(
-            got.len(),
-            1,
-            "candidates: {:?}",
-            got.iter().map(|a| &a.name).collect::<Vec<_>>()
+        assert_pick(
+            &pd,
+            "pandoc",
+            &[
+                ("linux", "x86_64", Some("pandoc-3.9.0.2-linux-amd64.tar.gz")),
+                (
+                    "linux",
+                    "aarch64",
+                    Some("pandoc-3.9.0.2-linux-arm64.tar.gz"),
+                ),
+                ("macos", "x86_64", None),
+                ("macos", "aarch64", Some("pandoc-3.9.0.2-arm64-macOS.zip")),
+                (
+                    "windows",
+                    "x86_64",
+                    Some("pandoc-3.9.0.2-windows-x86_64.zip"),
+                ),
+            ],
         );
-        assert_eq!(got[0].name, "pandoc-3.9.0.2-linux-amd64.tar.gz");
 
         // unpins catalog htop v3.4.1-1: canonical <pkg>-<tag>-<arch>-<os>.zst,
         // incl. the armv7l/i686/ppc64le/riscv64 arms that must all be excluded.
-        let ht = mk(&[
+        let ht = mk_assets(&[
             "htop-3.4.1-1-aarch64-darwin.zst",
             "htop-3.4.1-1-aarch64-linux.zst",
             "htop-3.4.1-1-armv7l-linux.zst",
@@ -567,51 +633,50 @@ mod tests {
             "htop-3.4.1-1-x86_64-darwin.zst",
             "htop-3.4.1-1-x86_64-linux.zst",
         ]);
-        let got = narrow_assets(&ht, "htop", false, false).unwrap();
-        assert_eq!(
-            got.len(),
-            1,
-            "candidates: {:?}",
-            got.iter().map(|a| &a.name).collect::<Vec<_>>()
+        assert_pick(
+            &ht,
+            "htop",
+            &[
+                ("linux", "x86_64", Some("htop-3.4.1-1-x86_64-linux.zst")),
+                ("linux", "aarch64", Some("htop-3.4.1-1-aarch64-linux.zst")),
+                ("macos", "x86_64", Some("htop-3.4.1-1-x86_64-darwin.zst")),
+                ("macos", "aarch64", Some("htop-3.4.1-1-aarch64-darwin.zst")),
+                ("windows", "x86_64", None),
+            ],
         );
-        assert_eq!(got[0].name, "htop-3.4.1-1-x86_64-linux.zst");
     }
 
-    // A repo that ships both glibc and musl x86_64-linux builds (sharkdp/fd,
-    // eza, …) used to be an ambiguous pick; the musl preference now auto-picks
-    // the static build, while `--pick` still surfaces both.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    // A repo that ships two builds for the host (sharkdp/fd, eza, …: glibc and
+    // musl on Linux, gnu and msvc on Windows) used to be an ambiguous pick; the
+    // toolchain preference now auto-picks the portable one (musl, msvc), while
+    // `--pick` still surfaces both. macOS has no such pair.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
-    fn narrow_prefers_musl_for_multivariant_linux_repo() {
-        let mk = |names: &[&str]| -> Vec<Asset> {
-            names
-                .iter()
-                .map(|n| Asset {
-                    name: (*n).into(),
-                    browser_download_url: "u".into(),
-                    size: 0,
-                })
-                .collect()
+    fn narrow_prefers_the_portable_toolchain_for_a_multivariant_repo() {
+        let arch = platform::current_arch_keys()[0];
+        let other = if arch == "x86_64" {
+            "aarch64"
+        } else {
+            "x86_64"
         };
-        let fd = mk(&[
-            "fd-v10.4.2-aarch64-unknown-linux-musl.tar.gz",
-            "fd-v10.4.2-x86_64-pc-windows-gnu.zip",
-            "fd-v10.4.2-x86_64-unknown-linux-gnu.tar.gz",
-            "fd-v10.4.2-x86_64-unknown-linux-musl.tar.gz",
+        let (os, ext, preferred, other_toolchain) = if cfg!(windows) {
+            ("pc-windows", "zip", "msvc", "gnu")
+        } else {
+            ("unknown-linux", "tar.gz", "musl", "gnu")
+        };
+        let fd = mk_assets(&[
+            &format!("fd-v10.4.2-{other}-{os}-{preferred}.{ext}"),
+            &format!("fd-v10.4.2-{arch}-{os}-{other_toolchain}.{ext}"),
+            &format!("fd-v10.4.2-{arch}-{os}-{preferred}.{ext}"),
         ]);
         let got = narrow_assets(&fd, "fd", false, false).unwrap();
-        assert_eq!(
-            got.len(),
-            1,
-            "candidates: {:?}",
-            got.iter().map(|a| &a.name).collect::<Vec<_>>()
-        );
-        assert_eq!(got[0].name, "fd-v10.4.2-x86_64-unknown-linux-musl.tar.gz");
+        let names: Vec<_> = got.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, [format!("fd-v10.4.2-{arch}-{os}-{preferred}.{ext}")]);
 
-        // `--pick` keeps both x86_64-linux variants so the user can choose.
+        // `--pick` keeps both host variants so the user can choose.
         let picked = narrow_assets(&fd, "fd", true, false).unwrap();
         assert!(
-            picked.len() >= 2 && picked.iter().any(|a| a.name.contains("gnu")),
+            picked.len() >= 2 && picked.iter().any(|a| a.name.contains(other_toolchain)),
             "picked: {:?}",
             picked.iter().map(|a| &a.name).collect::<Vec<_>>()
         );
