@@ -409,10 +409,16 @@ mod tests {
 
     #[test]
     fn classify_accepts_bare_zst_binary() {
-        #[cfg(target_os = "linux")]
-        assert_eq!(classify_excluded("gvim-9.2.0-x86_64-linux.zst"), None);
-        #[cfg(target_os = "linux")]
-        assert!(classify_excluded("gvim-9.2.0-x86_64-windows.exe.zst").is_some());
+        let (os, arch) = (
+            platform::current_os_keys()[0],
+            platform::current_arch_keys()[0],
+        );
+        assert_eq!(
+            classify_excluded(&format!("gvim-9.2.0-{arch}-{os}.zst")),
+            None
+        );
+        #[cfg(not(windows))]
+        assert!(classify_excluded(&format!("gvim-9.2.0-{arch}-windows.exe.zst")).is_some());
     }
 
     #[test]
@@ -439,10 +445,15 @@ mod tests {
 
     #[test]
     fn classify_accepts_current_os_asset() {
-        #[cfg(target_os = "linux")]
-        assert_eq!(classify_excluded("rg-14.1.0-x86_64-linux.tar.gz"), None);
-        #[cfg(target_os = "macos")]
-        assert_eq!(classify_excluded("rg-14.1.0-x86_64-darwin.tar.gz"), None);
+        // The host's own OS and arch: another arch is excluded, as "other arch".
+        let (os, arch) = (
+            platform::current_os_keys()[0],
+            platform::current_arch_keys()[0],
+        );
+        assert_eq!(
+            classify_excluded(&format!("rg-14.1.0-{arch}-{os}.tar.gz")),
+            None
+        );
     }
 
     #[test]
