@@ -31,6 +31,11 @@ Versioning](https://semver.org).
   removed version, which `unpin run` then started.
 - Windows: `unpin run` exits with its program's whole exit code; one above
   255 (a crash, or ctrl-c's 0xC000013A) was cut to its low byte.
+- Windows: adding unpin's folder to the user PATH turned the PATH's
+  `%VARIABLE%` references into fixed paths. An entry for the folder spelled
+  another way (`%LOCALAPPDATA%`, an 8.3 short name, a junction) was not
+  recognised, so the folder could be added twice or left on the PATH by an
+  uninstall.
 - Installing a multicall package (e.g. `mtools`) no longer warns that its
   own name "is provided by more than one binary in this package".
 - Windows: when `%LOCALAPPDATA%` was spelled differently from the disk (an

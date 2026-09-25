@@ -550,8 +550,8 @@ fn apply_path_change(bin: &Path) -> Result<PathOutcome, String> {
 }
 
 /// Windows can't cheaply distinguish "already in the user Path but not live"
-/// without a query, so we always offer to add; the idempotent PowerShell write
-/// reports back whether it actually changed anything.
+/// without a query, so we always offer to add; `apply_path_change` reports
+/// whether it was there.
 #[cfg(windows)]
 fn plan_path_change(bin: &Path) -> Result<PathPlan, String> {
     Ok(PathPlan::Pending {
@@ -564,51 +564,24 @@ fn plan_path_change(bin: &Path) -> Result<PathPlan, String> {
 
 #[cfg(windows)]
 fn apply_path_change(bin: &Path) -> Result<PathOutcome, String> {
-    use std::process::Command;
-
-    let bin_disp = bin.display().to_string();
-    // PowerShell single-quoted literal: the only escape is `'` → `''`.
-    let escaped = bin_disp.replace('\'', "''");
-    // Read the *user* Path (not the merged process PATH), append our folder if
-    // absent, write it back, and broadcast the change to new processes — all
-    // of which `[Environment]::SetEnvironmentVariable(..,'User')` handles. No
-    // `setx` (it truncates at 1024 chars and clobbers REG_EXPAND_SZ).
-    let script = format!(
-        "$b='{escaped}'; \
-         $p=[Environment]::GetEnvironmentVariable('Path','User'); \
-         if (-not $p) {{ $p='' }}; \
-         $parts = $p -split ';' | Where-Object {{ $_ -ne '' }}; \
-         if ($parts -notcontains $b) {{ \
-             $new = if ($p) {{ \"$p;$b\" }} else {{ $b }}; \
-             [Environment]::SetEnvironmentVariable('Path', $new, 'User'); \
-             'added' \
-         }} else {{ 'present' }}"
-    );
-
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map_err(|e| format!("run powershell to update PATH: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "powershell failed to update PATH: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-
-    // The script echoes whether it actually wrote the value or found it there.
-    let already = String::from_utf8_lossy(&out.stdout).trim() == "present";
-    Ok(PathOutcome::Added(if already {
-        format!(
+    let (path, kind) = read_user_path()?;
+    if path.split(';').any(|e| names_dir(e, bin)) {
+        return Ok(PathOutcome::Added(format!(
             "{} was already in your user PATH. Open a new terminal to use it.",
             bin.display()
-        )
+        )));
+    }
+    let path = path.trim_end_matches(';');
+    let bin_disp = bin.display();
+    let new = if path.is_empty() {
+        bin_disp.to_string()
     } else {
-        format!(
-            "Added {} to your user PATH. Open a new terminal to use it.",
-            bin.display()
-        )
-    }))
+        format!("{path};{bin_disp}")
+    };
+    write_user_path(&new, &kind)?;
+    Ok(PathOutcome::Added(format!(
+        "Added {bin_disp} to your user PATH. Open a new terminal to use it."
+    )))
 }
 
 /// Remove `dir` from the per-user `Path` registry value, if present. The mirror
@@ -620,25 +593,114 @@ fn apply_path_change(bin: &Path) -> Result<PathOutcome, String> {
 /// so the profile edit is left in place there.
 #[cfg(windows)]
 pub fn remove_dir_from_user_path(dir: &Path) -> Result<bool, String> {
-    use std::process::Command;
+    let (path, kind) = read_user_path()?;
+    let kept: Vec<&str> = path
+        .split(';')
+        .filter(|e| !e.is_empty() && !names_dir(e, dir))
+        .collect();
+    let new = kept.join(";");
+    if new == path {
+        return Ok(false);
+    }
+    write_user_path(&new, &kind)?;
+    Ok(true)
+}
 
-    let escaped = dir.display().to_string().replace('\'', "''");
-    // `-ne` is case-insensitive in PowerShell, matching NTFS path semantics, so
-    // a differently-cased stored entry still matches; splitting on ';' and
-    // dropping empties also tidies any stray separators while we're here.
-    let script = format!(
-        "$b='{escaped}'; \
-         $p=[Environment]::GetEnvironmentVariable('Path','User'); \
-         if (-not $p) {{ 'absent' }} else {{ \
-             $parts = $p -split ';' | Where-Object {{ $_ -ne '' -and $_ -ne $b }}; \
-             $new = $parts -join ';'; \
-             if ($new -ne $p) {{ \
-                 [Environment]::SetEnvironmentVariable('Path', $new, 'User'); 'removed' \
-             }} else {{ 'absent' }} \
-         }}"
-    );
+/// Whether a user `Path` entry names `dir`, however it is spelled: `%VAR%`s,
+/// another case, a trailing `\`, an 8.3 name or a junction.
+#[cfg(windows)]
+fn names_dir(entry: &str, dir: &Path) -> bool {
+    let entry = expand_env(entry, |k| std::env::var(k).ok());
+    let entry = Path::new(entry.trim_end_matches('\\'));
+    let same = |a: &Path, b: &Path| a.as_os_str().eq_ignore_ascii_case(b.as_os_str());
+    // Only a likely match is resolved: an entry on a dead network drive can
+    // take seconds.
+    same(entry, dir)
+        || entry
+            .file_name()
+            .zip(dir.file_name())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+            && crate::platform::on_disk_spelling(entry) == dir
+}
 
-    let out = Command::new("powershell")
+/// `%NAME%` replaced by `var(NAME)`, as Windows expands a `REG_EXPAND_SZ`; an
+/// unknown name is left as written.
+// Only Windows calls it; its tests run everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn expand_env(s: &str, var: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        match after.find('%') {
+            Some(j) => match var(&after[..j]) {
+                Some(v) if j > 0 => {
+                    out.push_str(&v);
+                    rest = &after[j + 1..];
+                }
+                // Not a variable: keep the `%` and rescan from the next one.
+                _ => {
+                    out.push('%');
+                    rest = after;
+                }
+            },
+            None => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The user `Path` as stored — `%VAR%`s unexpanded — and its registry type.
+/// `[Environment]::GetEnvironmentVariable` would expand them, and writing that
+/// back freezes them.
+#[cfg(windows)]
+fn read_user_path() -> Result<(String, String), String> {
+    let out = powershell(
+        "$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment'); \
+         if ($k -and $k.GetValueNames() -contains 'Path') { \
+             $k.GetValueKind('Path').ToString(); \
+             $k.GetValue('Path', '', 'DoNotExpandEnvironmentNames') \
+         } else { 'ExpandString'; '' }",
+    )?;
+    let mut lines = out.lines();
+    let kind = lines.next().unwrap_or_default().trim().to_owned();
+    let path = lines
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('\r')
+        .to_owned();
+    if kind != "String" && kind != "ExpandString" {
+        return Err(format!("your user PATH is a registry {kind}, not a string"));
+    }
+    Ok((path, kind))
+}
+
+/// Store `path` as the user `Path`, keeping its registry type, and tell running
+/// programs so new terminals see it.
+#[cfg(windows)]
+fn write_user_path(path: &str, kind: &str) -> Result<(), String> {
+    // PowerShell single-quoted literal: the only escape is `'` → `''`.
+    let escaped = path.replace('\'', "''");
+    // Removing a variable that isn't there changes nothing, but broadcasts the
+    // WM_SETTINGCHANGE a raw registry write doesn't.
+    powershell(&format!(
+        "$k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment'); \
+         $k.SetValue('Path', '{escaped}', '{kind}'); \
+         [Environment]::SetEnvironmentVariable('unpin-no-such-variable', $null, 'User')"
+    ))
+    .map(drop)
+}
+
+/// Run `script` in Windows PowerShell; its stdout, read as UTF-8.
+#[cfg(windows)]
+fn powershell(script: &str) -> Result<String, String> {
+    let script = format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; {script}");
+    let out = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .map_err(|e| format!("run powershell to update PATH: {e}"))?;
@@ -648,7 +710,7 @@ pub fn remove_dir_from_user_path(dir: &Path) -> Result<bool, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim() == "removed")
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(all(test, unix))]
@@ -730,5 +792,35 @@ mod tests {
             bin
         ));
         assert!(!profile_has_path_entry("", bin));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn names_dir_ignores_case_and_a_trailing_backslash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::platform::on_disk_spelling(tmp.path());
+        let spelled = format!("{}\\", dir.display()).to_uppercase();
+        assert!(names_dir(&spelled, &dir));
+        assert!(!names_dir(&format!("{}x", dir.display()), &dir));
+    }
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::expand_env;
+
+    #[test]
+    fn expand_env_replaces_known_names_and_keeps_the_rest() {
+        let var = |k: &str| (k == "HOME").then(|| r"C:\Users\u".to_owned());
+        assert_eq!(expand_env(r"%HOME%\bin", var), r"C:\Users\u\bin");
+        assert_eq!(expand_env(r"%NOPE%\bin", var), r"%NOPE%\bin");
+        assert_eq!(expand_env("100%", var), "100%");
+        assert_eq!(expand_env("%%HOME%", var), r"%C:\Users\u");
+        assert_eq!(expand_env("a%NOPE%HOME%b", var), "a%NOPEC:\\Users\\ub");
+        assert_eq!(expand_env("plain", var), "plain");
     }
 }
