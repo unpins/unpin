@@ -544,11 +544,9 @@ fn main() -> ExitCode {
     };
     match cli.command.run(&paths) {
         Ok(0) => ExitCode::SUCCESS,
-        // Child exit codes are 8-bit on Unix (waitpid masks the low byte); on
-        // Windows they fit a DWORD but ExitCode caps at u8 anyway. Truncating
-        // is the same thing the shell does after a child dies, so callers see
-        // the conventional value.
-        Ok(code) => ExitCode::from((code & 0xff) as u8),
+        // The program `run` waited for (Windows; Unix execs it). `exit` keeps
+        // the whole DWORD, where ExitCode would cut it to a byte.
+        Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("unpin: {e}");
             // `e` is often just a summary ("N operation(s) failed") — the

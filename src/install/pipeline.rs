@@ -120,6 +120,51 @@ fn part_dir_for(vdir: &Path) -> PathBuf {
     vdir.with_file_name(name)
 }
 
+/// Remove a version dir, moved aside first: a removal cut short must not
+/// leave a partial version that reads as installed.
+pub(super) fn remove_version(vdir: &Path) -> Result<(), String> {
+    let part = part_dir_for(vdir);
+    remove_part(&part)?;
+    fs::rename(vdir, &part).map_err(|e| format!("move {} aside: {e}", vdir.display()))?;
+    remove_part(&part)
+}
+
+/// Remove a `.part` dir. An interrupt stops the removal and finishes it
+/// itself before releasing any lock.
+pub(super) fn remove_part(part: &Path) -> Result<(), String> {
+    if !part.is_dir() {
+        return Ok(());
+    }
+    crate::sigint::push_cleanup(part);
+    let result = crate::sigint::InFlight::enter().and_then(|_flight| {
+        remove_tree(part).map_err(|e| format!("remove {}: {e}", part.display()))
+    });
+    crate::sigint::pop_cleanup(part);
+    result
+}
+
+/// `fs::remove_dir_all` that stops once an interrupt cancels it.
+fn remove_tree(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        crate::sigint::check_io()?;
+        let entry = entry?;
+        let (path, kind) = (entry.path(), entry.file_type()?);
+        if kind.is_dir() {
+            remove_tree(&path)?;
+        } else {
+            // A Windows dir symlink or junction goes with remove_dir.
+            fs::remove_file(&path).or_else(|e| {
+                if kind.is_symlink() {
+                    fs::remove_dir(&path)
+                } else {
+                    Err(e)
+                }
+            })?;
+        }
+    }
+    fs::remove_dir(dir)
+}
+
 /// Which leg of an install the missing-checksum prompt is about. Drives the
 /// warning text and the prompt question — primary asset vs. data companion.
 enum ChecksumKind {
@@ -182,22 +227,14 @@ fn prepare_workspace_dirs(
     // write. Holding it through a prompt would force a parallel install on the
     // same package to error out while the user is at coffee.
     let lock = RepoLock::acquire(&paths.repo_dir(&spec.owner, &spec.name))?;
-    // In flight, so an interrupt waits instead of cutting it short.
-    let _flight = crate::sigint::InFlight::enter()?;
     // --pick (or incomplete cache) on a cached version: wipe before re-extracting.
     // Also wipe a leftover `.part` from a previous run that got SIGKILL'd between
     // extract and rename — without this the second attempt would start from a
     // half-populated tree and `archive::extract` would error on the first entry
     // that collides.
-    if extract_dir.is_dir() {
-        fs::remove_dir_all(extract_dir)
-            .map_err(|e| format!("remove {}: {e}", extract_dir.display()))?;
-    }
-    // Moved aside first: a removal cut short must not leave a partial vdir
-    // that reads as installed.
+    remove_part(extract_dir)?;
     if vdir.is_dir() {
-        fs::rename(vdir, extract_dir).map_err(|e| format!("remove {}: {e}", vdir.display()))?;
-        fs::remove_dir_all(extract_dir).map_err(|e| format!("remove {}: {e}", vdir.display()))?;
+        remove_version(vdir)?;
     }
     Ok(lock)
 }
@@ -1511,5 +1548,31 @@ mod tests {
         // `.part` to the whole file_name, not to the stem.
         let v = PathBuf::from("/data/o/r/14.1.0");
         assert_eq!(part_dir_for(&v).file_name().unwrap(), "14.1.0.part");
+    }
+
+    #[test]
+    fn remove_version_removes_the_tree_and_a_stale_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vdir = tmp.path().join("v1");
+        fs::create_dir_all(vdir.join("bin/deep")).unwrap();
+        fs::write(vdir.join("bin/deep/x"), "x").unwrap();
+        fs::create_dir_all(part_dir_for(&vdir).join("old")).unwrap();
+        remove_version(&vdir).unwrap();
+        assert!(fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_part_leaves_what_a_symlink_points_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), "k").unwrap();
+        let part = tmp.path().join("v1.part");
+        fs::create_dir(&part).unwrap();
+        std::os::unix::fs::symlink(&outside, part.join("link")).unwrap();
+        remove_part(&part).unwrap();
+        assert!(!part.exists());
+        assert!(outside.join("keep").exists());
     }
 }

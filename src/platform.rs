@@ -682,21 +682,6 @@ fn remove_lock_file(path: &Path, repo_dir: Option<&Path>) {
     }
 }
 
-/// A [`HeldFile`] handed to the interrupt handler, which releases it after the
-/// dirs it removes if the process is interrupted; dropping this releases it.
-#[derive(Debug)]
-struct Registered {
-    _held: crate::sigint::Held,
-}
-
-impl Registered {
-    fn new(held: HeldFile) -> Self {
-        Self {
-            _held: crate::sigint::hold(held),
-        }
-    }
-}
-
 /// Close a lock file this process opened but does not hold. On Unix the name
 /// belongs to its holder and must be left alone; on Windows the last handle to
 /// close removes it, and this may be the last one.
@@ -840,7 +825,7 @@ fn names_same_file(file: &fs::File, path: &Path) -> bool {
 /// releases the lock and removes its file (see [`HeldFile`]).
 #[derive(Debug)]
 pub struct InstallLock {
-    _held: Registered,
+    _held: crate::sigint::Held,
 }
 
 const INSTALL_LOCK_SUFFIX: &str = "~lock";
@@ -857,7 +842,9 @@ pub fn install_lock_path(repo_dir: &Path) -> PathBuf {
 /// The repo name whose lock file is named `file_name`: the inverse of
 /// [`install_lock_path`].
 pub fn install_lock_repo(file_name: &str) -> Option<&str> {
-    file_name.strip_suffix(INSTALL_LOCK_SUFFIX)
+    file_name
+        .strip_suffix(INSTALL_LOCK_SUFFIX)
+        .filter(|r| !r.is_empty())
 }
 
 /// Acquire the exclusive lock of the package whose repo dir is `repo_dir`,
@@ -885,7 +872,7 @@ impl InstallLock {
             let _ = writeln!(f, "pid={}", std::process::id());
         }
         Ok(InstallLock {
-            _held: Registered::new(held),
+            _held: crate::sigint::hold(held),
         })
     }
 }
@@ -899,7 +886,7 @@ impl InstallLock {
 /// like [`InstallLock`]'s (see [`HeldFile`]).
 #[derive(Debug)]
 pub struct LinksLock {
-    _held: Registered,
+    _held: crate::sigint::Held,
 }
 
 /// Acquire the shared `bin_dir` links lock, blocking until it's free. Pass the
@@ -918,7 +905,7 @@ pub fn acquire_links_lock(data_dir: &Path, on_wait: impl FnOnce()) -> Result<Lin
     let held = acquire_lock_file(&lock_path, None, Some(on_wait))?
         .expect("a blocking acquire either locks or fails");
     Ok(LinksLock {
-        _held: Registered::new(held),
+        _held: crate::sigint::hold(held),
     })
 }
 
@@ -1087,6 +1074,13 @@ pub fn run_foreground(cmd: &mut std::process::Command) -> io::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_lock_repo_needs_a_name() {
+        assert_eq!(install_lock_repo("htop~lock"), Some("htop"));
+        assert_eq!(install_lock_repo("~lock"), None);
+        assert_eq!(install_lock_repo("htop"), None);
+    }
 
     #[cfg(windows)]
     #[test]

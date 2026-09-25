@@ -753,6 +753,9 @@ fn uninstall_one(paths: &Paths, name: &str, quiet: bool) -> Result<(), String> {
             }
             return Ok(());
         }
+        for v in &versions {
+            pipeline::remove_version(&rdir.join(v))?;
+        }
         fs::remove_dir_all(&rdir).map_err(|e| format!("remove {}: {e}", rdir.display()))?;
     }
 
@@ -1035,11 +1038,12 @@ pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
         // with or without a repo dir. 0.4 kept the lock inside the repo dir,
         // and never removed it.
         let _ = fs::remove_file(rdir.join(".unpin.lock"));
-        let versions = match fs::read_dir(&rdir) {
-            Ok(e) => e,
+        // Listed up front: removing a version adds its `.part` to the dir.
+        let versions: Vec<_> = match fs::read_dir(&rdir) {
+            Ok(e) => e.flatten().collect(),
             Err(_) => continue,
         };
-        for ver_entry in versions.flatten() {
+        for ver_entry in versions {
             if !ver_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
@@ -1051,7 +1055,8 @@ pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
             // is safe. We don't gate on `linked_targets` because `.part`
             // dirs are never linked.
             if is_part_dir_name(&v) {
-                if fs::remove_dir_all(&vpath).is_ok() {
+                // Gone already if its version was an orphan removed above.
+                if vpath.is_dir() && pipeline::remove_part(&vpath).is_ok() {
                     let tag = v.strip_suffix(".part").unwrap_or(&v);
                     if !quiet {
                         println!("Removed stale extraction {owner}/{repo}@{tag}");
@@ -1063,7 +1068,7 @@ pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
             if linked_targets.iter().any(|t| t.starts_with(&vpath)) {
                 continue;
             }
-            if fs::remove_dir_all(&vpath).is_ok() {
+            if pipeline::remove_version(&vpath).is_ok() {
                 if !quiet {
                     println!("Removed orphan {owner}/{repo}@{v}");
                 }

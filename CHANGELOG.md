@@ -27,6 +27,10 @@ Versioning](https://semver.org).
 - ctrl-c while `unpin run` waits for its program goes to the program
   alone, and its exit code is unpin's. unpin used to exit under it, leaving
   a program that handles ctrl-c (vim, a Python prompt) running on its own.
+- An interrupted `unpin uninstall` or `unpin clean` could leave a partly
+  removed version, which `unpin run` then started.
+- Windows: `unpin run` exits with its program's whole exit code; one above
+  255 (a crash, or ctrl-c's 0xC000013A) was cut to its low byte.
 - Installing a multicall package (e.g. `mtools`) no longer warns that its
   own name "is provided by more than one binary in this package".
 - Windows: when `%LOCALAPPDATA%` was spelled differently from the disk (an
