@@ -42,7 +42,7 @@ fn is_part_dir_name(name: &str) -> bool {
 /// `true` if `rdir` holds at least one real (non-`.part`) version dir — the
 /// single definition of "this repo is installed", shared by `list`,
 /// `installed_repos`, and `resolve_installed` so they never disagree. A repo
-/// dir left holding only a stray `.unpin.lock` or a crashed `.part` (e.g. a
+/// dir left empty or holding only a crashed `.part` (e.g. a
 /// `run`-cached version that `clean` later swept, or an install that failed
 /// after taking the lock) is *not* a package and must not surface in
 /// `list`/`uninstall`/`info`.
@@ -296,38 +296,26 @@ pub(super) fn prompt_yes_no(question: &str) -> bool {
     matches!(line.trim_start().chars().next(), Some('y' | 'Y'))
 }
 
-/// Cross-process advisory lock at `<repo_dir>/.unpin.lock`. Wraps
-/// [`platform::InstallLock`] to integrate with the sigint cleanup hook —
-/// holding this guard guarantees the lock file is removed on normal Drop,
-/// process panic, *and* SIGINT (ctrl-c).
+/// Cross-process lock of one package, at `<owner>/<repo>~lock` beside its repo
+/// dir (see [`platform::acquire_install_lock`]). The lock file exists only while
+/// held — removed on Drop, panic, and SIGINT — and releasing it prunes the owner
+/// dir once nothing else is in it.
 ///
 /// Hold this for the smallest window that fully covers the destructive
 /// operation: pipeline.rs holds one from preflight through linking; clean
 /// and uninstall_one each grab one for the duration of their `remove_dir_all`
-/// pass. Reads (info, list) deliberately skip the lock — they tolerate the
+/// pass; the self-install holds one from placing its binary through linking.
+/// Reads (info, list) deliberately skip the lock — they tolerate the
 /// occasional racy result instead of paying for serialization.
-///
-/// The underlying primitive is `File::try_lock` (stable since Rust 1.89),
-/// not a sentinel-file dance: the kernel owns the lock state and releases
-/// it on fd close, including SIGKILL/panic-abort/power-loss. The sentinel
-/// file path is still cosmetic so a user finding `.unpin.lock` knows what
-/// it is.
-pub(super) struct RepoLock {
-    inner: platform::InstallLock,
+pub(crate) struct RepoLock {
+    _inner: platform::InstallLock,
 }
 
 impl RepoLock {
-    pub(super) fn acquire(repo_dir: &Path) -> Result<Self, String> {
-        let inner = platform::acquire_install_lock(repo_dir)?;
-        crate::sigint::push_cleanup(inner.path());
-        Ok(Self { inner })
-    }
-}
-
-impl Drop for RepoLock {
-    fn drop(&mut self) {
-        crate::sigint::pop_cleanup(self.inner.path());
-        // platform::InstallLock::drop runs next and removes the file.
+    pub(crate) fn acquire(repo_dir: &Path) -> Result<Self, String> {
+        Ok(Self {
+            _inner: platform::acquire_install_lock(repo_dir)?,
+        })
     }
 }
 
@@ -558,18 +546,19 @@ pub fn self_spec() -> Spec {
     }
 }
 
-/// Link an already-populated version dir as `spec`'s active version, taking the
-/// same repo→links locks the install pipeline uses. The self-install bootstrap
-/// calls this after dropping unpin's own binary into `vdir` — there's no
-/// download/extract, just the linking half of a normal install. unpin declares
-/// no aliases, so alias handling is off.
+/// Link an already-populated version dir as `spec`'s active version. The
+/// self-install bootstrap calls this after dropping unpin's own binary into
+/// `vdir` — there's no download/extract, just the linking half of a normal
+/// install. It must already hold `spec`'s [`RepoLock`], taken before `vdir` was
+/// populated: a `clean` in between would see an unlinked version dir and remove
+/// it as an orphan. unpin declares no aliases, so alias handling is off.
 pub fn link_installed(
     paths: &Paths,
     spec: &Spec,
     vdir: &Path,
     assume_yes: bool,
+    _repo: &RepoLock,
 ) -> Result<(), String> {
-    let _repo = RepoLock::acquire(&paths.repo_dir(&spec.owner, &spec.name))?;
     let _links = platform::acquire_links_lock(&paths.data, || {})?;
     link_all_executables(
         paths,
@@ -701,10 +690,8 @@ fn uninstall_one(paths: &Paths, name: &str, quiet: bool) -> Result<(), String> {
     // Same lock the install pipeline takes. Without it a concurrent
     // `unpin install` extracting into rdir would race against this
     // `remove_dir_all` and end up either rolled-back-to-empty or
-    // confused with ENOENTs mid-tar. RepoLock will be dropped on its
-    // own after the function returns; remove_dir_all below wipes the
-    // lock file along with the rest of rdir, which is fine — Drop's
-    // `fs::remove_file` becomes a silent no-op.
+    // confused with ENOENTs mid-tar. Dropped last, on return: releasing it
+    // prunes the owner dir, which its own lock file keeps non-empty until then.
     let _lock = RepoLock::acquire(&rdir)?;
 
     let mut versions: Vec<String> = fs::read_dir(&rdir)
@@ -783,7 +770,6 @@ fn uninstall_one(paths: &Paths, name: &str, quiet: bool) -> Result<(), String> {
         }
         fs::remove_dir_all(&rdir).map_err(|e| format!("remove {}: {e}", rdir.display()))?;
     }
-    let _ = fs::remove_dir(paths.data.join(&owner));
 
     if !quiet {
         if versions.is_empty() {
@@ -846,7 +832,7 @@ pub fn update(ctx: &Ctx, opts: &InstallOptions, names: &[String]) -> Result<(), 
 }
 
 /// Every `owner/repo` dir under the data root, *including* ones left empty (a
-/// repo dir holding only `.unpin.lock`, or only `.part` cruft). Only `clean`
+/// repo dir, or one holding only `.part` cruft). Only `clean`
 /// wants this view — it needs to see and prune those empties. Everything
 /// user-facing goes through [`installed_repos`], which filters them out.
 fn all_repo_dirs(paths: &Paths) -> Vec<(String, String)> {
@@ -1089,18 +1075,30 @@ pub fn clean(paths: &Paths, quiet: bool) -> Result<(), String> {
                 removed += 1;
             }
         }
-        // Prune the repo dir if no real version is left in it. We use
-        // remove_dir_all, not remove_dir: the `.unpin.lock` we still hold lives
-        // *inside* rdir, so remove_dir (which needs an empty dir) would fail and
-        // strand the empty repo dir — which then shows up as a phantom package
-        // in `uninstall`/`info` even though `list` (rightly) hides it. Same
-        // trick uninstall_one uses: std opens the lock share-delete on Windows
-        // and unlinks it on Unix, so the wipe succeeds while the lock is held;
-        // the guard's own Drop::remove_file then no-ops. Guarded by
+        // A repo dir left with no real version is not a package; remove it so
+        // `uninstall`/`info` agree with `list`. The lock lives beside rdir, so
+        // holding it doesn't get in the way, and releasing it at the end of
+        // this iteration prunes the owner dir once that is empty. Guarded by
         // has_real_version so a kept/linked version is never touched.
         if !has_real_version(&rdir) {
             let _ = fs::remove_dir_all(&rdir);
-            let _ = fs::remove_dir(paths.data.join(&owner));
+        }
+    }
+
+    // A lock file outlives its holder only when that process was killed
+    // (SIGKILL, or ctrl-c on Windows, where the handle it still has open blocks
+    // the delete) — possibly before the repo dir existed, so the loop above
+    // never met it. Taking and releasing it removes it; one that is held
+    // belongs to a live unpin and stays.
+    for owner in fs::read_dir(root).into_iter().flatten().flatten() {
+        if !owner.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        for entry in fs::read_dir(owner.path()).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(repo) = name.strip_suffix("~lock") {
+                let _ = RepoLock::acquire(&owner.path().join(repo));
+            }
         }
     }
 
@@ -1674,22 +1672,43 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_data(tmp.path());
         fs::create_dir_all(&paths.bin).unwrap();
-        // Simulate `unpin run bash` (cached, never linked) + a `clean` that
-        // swept the version but, before the fix, stranded the empty repo dir
-        // holding only `.unpin.lock`.
+        // Simulate `unpin run bash` (cached, never linked) whose only version
+        // was swept, leaving an empty repo dir, plus the lock file of a
+        // process killed while holding it.
         let rdir = paths.repo_dir("unpins", "bash");
         fs::create_dir_all(&rdir).unwrap();
-        fs::write(rdir.join(".unpin.lock"), "pid=1\n").unwrap();
-        assert!(rdir.is_dir());
+        let lock = platform::install_lock_path(&rdir);
+        fs::write(&lock, "pid=1\n").unwrap();
 
         clean(&paths, true).unwrap();
 
-        // The phantom is gone: the repo dir (and its now-empty owner dir) are
-        // removed, and nothing resolves it as installed anymore.
+        // The phantom is gone: the repo dir, its lock file, and the now-empty
+        // owner dir are removed, and nothing resolves it as installed anymore.
         assert!(!rdir.exists());
+        assert!(!lock.exists());
         assert!(!paths.data.join("unpins").exists());
         assert!(!is_installed(&paths, "bash").unwrap());
         assert!(installed_repos(&paths).is_empty());
+    }
+
+    #[test]
+    fn clean_removes_a_dead_holders_lock_with_no_repo_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_data(tmp.path());
+        fs::create_dir_all(&paths.bin).unwrap();
+        // Killed after taking the lock, before creating the repo dir.
+        let orphan = platform::install_lock_path(&paths.repo_dir("unpins", "bash"));
+        fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        fs::write(&orphan, "pid=1\n").unwrap();
+        // A lock a live process holds is left alone.
+        let held = RepoLock::acquire(&paths.repo_dir("unpins", "tree")).unwrap();
+
+        clean(&paths, true).unwrap();
+
+        assert!(!orphan.exists());
+        assert!(platform::install_lock_path(&paths.repo_dir("unpins", "tree")).exists());
+        drop(held);
+        assert!(!platform::install_lock_path(&paths.repo_dir("unpins", "tree")).exists());
     }
 
     #[test]

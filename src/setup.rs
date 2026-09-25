@@ -43,13 +43,16 @@ pub fn run(paths: &Paths, assume_yes: bool, force: bool, quiet: bool) -> Result<
     // linker creates next to the other packages' links.
     let dest = vdir.join(SELF_NAME);
     let link = paths.bin.join(platform::link_filename(&spec.name));
+    // Held from placing the binary through linking: in between, a `clean` would
+    // see an unlinked version dir and remove it as an orphan.
+    let repo_lock = install::RepoLock::acquire(&paths.repo_dir(&spec.owner, &spec.name))?;
 
     if dest.exists() && same_file(&current, &dest) {
         // We ARE the installed binary — there's nothing to relocate (a copy
         // onto itself would just delete the file). Re-link (idempotent) and
         // re-check PATH. `--force` can't redo a no-op relocation, so it only
         // changes the message.
-        install::link_installed(paths, &spec, &vdir, assume_yes)?;
+        install::link_installed(paths, &spec, &vdir, assume_yes, &repo_lock)?;
         if !quiet {
             if force {
                 println!(
@@ -75,7 +78,7 @@ pub fn run(paths: &Paths, assume_yes: bool, force: bool, quiet: bool) -> Result<
             let _ = fs::remove_file(&link);
         }
         let reloc = relocate(&current, &dest)?;
-        install::link_installed(paths, &spec, &vdir, assume_yes)?;
+        install::link_installed(paths, &spec, &vdir, assume_yes, &repo_lock)?;
         if !quiet {
             println!("Installed unpin {tag} ({}).", link.display());
         }
@@ -87,6 +90,8 @@ pub fn run(paths: &Paths, assume_yes: bool, force: bool, quiet: bool) -> Result<
         // Bind on non-Windows so the `reloc` value is always "used".
         let _ = &reloc;
     }
+    // Not through the PATH prompt below.
+    drop(repo_lock);
 
     match ensure_on_path(&paths.bin, assume_yes, quiet)? {
         PathOutcome::AlreadyOnPath => {
@@ -233,18 +238,16 @@ fn janitor_delete(origin: &Path) {
 
 /// Like [`janitor_delete`] but for a whole directory — unpin's repo dir on a
 /// self-uninstall, retried until the just-exited parent's `.exe` is unlocked.
-/// Once the repo dir is gone, prune the now-empty owner dir too, mirroring the
-/// normal uninstall path (which `uninstall_one` skips via an early return on
-/// the self-uninstall branch). `remove_dir` only succeeds on an empty dir, so
-/// an owner that still holds other packages is a harmless no-op.
+/// Under the package's lock, like any uninstall, so a concurrent install of
+/// unpin is never removed mid-extract; releasing it prunes the now-empty owner
+/// dir too, mirroring the normal uninstall path.
 #[cfg(windows)]
 fn janitor_delete_dir(dir: &Path) {
     use std::time::Duration;
     for _ in 0..50 {
-        if !dir.exists() || fs::remove_dir_all(dir).is_ok() {
-            if let Some(owner) = dir.parent() {
-                let _ = fs::remove_dir(owner);
-            }
+        if let Ok(_lock) = install::RepoLock::acquire(dir)
+            && (!dir.exists() || fs::remove_dir_all(dir).is_ok())
+        {
             return;
         }
         std::thread::sleep(Duration::from_millis(100));

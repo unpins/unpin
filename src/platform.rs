@@ -587,85 +587,240 @@ pub fn create_alias_link(dir: &Path, name: &str, target: &Path) -> io::Result<()
     }
 }
 
-/// RAII guard around a kernel-level advisory file lock. The open `File`
-/// inside is what holds the lock — dropping it releases the flock at the
-/// OS level whether `Drop` runs cleanly (normal exit) or not (SIGKILL,
-/// OOM, power loss, `panic = "abort"`). That replaces the old mtime-based
-/// "stale lock" heuristic, which had a TOCTOU race during takeover and
-/// would spuriously steal locks from slow real installs.
+/// A lock file that exists only while it is held: acquiring creates it and
+/// releasing removes it. Removing a lock file is racy on its own — a process
+/// that opened the old file just before it was removed can lock it while a
+/// third creates and locks a new one at the same path, and both believe they
+/// hold the lock. Each platform closes that race differently:
 ///
-/// The sentinel file at `path` stays on disk after Drop just to make the
-/// failure mode visible to a user investigating "why is unpin stuck"; the
-/// file's presence is *not* what gates the lock, so a leftover is harmless.
-/// We still remove it cosmetically when releasing cleanly.
+/// - Unix: the holder unlinks the path *before* closing, while still holding
+///   the lock, and an acquirer that got the lock checks that the path still
+///   names the file it locked (same dev/ino), retrying if not.
+/// - Windows: the file is opened without `FILE_SHARE_DELETE`, so its name
+///   cannot be removed while any unpin has it open. Whoever closes it last —
+///   the holder, or a waiter that gave up — removes it. Opening can then fail
+///   transiently while another process is deleting it, which is retried.
+///
+/// The kernel releases the lock when the handle closes for any reason (crash,
+/// SIGKILL, power loss), so a file a crash leaves behind is never stale: the
+/// next acquire and release of the same lock removes it.
+#[derive(Debug)]
+struct HeldFile {
+    file: Option<fs::File>,
+    path: PathBuf,
+    /// The package's repo dir, for a package lock: removed on release if it is
+    /// empty (an install that failed or was interrupted before its first
+    /// version), and then its owner dir too.
+    repo_dir: Option<PathBuf>,
+}
+
+impl Drop for HeldFile {
+    fn drop(&mut self) {
+        let Some(file) = self.file.take() else {
+            return;
+        };
+        crate::sigint::pop_cleanup(&self.path);
+        // Still held, so no other process is filling it.
+        if let Some(repo_dir) = &self.repo_dir {
+            let _ = fs::remove_dir(repo_dir);
+        }
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(&self.path);
+            drop(file);
+        }
+        #[cfg(windows)]
+        {
+            // unlock() can fail (e.g. the handle already invalidated); closing
+            // it releases the lock regardless.
+            let _ = file.unlock();
+            drop(file);
+            let _ = fs::remove_file(&self.path);
+        }
+        if self.repo_dir.is_some()
+            && let Some(owner) = self.path.parent()
+        {
+            let _ = fs::remove_dir(owner);
+        }
+    }
+}
+
+/// [`HeldFile`]'s release, for the interrupt handler, which runs while the
+/// guard is still owned elsewhere and the process is about to exit. On Windows
+/// the lock file can't be removed while this process still has it open; the
+/// next acquire and release of it removes it.
+pub fn release_on_interrupt(lock: &Path, repo_dir: Option<&Path>) {
+    if let Some(repo_dir) = repo_dir {
+        let _ = fs::remove_dir(repo_dir);
+    }
+    let _ = fs::remove_file(lock);
+    if repo_dir.is_some()
+        && let Some(owner) = lock.parent()
+    {
+        let _ = fs::remove_dir(owner);
+    }
+}
+
+/// Close a lock file this process opened but does not hold. On Unix the name
+/// belongs to its holder and must be left alone; on Windows the last handle to
+/// close removes it, and this may be the last one.
+fn give_up_lock_file(file: fs::File, path: &Path, prune_owner: bool) {
+    drop(file);
+    #[cfg(windows)]
+    {
+        let _ = fs::remove_file(path);
+        if prune_owner && let Some(owner) = path.parent() {
+            let _ = fs::remove_dir(owner);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (path, prune_owner);
+}
+
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    // `truncate(false)`: the body is the holder's diagnostic pid line.
+    opts.write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    opts.open(path)
+}
+
+/// An open error that means the file is changing hands, not that it can't be
+/// opened: its parent dir was pruned between `create_dir_all` and the open, or
+/// (Windows) another process is deleting it (32, sharing violation) or it is
+/// pending deletion (5, access denied). Both Windows codes were measured under
+/// contention on Windows 10 NTFS, not only with an indexer in the way.
+fn transient_open_error(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(windows)]
+    return matches!(e.raw_os_error(), Some(5 | 32));
+    #[cfg(not(windows))]
+    false
+}
+
+/// How long a transient open error is retried before it is reported.
+const LOCK_OPEN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take the lock at `path`. `repo_dir` is the package a package lock guards
+/// (see [`HeldFile::repo_dir`]). `block` is `None` for a non-blocking attempt
+/// (`Ok(None)` when another process holds it), or the notice to run once
+/// before waiting for it.
+fn acquire_lock_file<F: FnOnce()>(
+    path: &Path,
+    repo_dir: Option<&Path>,
+    mut block: Option<F>,
+) -> Result<Option<HeldFile>, String> {
+    let blocking = block.is_some();
+    let prune_owner = repo_dir.is_some();
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mut give_up_at = None;
+    loop {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        let file = match open_lock_file(path) {
+            Ok(f) => f,
+            Err(e) if transient_open_error(&e) => {
+                let at = *give_up_at
+                    .get_or_insert_with(|| std::time::Instant::now() + LOCK_OPEN_PATIENCE);
+                if std::time::Instant::now() >= at {
+                    return Err(format!("open lock {}: {e}", path.display()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => return Err(format!("open lock {}: {e}", path.display())),
+        };
+        let locked = match file.try_lock() {
+            Ok(()) => Ok(()),
+            Err(fs::TryLockError::WouldBlock) if blocking => {
+                if let Some(on_wait) = block.take() {
+                    on_wait();
+                }
+                file.lock()
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                give_up_lock_file(file, path, prune_owner);
+                return Ok(None);
+            }
+            Err(fs::TryLockError::Error(e)) => Err(e),
+        };
+        if let Err(e) = locked {
+            give_up_lock_file(file, path, prune_owner);
+            return Err(format!("lock {}: {e}", path.display()));
+        }
+        // Locked an inode its holder had already unlinked: that holder is gone,
+        // and whoever comes next will lock the file now at `path`, not this one.
+        #[cfg(unix)]
+        if !names_same_file(&file, path) {
+            give_up_at = None;
+            continue;
+        }
+        crate::sigint::push_lock_cleanup(path, repo_dir);
+        return Ok(Some(HeldFile {
+            file: Some(file),
+            path: path.to_owned(),
+            repo_dir: repo_dir.map(Path::to_owned),
+        }));
+    }
+}
+
+#[cfg(unix)]
+fn names_same_file(file: &fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Per-package lock, held while a package's repo dir is changed. Dropping it
+/// releases the lock and removes its file (see [`HeldFile`]).
 #[derive(Debug)]
 pub struct InstallLock {
-    file: fs::File,
-    path: PathBuf,
+    _held: HeldFile,
 }
 
-impl InstallLock {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
+/// Where the lock guarding `repo_dir` lives: beside it, not inside, so the repo
+/// dir can be removed while the lock is held. `~` is not valid in a GitHub
+/// name, so `<repo>~lock` never collides with another package's repo dir.
+pub fn install_lock_path(repo_dir: &Path) -> PathBuf {
+    let mut name = repo_dir.file_name().unwrap_or_default().to_owned();
+    name.push("~lock");
+    repo_dir.with_file_name(name)
 }
 
-impl Drop for InstallLock {
-    fn drop(&mut self) {
-        // unlock() can fail (e.g. fd already invalidated); ignore — the
-        // upcoming File::drop closes the fd, which releases the kernel
-        // lock regardless. The remove_file is cosmetic; it can fail when
-        // rdir was wiped underneath us (e.g. by `uninstall_one`).
-        let _ = self.file.unlock();
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// Acquire an exclusive advisory lock on `<repo_dir>/.unpin.lock`. Two `unpin`
-/// processes touching the same package serialize here; different packages run
-/// fully in parallel.
-///
-/// Uses `File::try_lock` (stable since Rust 1.89) which maps to `flock` on
-/// Unix and `LockFileEx` on Windows. The kernel releases the lock when the
-/// file descriptor closes for *any* reason, so crashes don't leave stale
-/// locks — no timeout heuristic needed.
+/// Acquire the exclusive lock of the package whose repo dir is `repo_dir`,
+/// without waiting. Two `unpin` processes touching the same package serialize
+/// here; different packages run fully in parallel. The repo dir itself is not
+/// created — the caller does that once it holds the lock. Releasing the lock
+/// also removes the repo dir if it is empty, and then the owner dir if that is.
 pub fn acquire_install_lock(repo_dir: &Path) -> Result<InstallLock, String> {
-    fs::create_dir_all(repo_dir).map_err(|e| format!("create {}: {e}", repo_dir.display()))?;
-    let lock_path = repo_dir.join(".unpin.lock");
-    // `truncate(false)` — we don't blow away the diagnostic PID line another
-    // unpin may have written. `write(true) + create(true)` is enough for our
-    // needs; the file body is informational only.
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| format!("open lock {}: {e}", lock_path.display()))?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(fs::TryLockError::WouldBlock) => {
-            return Err(format!(
-                "another `unpin install`/`update` is in progress for this package\n  \
-                 lock: {}",
-                lock_path.display()
-            ));
-        }
-        Err(fs::TryLockError::Error(e)) => {
-            return Err(format!("lock {}: {e}", lock_path.display()));
-        }
-    }
+    let lock_path = install_lock_path(repo_dir);
+    let Some(held) = acquire_lock_file(&lock_path, Some(repo_dir), None::<fn()>)? else {
+        return Err(format!(
+            "another `unpin install`/`update` is in progress for this package\n  \
+             lock: {}",
+            lock_path.display()
+        ));
+    };
     // Best-effort diagnostic — a user who finds a stuck `unpin` can grep the
     // pid to see which process is sitting on the lock. truncate-then-write
     // because the open didn't truncate.
-    use std::io::{Seek, SeekFrom, Write};
-    let _ = file.set_len(0);
-    let mut f = &file;
-    let _ = f.seek(SeekFrom::Start(0));
-    let _ = writeln!(f, "pid={}", std::process::id());
-    Ok(InstallLock {
-        file,
-        path: lock_path,
-    })
+    if let Some(file) = &held.file {
+        use std::io::{Seek, SeekFrom, Write};
+        let _ = file.set_len(0);
+        let mut f = file;
+        let _ = f.seek(SeekFrom::Start(0));
+        let _ = writeln!(f, "pid={}", std::process::id());
+    }
+    Ok(InstallLock { _held: held })
 }
 
 /// Process-wide exclusive lock guarding mutations of the shared `bin_dir`
@@ -673,21 +828,11 @@ pub fn acquire_install_lock(repo_dir: &Path) -> Result<InstallLock, String> {
 /// only covers a repo's own `repo_dir`; `bin_dir` is shared across every
 /// package, so without this two `unpin` processes installing *different*
 /// packages could interleave their link writes (lost links, an orphan sweep
-/// deleting the other's fresh link).
-///
-/// Unlike [`InstallLock`], the lock file is **never removed** on drop: this
-/// lock is acquired *blocking*, so a waiter holds an open fd to the file. If
-/// the holder unlinked it on release, a third process could create a fresh
-/// file at the same path and lock a *different* inode — two processes would
-/// then both "hold" the lock. Leaving the file in place keeps every process
-/// contending on one inode. The kernel still releases the advisory lock when
-/// the fd closes (clean drop, panic, SIGKILL, power loss), so a leftover file
-/// is harmless and never goes stale.
+/// deleting the other's fresh link). Its file exists only while it is held,
+/// like [`InstallLock`]'s (see [`HeldFile`]).
 #[derive(Debug)]
 pub struct LinksLock {
-    // The open fd is the lock; `Drop` closing it releases the flock. No
-    // explicit unlock or file removal (see type docs).
-    _file: fs::File,
+    _held: HeldFile,
 }
 
 /// Acquire the shared `bin_dir` links lock, blocking until it's free. Pass the
@@ -702,26 +847,10 @@ pub struct LinksLock {
 /// so a `WouldBlock` always means a live holder that will release when its
 /// (short) link phase — or its interactive prompt — completes.
 pub fn acquire_links_lock(data_dir: &Path, on_wait: impl FnOnce()) -> Result<LinksLock, String> {
-    fs::create_dir_all(data_dir).map_err(|e| format!("create {}: {e}", data_dir.display()))?;
     let lock_path = data_dir.join(".unpin-links.lock");
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| format!("open lock {}: {e}", lock_path.display()))?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(fs::TryLockError::WouldBlock) => {
-            on_wait();
-            file.lock()
-                .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
-        }
-        Err(fs::TryLockError::Error(e)) => {
-            return Err(format!("lock {}: {e}", lock_path.display()));
-        }
-    }
-    Ok(LinksLock { _file: file })
+    let held = acquire_lock_file(&lock_path, None, Some(on_wait))?
+        .expect("a blocking acquire either locks or fails");
+    Ok(LinksLock { _held: held })
 }
 
 /// Read the target path from an unpin-managed link, or `None` if `p` isn't one.
@@ -976,23 +1105,56 @@ mod tests {
     // ---- InstallLock ----
 
     #[test]
-    fn install_lock_acquire_creates_file_and_drop_removes_it() {
+    fn install_lock_lives_beside_the_repo_dir_and_drop_removes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
         let lock = acquire_install_lock(&repo).unwrap();
-        let lock_path = repo.join(".unpin.lock");
+        let lock_path = tmp.path().join("owner/name~lock");
         assert!(lock_path.exists());
+        // The repo dir is the caller's to create, and can go while held.
+        assert!(!repo.exists());
         drop(lock);
         assert!(!lock_path.exists());
+        // Releasing prunes the owner dir it left empty.
+        assert!(!tmp.path().join("owner").exists());
+    }
+
+    #[test]
+    fn install_lock_release_removes_the_repo_dir_only_if_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("owner/name");
+        // An install that created its repo dir and then failed.
+        let lock = acquire_install_lock(&repo).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        drop(lock);
+        assert!(!repo.exists());
+        assert!(!tmp.path().join("owner").exists());
+        // One that left a version behind keeps it.
+        let lock = acquire_install_lock(&repo).unwrap();
+        fs::create_dir_all(repo.join("v1")).unwrap();
+        drop(lock);
+        assert!(repo.join("v1").is_dir());
+        assert!(!install_lock_path(&repo).exists());
+    }
+
+    #[test]
+    fn install_lock_release_keeps_an_owner_dir_still_in_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("owner/other")).unwrap();
+        drop(acquire_install_lock(&tmp.path().join("owner/name")).unwrap());
+        assert!(tmp.path().join("owner/other").is_dir());
     }
 
     #[test]
     fn install_lock_second_acquire_fails_while_first_held() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
-        let _lock = acquire_install_lock(&repo).unwrap();
+        let lock = acquire_install_lock(&repo).unwrap();
         let err = acquire_install_lock(&repo).unwrap_err();
         assert!(err.contains("in progress"), "got: {err}");
+        // Giving up must not remove the holder's file.
+        assert!(install_lock_path(&repo).exists());
+        drop(lock);
     }
 
     #[test]
@@ -1006,27 +1168,68 @@ mod tests {
         let repo = tmp.path().join("owner/name");
         let first = acquire_install_lock(&repo).unwrap();
         drop(first);
-        let second = acquire_install_lock(&repo).unwrap();
-        assert_eq!(second.path(), repo.join(".unpin.lock"));
+        let _second = acquire_install_lock(&repo).unwrap();
+        assert!(install_lock_path(&repo).exists());
     }
 
     #[test]
     fn install_lock_takes_over_orphan_file_from_dead_holder() {
-        // Sentinel file from a previous run that died without unlocking:
-        // the file is on disk but no process holds the kernel flock. A
-        // fresh acquire must succeed (no mtime-based staleness check
-        // needed — the kernel knows nobody owns it).
+        // Lock file from a previous run that died holding it: the file is on
+        // disk but no process holds the kernel lock. A fresh acquire must
+        // succeed, and its release removes the leftover.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("owner/name");
-        fs::create_dir_all(&repo).unwrap();
-        let lock_path = repo.join(".unpin.lock");
+        fs::create_dir_all(tmp.path().join("owner")).unwrap();
+        let lock_path = install_lock_path(&repo);
         fs::write(&lock_path, "pid=99999\n").unwrap();
-        let lock = acquire_install_lock(&repo).unwrap();
-        assert_eq!(lock.path(), lock_path);
+        drop(acquire_install_lock(&repo).unwrap());
+        assert!(!lock_path.exists());
     }
 
     #[test]
-    fn links_lock_excludes_while_held_and_keeps_file_on_drop() {
+    fn install_lock_path_cannot_be_a_repo_name() {
+        // `~` is not valid in a GitHub name, so no repo dir can be spelled
+        // like another repo's lock (a repo may be named `.name.lock`).
+        let p = install_lock_path(Path::new("data/owner/name"));
+        assert_eq!(p, Path::new("data/owner/name~lock"));
+    }
+
+    /// Many threads with their own descriptors (flock and LockFileEx exclude
+    /// per open file, not per process) contend for one lock; two of them in
+    /// the critical section at once is the race a removed lock file invites.
+    /// The unguarded version of this scheme — unlock, then remove — fails it
+    /// within a second.
+    #[test]
+    fn install_lock_excludes_under_contention() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("owner/name");
+        let inside = AtomicUsize::new(0);
+        let acquired = AtomicUsize::new(0);
+        let end = Instant::now() + Duration::from_millis(1500);
+        std::thread::scope(|sc| {
+            for _ in 0..8 {
+                sc.spawn(|| {
+                    while Instant::now() < end {
+                        let Ok(lock) = acquire_install_lock(&repo) else {
+                            continue;
+                        };
+                        assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two holders");
+                        acquired.fetch_add(1, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                        drop(lock);
+                    }
+                });
+            }
+        });
+        assert!(acquired.load(Ordering::SeqCst) > 0);
+        assert!(!install_lock_path(&repo).exists());
+    }
+
+    #[test]
+    fn links_lock_excludes_while_held_and_drop_removes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let mut waited = false;
@@ -1044,19 +1247,39 @@ mod tests {
         ));
         drop(other);
 
-        // Unlike InstallLock, the file is NOT removed on drop: a blocking
-        // waiter holds an open fd, and unlinking would let a third process
-        // create a fresh inode and lock it in parallel.
         drop(lock);
-        assert!(
-            lock_path.exists(),
-            "links lock file must persist across drop"
-        );
+        assert!(!lock_path.exists());
+        // The data dir itself is never pruned.
+        assert!(data.is_dir());
 
         // Released cleanly, so it can be re-acquired with no wait.
         let mut waited2 = false;
         let _lock2 = acquire_links_lock(data, || waited2 = true).unwrap();
         assert!(!waited2);
+    }
+
+    #[test]
+    fn links_lock_blocking_waiters_exclude_under_contention() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let inside = AtomicUsize::new(0);
+        let end = Instant::now() + Duration::from_millis(1500);
+        std::thread::scope(|sc| {
+            for _ in 0..8 {
+                sc.spawn(|| {
+                    while Instant::now() < end {
+                        let lock = acquire_links_lock(data, || {}).unwrap();
+                        assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two holders");
+                        std::thread::yield_now();
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                        drop(lock);
+                    }
+                });
+            }
+        });
+        assert!(!data.join(".unpin-links.lock").exists());
     }
 
     #[test]
