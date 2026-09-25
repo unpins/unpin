@@ -1,0 +1,57 @@
+# The whole `cargo test` suite on every OS unpin ships for. The release build
+# (unpin.yml → action-build, nix) runs no tests — `doCheck = false` in
+# flake.nix — so this is the only place they run.
+#
+# Windows: the test binary is cross-built on ubuntu with mingw, the toolchain
+# the released unpin.exe is built with, and run on windows-latest; the same
+# split as smoke.yml's build-exe → windows.
+name: Test
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo test --locked
+
+  windows-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
+          rustup default stable
+      - name: Build the test binary
+        run: |
+          exe=$(cargo test --locked --target x86_64-pc-windows-gnu --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true) | .executable')
+          cp "$exe" unpin-tests.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unpin-tests-exe
+          path: unpin-tests.exe
+
+  windows:
+    needs: windows-build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unpin-tests-exe
+      - run: .\unpin-tests.exe
