@@ -15,11 +15,9 @@
     # download for each cross target — avoids the multi-hour cross-rustc
     # bootstrap that pkgsCross.<x>.rustPlatform triggers for musl targets
     # not pre-built on cache.nixos.org (i686-musl, muslpi, musl-power,
-    # riscv64-musl).
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    # riscv64-musl). Same rule as nixpkgs above: the catalog's one pin, so
+    # this binary and cfonts are built by the same rustc.
+    rust-overlay.follows = "unpins-lib/rust-overlay";
   };
 
   outputs = { self, nixpkgs, unpins-lib, rust-overlay }:
