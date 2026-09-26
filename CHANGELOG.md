@@ -5,6 +5,8 @@ Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-26
+
 ### Fixed
 - A package name typed with other capitals (`unpin install Tree`) installed a
   second copy of the package, which took over the first one's commands. Such a
