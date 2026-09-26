@@ -78,13 +78,6 @@ impl Config {
         self.get_bool("use_gh_auth").unwrap_or(false)
     }
 
-    /// Whether to download the per-release runtime data tarball
-    /// (`<pkg>-<tag>-data.tar.zst`) alongside the primary binary. Default true.
-    /// CLI `--no-data` overrides this to false for a single invocation.
-    pub fn data(&self) -> bool {
-        self.get_bool("data").unwrap_or(true)
-    }
-
     /// How to handle multi-call aliases declared by a catalog package's
     /// embedded `unpin/aliases`. Default [`AliasMode::Yes`] — install them
     /// silently and print the list. CLI `--aliases` / `--no-aliases` and
@@ -153,7 +146,6 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.http_timeout(), 30);
         assert!(!cfg.use_gh_auth());
-        assert!(cfg.data());
         assert_eq!(cfg.aliases(), AliasMode::Yes);
     }
 
@@ -185,8 +177,12 @@ mod tests {
             assert!(cfg.use_gh_auth(), "spelling `{v}` should be true");
         }
         for v in ["false", "FALSE", "no", "0"] {
-            let cfg = Config::parse(&format!("data = {v}\n"));
-            assert!(!cfg.data(), "spelling `{v}` should be false");
+            let cfg = Config::parse(&format!("use_gh_auth = {v}\n"));
+            assert_eq!(
+                cfg.get_bool("use_gh_auth"),
+                Some(false),
+                "spelling `{v}` should parse as false, not as absent"
+            );
         }
         // Garbage falls back to default.
         let cfg = Config::parse("use_gh_auth = maybe\n");

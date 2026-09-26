@@ -156,7 +156,7 @@ enum Phase {
     Idle(String),
     /// Live download against shared counters.
     Download(Arc<RowBytes>),
-    /// Frozen red bar at the failure point (run-path primary, companion error).
+    /// Frozen red bar at the failure point (run-path primary).
     DownloadFailed(Arc<RowBytes>, String),
     /// Settled final state.
     Done(Outcome),
@@ -171,11 +171,9 @@ struct Row {
 }
 
 /// Everything on screen. The render thread owns the only instance; workers
-/// mutate it indirectly via [`Msg`]. A companion (data tarball) download is a
-/// transient extra row appended after the fixed per-request rows.
+/// mutate it indirectly via [`Msg`].
 struct Model {
     rows: Vec<Row>,
-    companions: Vec<(u64, Row)>,
     /// Extra lines rendered *below* the bars while a prompt is open.
     prompt: Option<Vec<String>>,
 }
@@ -515,7 +513,7 @@ fn render_row(row: &Row, width: usize, frame: usize, color: bool, pad: usize) ->
 /// with `color = false`; the render thread calls it with `color = true`.
 ///
 /// Prefixes are padded to a single column width computed over *this frame's*
-/// visible rows (+ companions) — left-aligned bars with no fixed/hardcoded
+/// visible rows — left-aligned bars with no fixed/hardcoded
 /// width. Because the frame is computed once, the alignment can never tear: the
 /// pad either fits every row or none, never a mix.
 #[cfg(test)]
@@ -568,7 +566,7 @@ fn render_prompt(model: &Model, width: usize, color: bool) -> Vec<String> {
         .collect()
 }
 
-/// Just the bar rows (+ companions), without the prompt lines. The render
+/// Just the bar rows, without the prompt lines. The render
 /// thread repaints *only* this region while a prompt is open, leaving the
 /// prompt + the user's typed input untouched (via cursor save/restore) so the
 /// bars keep animating during the prompt.
@@ -578,7 +576,6 @@ fn render_block(model: &Model, width: usize, frame: usize, color: bool) -> Vec<S
             .rows
             .iter()
             .filter(|r| !matches!(r.phase, Phase::Cleared))
-            .chain(model.companions.iter().map(|(_, r)| r))
     };
     let pad = live()
         .map(|r| console::measure_text_width(&r.prefix))
@@ -598,8 +595,6 @@ enum Msg {
     Init(String),
     Phase(usize, Phase),
     Prefix(usize, String),
-    AddCompanion(u64, String, Arc<RowBytes>),
-    FinishCompanion(u64, Result<(), String>),
     Log(String),
     /// Show prompt lines below the bars; ack once drawn + paused.
     PromptShow(Vec<String>, mpsc::Sender<()>),
@@ -705,8 +700,8 @@ impl Paint {
     /// Brackets the redraw in cursor save/restore (`ESC 7`/`ESC 8`): save where
     /// the user is typing, jump up to the region top, rewrite each bar line
     /// (clear-to-EOL, never clear-to-EOS — that would wipe the prompt), restore
-    /// the cursor. Needs the bar-line count stable, which the loop guarantees by
-    /// deferring companion add/remove while a prompt is open. A keystroke echoed
+    /// the cursor. Needs the bar-line count stable, which holds because no
+    /// message adds or removes a row once the block is up. A keystroke echoed
     /// into the bar region during the tiny redraw window self-heals next tick.
     fn repaint_above(&self, screen: &Screen, shown: &[String], n_prompt: usize) {
         let bars = shown.len().saturating_sub(n_prompt);
@@ -744,41 +739,20 @@ fn render_loop(rx: mpsc::Receiver<Msg>, tty: bool) {
     let screen = Screen::new(tty);
     let mut model = Model {
         rows: Vec::new(),
-        companions: Vec::new(),
         prompt: None,
     };
     let mut paint = Paint::new();
     let mut logs: Vec<String> = Vec::new();
-    // Companion add/remove that arrives while a prompt is open. Applying it
-    // live would change the bar-line count under the prompt and break the
-    // in-place `repaint_above`; held here and flushed when the prompt closes.
-    let mut deferred: Vec<Msg> = Vec::new();
     let mut frame = 0usize;
 
     loop {
         match rx.recv_timeout(TICK) {
             Ok(m) => {
-                if process_one(
-                    m,
-                    &mut model,
-                    &mut paint,
-                    &screen,
-                    &mut logs,
-                    &mut deferred,
-                    frame,
-                ) {
+                if handle(m, &mut model, &mut paint, &screen, &mut logs, frame) {
                     return; // Interrupt/Shutdown handled the final frame.
                 }
                 while let Ok(m) = rx.try_recv() {
-                    if process_one(
-                        m,
-                        &mut model,
-                        &mut paint,
-                        &screen,
-                        &mut logs,
-                        &mut deferred,
-                        frame,
-                    ) {
+                    if handle(m, &mut model, &mut paint, &screen, &mut logs, frame) {
                         return;
                     }
                 }
@@ -809,33 +783,6 @@ fn full_frame(model: &Model, screen: &Screen, frame: usize) -> (Vec<String>, usi
     clamp_frame(block, prompt, height)
 }
 
-/// Dispatch one message, with two loop-level concerns layered over [`handle`]:
-/// defer structural companion changes while a prompt is open (so the
-/// bar-line count under the prompt stays put), and flush those deferred
-/// changes the moment the prompt closes.
-fn process_one(
-    m: Msg,
-    model: &mut Model,
-    paint: &mut Paint,
-    screen: &Screen,
-    logs: &mut Vec<String>,
-    deferred: &mut Vec<Msg>,
-    frame: usize,
-) -> bool {
-    if model.prompt.is_some() && matches!(m, Msg::AddCompanion(..) | Msg::FinishCompanion(..)) {
-        deferred.push(m);
-        return false;
-    }
-    let was_prompt = model.prompt.is_some();
-    let exit = handle(m, model, paint, screen, logs, frame);
-    if was_prompt && model.prompt.is_none() {
-        for dm in std::mem::take(deferred) {
-            handle(dm, model, paint, screen, logs, frame);
-        }
-    }
-    exit
-}
-
 /// Re-sample each live download's rate from its sliding window (see
 /// [`RowBytes::sample_rate`]). The displayed figure is the average over
 /// [`RATE_WINDOW`], which stays steady even when bytes arrive in lumps.
@@ -846,19 +793,13 @@ fn sample_rates(model: &Model) {
             b.sample_rate(now);
         }
     }
-    for (_, r) in &model.companions {
-        if let Phase::Download(b) = &r.phase {
-            b.sample_rate(now);
-        }
-    }
 }
 
 /// Collapse the Model to its interrupt freeze frame: keep only finished rows,
-/// drop every in-progress row, companion, and open prompt. The user's "preserve
+/// drop every in-progress row and any open prompt. The user's "preserve
 /// finished lines, clear what's in flight" Ctrl-C contract, made testable.
 fn freeze_model(model: &mut Model) {
     model.rows.retain(|r| matches!(r.phase, Phase::Done(_)));
-    model.companions.clear();
     model.prompt = None;
 }
 
@@ -887,23 +828,6 @@ fn handle(
                 r.prefix = p;
             }
         }
-        Msg::AddCompanion(id, prefix, bytes) => model.companions.push((
-            id,
-            Row {
-                prefix,
-                phase: Phase::Download(bytes),
-            },
-        )),
-        Msg::FinishCompanion(id, result) => match result {
-            Ok(()) => model.companions.retain(|(cid, _)| *cid != id),
-            Err(e) => {
-                if let Some((_, row)) = model.companions.iter_mut().find(|(cid, _)| *cid == id)
-                    && let Phase::Download(b) = &row.phase
-                {
-                    row.phase = Phase::DownloadFailed(b.clone(), e);
-                }
-            }
-        },
         Msg::Log(line) => logs.push(line),
         Msg::PromptShow(lines, ack) => {
             // Draw the question as the last block line(s) and park the cursor
@@ -969,7 +893,6 @@ pub struct Reporter {
     /// caller turns that `Skip` into the right outcome (refuse, or the safe
     /// non-destructive default); see the prompt methods below.
     quiet: bool,
-    next_companion: Arc<AtomicU64>,
 }
 
 impl Reporter {
@@ -1026,20 +949,6 @@ impl Reporter {
     /// Remove a row from the display (run-path success: the binary runs next).
     pub fn clear(&self, idx: usize) {
         let _ = self.tx.send(Msg::Phase(idx, Phase::Cleared));
-    }
-    /// Add a transient companion (data tarball) download row. Returns its id
-    /// (for [`Reporter::finish_companion`]) and shared counters.
-    pub fn add_companion(&self, prefix: impl Into<String>, hint: u64) -> (u64, Arc<RowBytes>) {
-        let id = self.next_companion.fetch_add(1, Ordering::Relaxed);
-        let bytes = RowBytes::new(hint);
-        let _ = self
-            .tx
-            .send(Msg::AddCompanion(id, prefix.into(), bytes.clone()));
-        (id, bytes)
-    }
-    /// Clear a companion row on success, or freeze it red on failure.
-    pub fn finish_companion(&self, id: u64, result: Result<(), String>) {
-        let _ = self.tx.send(Msg::FinishCompanion(id, result));
     }
     /// Print a line into history *above* the live block.
     pub fn log(&self, msg: impl Into<String>) {
@@ -1161,7 +1070,6 @@ pub fn start(prefixes: Vec<String>, quiet: bool) -> (Reporter, Handle) {
         tx: tx.clone(),
         tty,
         quiet,
-        next_companion: Arc::new(AtomicU64::new(0)),
     };
     let handle = Handle {
         tx,
@@ -1219,12 +1127,6 @@ impl Ui {
             Ui::Live(r) => r.prompt_pick(header, items),
         }
     }
-    /// Clear a companion row (live only; a no-op without bars).
-    pub fn finish_companion(&self, id: u64, result: Result<(), String>) {
-        if let Ui::Live(r) = self {
-            r.finish_companion(id, result);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1247,11 +1149,7 @@ mod tests {
         }
     }
     fn model(rows: Vec<Row>) -> Model {
-        Model {
-            rows,
-            companions: Vec::new(),
-            prompt: None,
-        }
+        Model { rows, prompt: None }
     }
     /// Render one row to plain text at a generous width (no truncation).
     fn line(row: Row, frame: usize) -> String {
@@ -1339,23 +1237,13 @@ mod tests {
     }
 
     #[test]
-    fn companion_and_prompt_lines_render_below_rows() {
-        let mut m = model(vec![idle("a", "Queued")]);
-        let cb = RowBytes::new(10);
-        cb.add(5);
-        m.companions.push((
-            0,
-            Row {
-                prefix: "a 1.0 (data)".into(),
-                phase: Phase::Download(cb),
-            },
-        ));
+    fn prompt_lines_render_below_the_rows() {
+        let mut m = model(vec![idle("a", "Queued"), idle("b", "Queued")]);
         m.prompt = Some(vec!["Replace? [y/N] ".into()]);
         let lines = render_lines(&m, 200, 0, false);
         assert_eq!(lines.len(), 3);
-        // "a" is padded to the companion prefix width so both spinners align.
-        assert!(lines[0].starts_with("  a "));
-        assert!(lines[1].contains("(data)"));
+        assert!(lines[0].contains('a'));
+        assert!(lines[1].contains('b'));
         assert_eq!(lines[2], "Replace? [y/N] ");
     }
 
@@ -1430,20 +1318,12 @@ mod tests {
                 phase: Phase::Done(Outcome::Skip("kept".into())),
             },
         ]);
-        let cb = RowBytes::new(10);
-        m.companions.push((
-            0,
-            Row {
-                prefix: "x (data)".into(),
-                phase: Phase::Download(cb),
-            },
-        ));
         m.prompt = Some(vec!["Replace? [y/N] ".into()]);
 
         freeze_model(&mut m);
 
-        // Two finished rows survive; the in-progress download, the companion,
-        // and the open prompt are all gone.
+        // Two finished rows survive; the in-progress download and the open
+        // prompt are both gone.
         let lines = render_lines(&m, 200, 0, false);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("done-pkg  ✓"));
@@ -1451,7 +1331,7 @@ mod tests {
         assert!(
             !lines
                 .iter()
-                .any(|l| l.contains("busy-pkg") || l.contains("data") || l.contains("Replace"))
+                .any(|l| l.contains("busy-pkg") || l.contains("Replace"))
         );
     }
 

@@ -5,6 +5,13 @@ Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Removed
+- The `--no-data` option and the `data` config setting. No package in the
+  catalog publishes the separate data file they controlled: a package that
+  needs data files at runtime carries them inside its binary. `unpin` no longer
+  looks for that file, and a release that still has one (only `nmap v7.99-1`)
+  now installs as the bare binary — pick a newer version of it instead.
+
 ## [0.5.0] - 2026-09-26
 
 ### Fixed

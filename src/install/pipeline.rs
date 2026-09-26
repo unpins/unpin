@@ -22,8 +22,7 @@ use crate::platform::{self, Paths};
 use crate::progress::{self, Reporter, Ui};
 
 use super::asset::{
-    ambiguous_assets_error, fetch_expected_sha256, find_checksum_url, find_companion,
-    narrow_assets, pick_asset,
+    ambiguous_assets_error, fetch_expected_sha256, find_checksum_url, narrow_assets, pick_asset,
 };
 use super::job::{PipelineMode, PipelineRequest, PrepareOutcome, PromptKind, ResolutionData};
 use super::linker::{LinkSummary, link_all_executables};
@@ -41,7 +40,6 @@ pub struct InstallOptions {
     /// both pools, capping at the number of input requests.
     pub jobs: u8,
     pub pick: bool,
-    pub include_data: bool,
     pub alias_mode: AliasMode,
     /// Reinstall over a complete cache: bypass the `UpToDate`/`Cached`
     /// short-circuits so the package is re-downloaded and re-extracted.
@@ -54,16 +52,14 @@ pub struct InstallOptions {
 
 impl InstallOptions {
     /// Combine CLI overrides with config defaults. `alias_override` comes
-    /// from `--aliases`/`--no-aliases`/`--ask-aliases` resolution; `no_data`
-    /// from `--no-data`. Caller owns the `ctx` so config lookups happen
-    /// here at the boundary rather than scattered in pipeline functions.
-    #[allow(clippy::too_many_arguments)] // CLI→policy boundary; each flag is distinct
+    /// from `--aliases`/`--no-aliases`/`--ask-aliases` resolution. Caller owns
+    /// the `ctx` so config lookups happen here at the boundary rather than
+    /// scattered in pipeline functions.
     pub fn resolve(
         ctx: &Ctx,
         assume_yes: bool,
         jobs: u8,
         pick: bool,
-        no_data: bool,
         force: bool,
         quiet: bool,
         alias_override: Option<AliasMode>,
@@ -72,7 +68,6 @@ impl InstallOptions {
             assume_yes,
             jobs,
             pick,
-            include_data: !no_data && ctx.cfg.data(),
             alias_mode: alias_override.unwrap_or_else(|| ctx.cfg.aliases()),
             force,
             quiet,
@@ -99,11 +94,6 @@ pub struct ExtractJob {
     /// `None` → already cached, worker skips the download path entirely.
     pub asset: Option<Asset>,
     pub expected_sha256: Option<String>,
-    /// Data tarball companion (e.g. `<pkg>-<tag>-data.tar.zst`) bundled with the
-    /// release. Extracted into the same `extract_dir` after the primary.
-    /// `None` for packages without runtime data (the common case).
-    pub companion: Option<Asset>,
-    pub companion_expected_sha256: Option<String>,
     /// Cross-process lock on the package's `repo_dir`. Held from preflight
     /// (right before the first destructive write) through the end of Phase C
     /// linking. `None` for cached jobs (no write happens, no lock needed).
@@ -182,13 +172,6 @@ fn remove_tree(dir: &Path) -> io::Result<()> {
     fs::remove_dir(dir)
 }
 
-/// Which leg of an install the missing-checksum prompt is about. Drives the
-/// warning text and the prompt question — primary asset vs. data companion.
-enum ChecksumKind {
-    Primary,
-    Companion,
-}
-
 /// Resolve the published SHA-256 for one asset. Fetches the `.sha256` (or
 /// `.sha256sum`) sidecar when present; falls back to either a stderr warning
 /// (`-y`) or an interactive y/N prompt. Returns `Ok(None)` when the user
@@ -197,7 +180,6 @@ fn resolve_checksum_for(
     ctx: &Ctx,
     assets: &[Asset],
     asset_name: &str,
-    kind: ChecksumKind,
     assume_yes: bool,
 ) -> Result<Option<String>, String> {
     if let Some(url) = find_checksum_url(assets, asset_name) {
@@ -208,24 +190,12 @@ fn resolve_checksum_for(
     // way, when we proceed we surface a stderr warning — the install/run
     // path otherwise looks identical to a verified one, which would hide
     // the trust gap from the user.
-    let (data_tag, question, abort_msg) = match kind {
-        ChecksumKind::Primary => (
-            "",
-            "No SHA-256 checksum found. Continue without verification?",
-            "aborted: missing checksum",
-        ),
-        ChecksumKind::Companion => (
-            " (data)",
-            "Data companion has no SHA-256 checksum. Continue without verification?",
-            "aborted: missing companion checksum",
-        ),
-    };
     if assume_yes {
         eprintln!(
-            "warning: no SHA-256 checksum published for {asset_name}{data_tag}; downloading without verification"
+            "warning: no SHA-256 checksum published for {asset_name}; downloading without verification"
         );
-    } else if !prompt_yes_no(question) {
-        return Err(abort_msg.into());
+    } else if !prompt_yes_no("No SHA-256 checksum found. Continue without verification?") {
+        return Err("aborted: missing checksum".into());
     }
     Ok(None)
 }
@@ -256,27 +226,11 @@ pub fn preflight_extract(
     release: Release,
     assume_yes: bool,
     pick: bool,
-    include_data: bool,
 ) -> Result<ExtractJob, String> {
     let vdir = ctx
         .paths
         .version_dir(&spec.owner, &spec.name, &release.tag_name);
-    // `--no-data` (or `data = false` in config) suppresses the companion lookup
-    // entirely. As a side effect the cache-complete check no longer requires
-    // `share/`, so a vdir installed without data won't be re-extracted by a
-    // later `--no-data` install/update — and conversely, a vdir installed with
-    // `--no-data` will be re-extracted when the user later runs without it.
-    let companion_peek = if include_data {
-        find_companion(&spec.name, &release.tag_name, &release.assets)
-    } else {
-        None
-    };
-    // Cache is complete iff the version dir exists AND, if a companion exists,
-    // share/ is present (the companion's payload). Without this, a download
-    // interrupted between primary and companion leaves a half-installed vdir
-    // that the cache check would happily accept.
-    let cache_complete = vdir.is_dir() && (companion_peek.is_none() || vdir.join("share").is_dir());
-    if cache_complete && !pick {
+    if vdir.is_dir() && !pick {
         return Ok(ExtractJob {
             spec,
             release,
@@ -284,8 +238,6 @@ pub fn preflight_extract(
             vdir,
             asset: None,
             expected_sha256: None,
-            companion: None,
-            companion_expected_sha256: None,
             _lock: None,
         });
     }
@@ -296,28 +248,7 @@ pub fn preflight_extract(
     // install/run on the same package error out while the user is deciding.
     // The asset picker above is likewise pre-lock. Mirrors run_pipeline_v2,
     // which resolves on a worker thread and only locks in finalize_resolution.
-    let expected_sha256 = resolve_checksum_for(
-        ctx,
-        &release.assets,
-        &asset.name,
-        ChecksumKind::Primary,
-        assume_yes,
-    )?;
-    let companion = if include_data {
-        find_companion(&spec.name, &release.tag_name, &release.assets).cloned()
-    } else {
-        None
-    };
-    let companion_expected_sha256 = match companion.as_ref() {
-        Some(c) => resolve_checksum_for(
-            ctx,
-            &release.assets,
-            &c.name,
-            ChecksumKind::Companion,
-            assume_yes,
-        )?,
-        None => None,
-    };
+    let expected_sha256 = resolve_checksum_for(ctx, &release.assets, &asset.name, assume_yes)?;
     // All prompts are done — now take the lock and clear stale staging, the
     // smallest window that still fully covers the destructive extract.
     let extract_dir = part_dir_for(&vdir);
@@ -329,36 +260,19 @@ pub fn preflight_extract(
         extract_dir,
         asset: Some(asset),
         expected_sha256,
-        companion,
-        companion_expected_sha256,
         _lock: Some(lock),
     })
 }
 
-/// Shared counters for the two concurrent legs of one extract. `companion`
-/// carries the companion row's id (to clear/fail it) alongside its counters.
+/// Byte counters for the download leg of one extract.
 pub struct DlSinks {
     pub primary: Arc<dyn ByteSink>,
-    pub companion: Option<(u64, Arc<dyn ByteSink>)>,
 }
 
-/// Join a scoped worker, re-raising its panic *as the original panic* rather
-/// than the misleading "called `Result::unwrap()` on an `Err` value: Any { .. }"
-/// that a plain `.join().unwrap()` produces. Under `panic = "abort"` (release)
-/// a worker panic aborts before we get here; this only shapes the dev/unwind
-/// build, but a real bug should surface its true message and location, not a
-/// raw `Result::Err` dump.
-fn join_or_resume<T>(h: thread::ScopedJoinHandle<'_, T>) -> T {
-    h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
-}
-
-/// Orchestrate one ExtractJob: download+extract primary, and (if present)
-/// data companion **concurrently** via `thread::scope`. They write disjoint
-/// subtrees of the same `.part` staging tree (e.g. `bin/` vs `share/`), so
-/// there's no contention.
+/// Orchestrate one ExtractJob: download+extract the asset into the `.part`
+/// staging tree.
 ///
-/// The **companion** row is transient and finalized here (cleared on Ok,
-/// frozen red on Err) via `ui.finish_companion`. The **primary** row is left
+/// The **primary** row is left
 /// in its download state; the caller decides its final glyph (the pipeline
 /// morphs it through Linking → Installed; the single-package `run` path calls
 /// `Reporter::done_*` / `download_failed`).
@@ -393,57 +307,15 @@ fn extract_and_publish(
     sinks: &DlSinks,
 ) -> Result<(), String> {
     let repo = job.spec.repo();
-    let result = if let (Some(companion), Some((cid, csink))) =
-        (job.companion.as_ref(), sinks.companion.as_ref())
-    {
-        // Run primary + companion in parallel. They write disjoint subtrees
-        // (bin/ vs share/), so there's no contention; the join below
-        // propagates the first error. Each leg gets its own `Ui` clone — the live handle's
-        // mpsc sender is `Send` but not `Sync`, so the two scoped threads
-        // can't share a borrow of it.
-        let (ui_p, ui_c) = (ui.clone(), ui.clone());
-        let (r_prim, r_comp) = thread::scope(|s| {
-            let h_prim = s.spawn(|| {
-                download_extract_verify(
-                    ctx,
-                    &ui_p,
-                    &repo,
-                    false,
-                    &sinks.primary,
-                    primary_asset,
-                    job.expected_sha256.as_deref(),
-                    &job.extract_dir,
-                )
-            });
-            let h_comp = s.spawn(|| {
-                download_extract_verify(
-                    ctx,
-                    &ui_c,
-                    &repo,
-                    true,
-                    csink,
-                    companion,
-                    job.companion_expected_sha256.as_deref(),
-                    &job.extract_dir,
-                )
-            });
-            (join_or_resume(h_prim), join_or_resume(h_comp))
-        });
-        // Companion row is transient — clear on success, freeze red on error.
-        ui.finish_companion(*cid, r_comp.clone());
-        r_prim.and(r_comp)
-    } else {
-        download_extract_verify(
-            ctx,
-            ui,
-            &repo,
-            false,
-            &sinks.primary,
-            primary_asset,
-            job.expected_sha256.as_deref(),
-            &job.extract_dir,
-        )
-    };
+    let result = download_extract_verify(
+        ctx,
+        ui,
+        &repo,
+        &sinks.primary,
+        primary_asset,
+        job.expected_sha256.as_deref(),
+        &job.extract_dir,
+    );
 
     result.and_then(|()| {
         // Atomic publish step. The two paths are siblings under the same
@@ -462,17 +334,12 @@ fn extract_and_publish(
 
 /// One download → extract → verify step against one [`ByteSink`]. **Row
 /// finalization is the caller's responsibility** — this only drives byte
-/// progress and returns the result. (`do_extract` finalizes the companion
-/// row; the primary row is left for the outer pipeline to morph through
-/// Linking → Installed.) The vdir is shared between primary and companion
-/// calls — both tar streams write disjoint subtrees, so concurrent
-/// invocations are safe.
-#[allow(clippy::too_many_arguments)]
+/// progress and returns the result; the primary row is left for the outer
+/// pipeline to morph through Linking → Installed.
 fn download_extract_verify(
     ctx: &Ctx,
     ui: &Ui,
     repo: &str,
-    is_companion: bool,
     sink: &Arc<dyn ByteSink>,
     asset: &Asset,
     expected_sha256: Option<&str>,
@@ -512,8 +379,7 @@ fn download_extract_verify(
             // standalone line would just be noise above the live block. Keep
             // the digest under -v, paired with the `GET` line above, for
             // anyone debugging *which* checksum was matched.
-            let suffix = if is_companion { " (data)" } else { "" };
-            ui.println(format!("  verified {repo}{suffix}  ({})", &expected[..16]));
+            ui.println(format!("  verified {repo}  ({})", &expected[..16]));
         }
     } else if let Some(total) = content_length
         && got_bytes != total
@@ -710,9 +576,8 @@ pub fn run_pipeline_v2(
                         Ok(p) => p,
                         Err(_) => break,
                     };
-                    // Switch the row to a live download (+ a transient
-                    // companion row) and hand the shared counters to the
-                    // download. Cached jobs never reach the extract pool.
+                    // Switch the row to a live download and hand the shared
+                    // counters to it. Cached jobs never reach the extract pool.
                     //
                     // The prefix appends the now-known version to the row's
                     // display-name identity (catalog `jq`, third-party
@@ -723,17 +588,10 @@ pub fn run_pipeline_v2(
                         let prefix = job.spec.with_tag(&job.release.tag_name);
                         let primary: Arc<dyn ByteSink> =
                             reporter.start_download(idx, prefix, asset.size);
-                        let companion = job.companion.as_ref().map(|c| {
-                            let cprefix =
-                                format!("{} (data)", job.spec.with_tag(&job.release.tag_name));
-                            let (cid, csink) = reporter.add_companion(cprefix, c.size);
-                            (cid, csink as Arc<dyn ByteSink>)
-                        });
-                        DlSinks { primary, companion }
+                        DlSinks { primary }
                     } else {
                         DlSinks {
                             primary: Arc::new(github::NoopSink),
-                            companion: None,
                         }
                     };
                     let result = do_extract(ctx, &job, &ui, &sinks);
@@ -882,8 +740,7 @@ fn link_on_main(
     // A fresh download (asset present) whose `.sha256` sidecar was absent ran
     // without integrity verification. Surface that on the row itself — yellow
     // ⚠ "… (unverified)" — instead of a separate warning line.
-    let unverified = (job.asset.is_some() && job.expected_sha256.is_none())
-        || (job.companion.is_some() && job.companion_expected_sha256.is_none());
+    let unverified = job.asset.is_some() && job.expected_sha256.is_none();
     match link_all_executables(
         paths,
         ui,
@@ -938,13 +795,7 @@ fn preflight_resolve(
     let vdir = ctx
         .paths
         .version_dir(&spec.owner, &spec.name, &release.tag_name);
-    let companion_peek = if opts.include_data {
-        find_companion(&spec.name, &release.tag_name, &release.assets)
-    } else {
-        None
-    };
-    let cache_complete = vdir.is_dir() && (companion_peek.is_none() || vdir.join("share").is_dir());
-    if cache_complete && !opts.pick && !opts.force {
+    if vdir.is_dir() && !opts.pick && !opts.force {
         return Ok(PrepareOutcome::Cached(Box::new(release)));
     }
 
@@ -959,10 +810,7 @@ fn preflight_resolve(
             asset: None,
             candidates,
             expected_sha256: None,
-            companion: None,
-            companion_expected_sha256: None,
             primary_checksum_missing: false,
-            companion_checksum_missing: false,
         };
         return Ok(PrepareOutcome::NeedsPrompt(
             PromptKind::AssetPicker,
@@ -976,38 +824,17 @@ fn preflight_resolve(
             Some(url) => (Some(fetch_expected_sha256(ctx, &url)?), false),
             None => (None, true),
         };
-    let companion = if opts.include_data {
-        find_companion(&spec.name, &release.tag_name, &release.assets).cloned()
-    } else {
-        None
-    };
-    let (companion_expected_sha256, companion_checksum_missing) = match companion.as_ref() {
-        Some(c) => match find_checksum_url(&release.assets, &c.name) {
-            Some(url) => (Some(fetch_expected_sha256(ctx, &url)?), false),
-            None => (None, true),
-        },
-        None => (None, false),
-    };
-
     let data = ResolutionData {
         release,
         asset: Some(asset),
         candidates: Vec::new(),
         expected_sha256,
-        companion,
-        companion_expected_sha256,
         primary_checksum_missing,
-        companion_checksum_missing,
     };
 
     if primary_checksum_missing {
         Ok(PrepareOutcome::NeedsPrompt(
             PromptKind::MissingChecksum,
-            Box::new(data),
-        ))
-    } else if companion_checksum_missing {
-        Ok(PrepareOutcome::NeedsPrompt(
-            PromptKind::MissingCompanionChecksum,
             Box::new(data),
         ))
     } else {
@@ -1050,8 +877,6 @@ fn finalize_resolution(
                 vdir,
                 asset: None,
                 expected_sha256: None,
-                companion: None,
-                companion_expected_sha256: None,
                 _lock: None,
             }))
         }
@@ -1111,38 +936,15 @@ fn finalize_resolution(
                         };
                     data.expected_sha256 = expected;
                     data.primary_checksum_missing = primary_missing;
-                    let companion = if opts.include_data {
-                        find_companion(&spec.name, &data.release.tag_name, &data.release.assets)
-                            .cloned()
-                    } else {
-                        None
-                    };
-                    if let Some(c) = companion.as_ref() {
-                        match find_checksum_url(&data.release.assets, &c.name) {
-                            Some(url) => {
-                                data.companion_expected_sha256 =
-                                    Some(fetch_expected_sha256(ctx, &url)?);
-                            }
-                            None => {
-                                data.companion_checksum_missing = true;
-                            }
-                        }
-                    }
-                    data.companion = companion;
                     data.asset = Some(chosen);
                 }
-                PromptKind::MissingChecksum | PromptKind::MissingCompanionChecksum => {}
+                PromptKind::MissingChecksum => {}
             }
 
             // Cascade: handle missing-checksum prompts now (possibly fresh
             // from the picker resolution).
             if data.primary_checksum_missing {
-                match resolve_missing_checksum_prompt(
-                    ui,
-                    ChecksumKind::Primary,
-                    opts.assume_yes,
-                    opts.quiet,
-                ) {
+                match resolve_missing_checksum_prompt(ui, opts.assume_yes, opts.quiet) {
                     PromptResult::Got(true) => {}
                     PromptResult::Got(false) => {
                         return Err("aborted: missing checksum".into());
@@ -1152,25 +954,6 @@ fn finalize_resolution(
                     }
                 }
                 data.primary_checksum_missing = false;
-            }
-            if data.companion_checksum_missing {
-                match resolve_missing_checksum_prompt(
-                    ui,
-                    ChecksumKind::Companion,
-                    opts.assume_yes,
-                    opts.quiet,
-                ) {
-                    PromptResult::Got(true) => {}
-                    PromptResult::Got(false) => {
-                        return Err("aborted: missing companion checksum".into());
-                    }
-                    PromptResult::Skip => {
-                        return Ok(Resolved::Skipped(
-                            "missing companion checksum skipped".into(),
-                        ));
-                    }
-                }
-                data.companion_checksum_missing = false;
             }
             match check_replace_active(&ctx.paths, spec, &data.release.tag_name, mode, opts, ui) {
                 ReplaceDecision::Proceed => {}
@@ -1246,8 +1029,6 @@ fn into_extract_job(paths: &Paths, spec: Spec, data: ResolutionData) -> Result<E
         extract_dir,
         asset: data.asset,
         expected_sha256: data.expected_sha256,
-        companion: data.companion,
-        companion_expected_sha256: data.companion_expected_sha256,
         _lock: Some(lock),
     })
 }
@@ -1256,12 +1037,7 @@ fn into_extract_job(paths: &Paths, spec: Spec, data: ResolutionData) -> Result<E
 /// asset. Returns `Got(true)` to continue without verification, `Got(false)`
 /// to abort the install with a hard error, or `Skip` (user typed `s` or
 /// stdin is non-TTY) to mark the package as skipped — non-fatal.
-fn resolve_missing_checksum_prompt(
-    ui: &Ui,
-    kind: ChecksumKind,
-    assume_yes: bool,
-    quiet: bool,
-) -> PromptResult<bool> {
+fn resolve_missing_checksum_prompt(ui: &Ui, assume_yes: bool, quiet: bool) -> PromptResult<bool> {
     if assume_yes {
         // No separate warning line under -y: the missing-checksum fact is
         // folded into the package's final row instead (yellow ⚠
@@ -1274,13 +1050,7 @@ fn resolve_missing_checksum_prompt(
         // fail this package (the run still exits non-zero and prints the error).
         return PromptResult::Got(false);
     }
-    let question = match kind {
-        ChecksumKind::Primary => "No SHA-256 checksum found. Continue without verification?",
-        ChecksumKind::Companion => {
-            "Data companion has no SHA-256 checksum. Continue without verification?"
-        }
-    };
-    ui.prompt_yes_no(question)
+    ui.prompt_yes_no("No SHA-256 checksum found. Continue without verification?")
 }
 
 /// Compose the trailing summary that sits to the right of the green check-mark,
@@ -1371,33 +1141,11 @@ mod tests {
         // Security gate: a quiet run can't show the y/N, and a silent skip would
         // read as success. It must refuse — `Got(false)` makes the caller fail
         // the package (non-zero exit), never a non-fatal `Skip`.
-        let r = resolve_missing_checksum_prompt(&Ui::Plain, ChecksumKind::Primary, false, true);
+        let r = resolve_missing_checksum_prompt(&Ui::Plain, false, true);
         assert!(matches!(r, PromptResult::Got(false)));
         // `-y` still wins (explicit opt-in to run unverified), quiet or not.
-        let y = resolve_missing_checksum_prompt(&Ui::Plain, ChecksumKind::Primary, true, true);
+        let y = resolve_missing_checksum_prompt(&Ui::Plain, true, true);
         assert!(matches!(y, PromptResult::Got(true)));
-    }
-
-    #[test]
-    fn join_or_resume_reraises_the_original_panic_not_an_err_dump() {
-        // A plain `.join().unwrap()` would surface the worker panic as
-        // "called `Result::unwrap()` on an `Err` value: Any { .. }". This
-        // helper must instead re-raise the *original* payload verbatim.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {})); // silence the test-run stderr
-        let caught = std::panic::catch_unwind(|| {
-            thread::scope(|s| {
-                let h = s.spawn(|| -> i32 { panic!("boom-original") });
-                join_or_resume(h)
-            })
-        });
-        std::panic::set_hook(prev);
-        let payload = caught.expect_err("worker panic should propagate");
-        let msg = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .expect("payload is the original &str panic message");
-        assert_eq!(msg, "boom-original");
     }
 
     #[test]

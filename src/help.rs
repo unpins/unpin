@@ -91,10 +91,6 @@ pub fn footer(config_path: Option<&Path>) {
                 "shell out to `gh auth token` (default: false)",
             ),
             (
-                "data         = true|false",
-                "download per-release data tarball (default: true)",
-            ),
-            (
                 "aliases      = yes|no|ask",
                 "install multi-call aliases declared by catalog packages \
                  (default: yes; non-catalog <owner>/<repo> installs always skip)",

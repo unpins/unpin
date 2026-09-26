@@ -2,9 +2,8 @@
 //!
 //! `pick_asset` is the main entry: filter by OS/arch keys, narrow when an
 //! unambiguous match exists, prompt the user when `--pick` is set or when
-//! ambiguity remains. `find_companion` pairs a primary asset with its data
-//! tarball when the release ships one. `parse_sha256` + helpers consume the
-//! checksum file the release publishes alongside the asset.
+//! ambiguity remains. `parse_sha256` + helpers consume the checksum file the
+//! release publishes alongside the asset.
 
 use std::io::{self, IsTerminal};
 
@@ -74,9 +73,10 @@ pub fn classify_excluded(name_lower: &str) -> Option<&'static str> {
     if name_lower.contains(".bsdiff") {
         return Some("unsupported format");
     }
-    // Data companion of another release asset: `<pkg>-<tag>-data.tar.zst`. One
-    // per release (platform-agnostic runtime data, e.g. vim/share/vim/<ver>).
-    // Excluded from the picker — preflight pairs it with the primary by tag.
+    // `<pkg>-<tag>-data.tar.zst`: the companion archive the catalog no longer
+    // publishes. Releases cut before it was dropped still carry one, and it is
+    // not a binary — keep it out of the picker so it can never be installed as
+    // one.
     if name_lower.ends_with("-data.tar.zst") {
         return Some("data companion");
     }
@@ -282,24 +282,6 @@ pub fn ambiguous_assets_error(candidate_names: &[String]) -> String {
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
     )
-}
-
-/// Find `<pkg>-<tag>-data.tar.zst` in the release's assets. Tries both raw
-/// `tag` and `v`-stripped (GitHub releases typically tag as `v9.2.0` but our
-/// build emits the data asset using the bare version). Returns `None` for
-/// packages that don't ship a runtime tarball.
-pub fn find_companion<'a>(pkg: &str, tag: &str, assets: &'a [Asset]) -> Option<&'a Asset> {
-    let pkg_l = pkg.to_ascii_lowercase();
-    let tag_l = tag.to_ascii_lowercase();
-    let tag_v = tag_l.trim_start_matches('v');
-    let candidates = [
-        format!("{pkg_l}-{tag_l}-data.tar.zst"),
-        format!("{pkg_l}-{tag_v}-data.tar.zst"),
-    ];
-    assets.iter().find(|a| {
-        let n = a.name.to_ascii_lowercase();
-        candidates.contains(&n)
-    })
 }
 
 pub fn find_checksum_url(assets: &[Asset], asset_name: &str) -> Option<String> {
@@ -677,31 +659,6 @@ mod tests {
     }
 
     #[test]
-    fn find_companion_matches_tagged_data_asset() {
-        let assets = vec![
-            Asset {
-                name: "gvim-9.2.0-x86_64-linux.zst".into(),
-                browser_download_url: "u1".into(),
-                size: 0,
-            },
-            Asset {
-                name: "gvim-9.2.0-x86_64-windows.exe.zst".into(),
-                browser_download_url: "u2".into(),
-                size: 0,
-            },
-            Asset {
-                name: "gvim-9.2.0-data.tar.zst".into(),
-                browser_download_url: "u3".into(),
-                size: 0,
-            },
-        ];
-        let c = find_companion("gvim", "v9.2.0", &assets).unwrap();
-        assert_eq!(c.name, "gvim-9.2.0-data.tar.zst");
-        let c2 = find_companion("gvim", "9.2.0", &assets).unwrap();
-        assert_eq!(c2.name, "gvim-9.2.0-data.tar.zst");
-    }
-
-    #[test]
     fn prompt_pick_errors_clearly_when_stdin_is_not_a_terminal() {
         // Under `cargo test` stdin is piped, so prompt_pick can't read a
         // choice. It must fail with the non-TTY message — not the old
@@ -766,12 +723,6 @@ mod tests {
         assert!(msg.contains("windows-gnu.zip"), "got: {msg}");
         assert!(msg.contains("windows-msvc.zip"), "got: {msg}");
         assert!(msg.contains("interactive terminal"), "got: {msg}");
-    }
-
-    #[test]
-    fn find_companion_returns_none_when_absent() {
-        let assets = mk_assets(&["tree-2.2.1-x86_64-linux.zst"]);
-        assert!(find_companion("tree", "v2.2.1", &assets).is_none());
     }
 
     #[test]

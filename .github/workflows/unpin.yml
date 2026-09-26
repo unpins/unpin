@@ -19,7 +19,6 @@ jobs:
     uses: unpins/action-build/.github/workflows/build.yml@main
     with:
       package_name: 'unpin'
-      package_data: false
       # unpin is the bootstrap: users download it by hand from unpins.org,
       # so the artifact gets a stable filename without version embedded.
       bootstrap_naming: true

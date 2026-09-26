@@ -46,9 +46,8 @@ pub enum PrepareOutcome {
     /// latest release tag. Bar finishes as "Up to date (vX)" and no
     /// further work happens for this request.
     UpToDate(Box<Release>),
-    /// The version dir is already on disk and complete (companion present
-    /// when needed). Skip the download entirely; the linker still runs so
-    /// any new aliases or removed companion symlinks get applied.
+    /// The version dir is already on disk. Skip the download entirely; the
+    /// linker still runs so any new or removed aliases get applied.
     Cached(Box<Release>),
     /// Resolution complete — no prompt needed. The dispatcher acquires the
     /// per-repo lock, wipes any stale `.part` dir, and hands the resulting
@@ -67,9 +66,6 @@ pub enum PromptKind {
     AssetPicker,
     /// Release has no `.sha256`/`.sha256sum` sidecar for the chosen asset.
     MissingChecksum,
-    /// Same for the data companion. Distinct so the message text matches
-    /// what the user actually sees on disk ("(data)" tag).
-    MissingCompanionChecksum,
 }
 
 /// All the data a preflight worker can resolve without prompting. Most fields
@@ -84,12 +80,9 @@ pub struct ResolutionData {
     /// Full candidate list for the `AssetPicker` prompt. Empty otherwise.
     pub candidates: Vec<Asset>,
     pub expected_sha256: Option<String>,
-    pub companion: Option<Asset>,
-    pub companion_expected_sha256: Option<String>,
     /// `true` when the release has no `.sha256` sidecar for the chosen
     /// primary asset. With `--yes` the dispatcher prints a warning and
     /// proceeds; without it, the dispatcher converts this into a
     /// `MissingChecksum` prompt.
     pub primary_checksum_missing: bool,
-    pub companion_checksum_missing: bool,
 }

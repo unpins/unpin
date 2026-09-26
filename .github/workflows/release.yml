@@ -14,7 +14,6 @@ jobs:
     uses: unpins/action-build/.github/workflows/release.yml@main
     with:
       package_name: 'unpin'
-      package_data: false
       bootstrap_naming: true
       own_software: true
     secrets:

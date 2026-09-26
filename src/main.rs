@@ -336,9 +336,6 @@ struct InstallUpdateFlags {
     /// Silence progress and per-package summaries; only errors are printed (pair with -y for unattended runs)
     #[arg(short = 'q', long = "quiet", conflicts_with = "verbose")]
     quiet: bool,
-    /// Skip the per-release runtime data tarball (overrides config `data = true`)
-    #[arg(long = "no-data")]
-    no_data: bool,
     /// Install multi-call aliases declared by the package (overrides config `aliases = no/ask`)
     #[arg(long = "aliases")]
     aliases_yes: bool,
@@ -360,7 +357,6 @@ impl InstallUpdateFlags {
             self.assume_yes,
             self.jobs,
             self.pick,
-            self.no_data,
             self.force,
             self.quiet,
             alias_override,

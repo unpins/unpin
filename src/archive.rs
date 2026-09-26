@@ -22,9 +22,9 @@ pub fn extract<R: Read>(asset_name: &str, reader: R, dest: &Path) -> Result<(), 
         unpack_zip(reader, dest)
     } else if lower.ends_with(".zst") {
         // Single-stream zstd (no tar inside). Asset name minus `.zst` is the
-        // binary name. Place under `bin/` so siblings extracted from a `.tar.zst`
-        // data companion (which puts files at `share/...`) line up: vim's
-        // argv[0]-walk then resolves <exe_dir>/../share/vim/<ver>.
+        // binary name. Place under `bin/` so the vdir has the same shape as one
+        // extracted from a tarball, and a program that resolves data relative to
+        // its own path finds <exe_dir>/../share/... where it expects to.
         //
         // `stem` is attacker-controlled (taken verbatim from the GitHub asset
         // name, minus the `.zst`). Routing the write through cap-std's

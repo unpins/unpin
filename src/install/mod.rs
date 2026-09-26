@@ -2,10 +2,9 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 
 use crate::ctx::Ctx;
-use crate::github::{self, ByteSink, Release};
+use crate::github::{self, Release};
 use crate::meta;
 use crate::platform::{self, Paths};
 use crate::progress::{self, Ui};
@@ -1186,36 +1185,25 @@ pub fn run(
         }
         Err(e) => return Err(e.into()),
     };
-    // `run` always includes data — bypassing it could leave the binary
-    // non-functional (gvim/vim need share/), and `run` is the "just try it"
-    // path where surprises are worst. Use `install --no-data` if you need a
-    // bare binary on disk.
-    //
     // `assume_yes` comes from the `-y` flag. Without it, `preflight_extract`
     // prompts when a release lacks a SHA-256 checksum, and a non-TTY stdin
     // turns the prompt into a refusal — `unpin run owner/repo` in a script
     // won't silently execute unverified code.
-    let job = preflight_extract(ctx, spec.clone(), release.clone(), assume_yes, pick, true)?;
+    let job = preflight_extract(ctx, spec.clone(), release.clone(), assume_yes, pick)?;
     let vdir = job.vdir.clone();
     let needs_download = job.asset.is_some();
     if needs_download {
-        // A one-row live block for the single package's download (+ a
-        // transient companion row). Cleared on success — the binary runs
-        // next, so no leftover line; frozen red on failure.
+        // A one-row live block for the single package's download. Cleared on
+        // success — the binary runs next, so no leftover line; frozen red on
+        // failure.
         let prefix = spec.with_tag(&release.tag_name);
         // `run` has no `--quiet` (it forwards everything to the tool); never quiet.
         let (reporter, handle) = progress::start(vec![prefix.clone()], false);
         let ui = Ui::Live(reporter.clone());
         let asset_size = job.asset.as_ref().map(|a| a.size).unwrap_or(0);
         let primary = reporter.start_download(0, prefix, asset_size);
-        let companion = job.companion.as_ref().map(|c| {
-            let cprefix = format!("{} (data)", spec.with_tag(&release.tag_name));
-            let (cid, csink) = reporter.add_companion(cprefix, c.size);
-            (cid, csink as Arc<dyn ByteSink>)
-        });
         let sinks = pipeline::DlSinks {
             primary: primary.clone(),
-            companion,
         };
         let result = do_extract(ctx, &job, &ui, &sinks);
         finalize_primary_row(&reporter, 0, primary, &result);

@@ -38,11 +38,11 @@ pub fn walk_files(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
 /// Walk a vdir for files that might become PATH entries: top-level files
 /// (a single-binary release that puts the binary at the root) and anything
 /// inside `bin/` (the canonical location for catalog packages). Skips
-/// `share/`, `lib/`, `etc/`, `libexec/` and any other subtree shipped by a
-/// runtime-data tarball — those are full of scripts (`.pl`, `.awk`, `.sh`)
-/// with +x set that we have no business promoting into the user's PATH.
-/// vim's `share/vim/runtime/tools/*.pl` is the concrete case that motivated
-/// this restriction.
+/// `share/`, `lib/`, `etc/`, `libexec/` and any other subtree a release
+/// tarball may carry — those are full of scripts (`.pl`, `.awk`, `.sh`) with
+/// +x set that we have no business promoting into the user's PATH. The case
+/// that motivated the restriction was a vim tarball whose
+/// `share/vim/runtime/tools/*.pl` all landed in PATH.
 ///
 /// Lone-root fallback: most third-party release tarballs nest everything one
 /// level down under a single root directory named after the asset
@@ -1089,9 +1089,9 @@ mod tests {
 
     #[test]
     fn walk_binary_candidates_skips_share_subtree() {
-        // Regression test for the linker.rs scope fix. vim's data tarball
-        // ships scripts under `share/vim/runtime/tools/*.pl` with +x set —
-        // those used to be promoted into PATH because the linker walked the
+        // Regression test for the linker.rs scope fix. A tarball that ships
+        // scripts under `share/vim/runtime/tools/*.pl` with +x set used to get
+        // every one of them promoted into PATH, because the linker walked the
         // whole vdir recursively. The candidate walk now stops at top-level
         // files and the `bin/` subtree.
         let tmp = tempfile::tempdir().unwrap();
