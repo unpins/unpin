@@ -9,7 +9,8 @@ Versioning](https://semver.org).
 - A package name typed with different capitals than its GitHub repository
   (`unpin install Tree`, `unpin install UNPINS/tree`) installed a second copy
   of the package, with its own `list` entry, which took over the first one's
-  commands. Such a name is now refused in every command, with the right
+  commands. Such a name is now refused — on install and update against the
+  spelling GitHub returns, offline against the one on disk — with the right
   spelling suggested ("did you mean `tree`?"). A copy already installed under
   another spelling, or under the old name of a repository since renamed on
   GitHub, no longer updates: reinstall it under the current name
@@ -20,10 +21,12 @@ Versioning](https://semver.org).
   "redefinition of 'vasprintf'".
 - Two `unpin` processes working on the same package could both proceed at
   once — often on Windows, rarely elsewhere — and `clean` could remove a
-  version the self-install had just placed. A failed or interrupted install
-  no longer leaves lock files, empty directories or (on Windows) its `.part`
-  folder behind, and a ctrl-c after one package had failed could remove
-  another `unpin`'s install of that package while it was running.
+  version the self-install had just placed. A ctrl-c after one package had
+  failed could remove another `unpin`'s install of that package while it was
+  running.
+- A failed or interrupted install left lock files, empty directories and (on
+  Windows) its `.part` folder behind. `unpin clean` also removes the lock
+  files 0.4 kept inside each package's directory.
 - ctrl-c while `unpin run` waits for its program goes to the program
   alone, and its exit code is unpin's. unpin used to exit under it, leaving
   a program that handles ctrl-c (vim, a Python prompt) running on its own.
