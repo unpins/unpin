@@ -6,44 +6,35 @@ Versioning](https://semver.org).
 ## [Unreleased]
 
 ### Fixed
-- A package name typed with different capitals than its GitHub repository
-  (`unpin install Tree`, `unpin install UNPINS/tree`) installed a second copy
-  of the package, with its own `list` entry, which took over the first one's
-  commands. Such a name is now refused — on install and update against the
-  spelling GitHub returns, offline against the one on disk — with the right
-  spelling suggested ("did you mean `tree`?"). A copy already installed under
-  another spelling, or under the old name of a repository since renamed on
-  GitHub, no longer updates: reinstall it under the current name
-  (`unpin uninstall Tree && unpin install tree`).
-- After `unpin clean` removed a package's only version, `info` and
-  `uninstall` still reported it as installed while `list` did not.
-- Building unpin for Windows with a MinGW-w64 12 toolchain failed with
-  "redefinition of 'vasprintf'".
+- A package name typed with other capitals (`unpin install Tree`) installed a
+  second copy of the package, which took over the first one's commands. Such a
+  name is now refused, with the right spelling suggested. A copy already
+  installed under another spelling no longer updates — reinstall it under the
+  current name.
+- After `unpin clean` removed a package's only version, `info` and `uninstall`
+  still reported it as installed while `list` did not.
 - Two `unpin` processes working on the same package could both proceed at
-  once — often on Windows, rarely elsewhere — and `clean` could remove a
-  version the self-install had just placed. A ctrl-c after one package had
-  failed could remove another `unpin`'s install of that package while it was
-  running.
-- A failed or interrupted install left lock files, empty directories and (on
-  Windows) its `.part` folder behind. `unpin clean` also removes the lock
-  files 0.4 kept inside each package's directory.
-- ctrl-c while `unpin run` waits for its program goes to the program
-  alone, and its exit code is unpin's. unpin used to exit under it, leaving
-  a program that handles ctrl-c (vim, a Python prompt) running on its own.
+  once, often on Windows, and one could remove what the other had just
+  installed.
+- A failed or interrupted install left lock files, empty directories and, on
+  Windows, its `.part` folder behind. `unpin clean` also removes the lock
+  files 0.4 left inside each package's directory.
 - An interrupted `unpin uninstall` or `unpin clean` could leave a partly
   removed version, which `unpin run` then started.
-- Windows: `unpin run` exits with its program's whole exit code; one above
-  255 (a crash, or ctrl-c's 0xC000013A) was cut to its low byte.
-- Windows: adding unpin's folder to the user PATH turned the PATH's
-  `%VARIABLE%` references into fixed paths. An entry for the folder spelled
-  another way (`%LOCALAPPDATA%`, an 8.3 short name, a junction) was not
-  recognised, so the folder could be added twice or left on the PATH by an
-  uninstall.
-- Installing a multicall package (e.g. `mtools`) no longer warns that its
-  own name "is provided by more than one binary in this package".
-- Windows: when `%LOCALAPPDATA%` was spelled differently from the disk (an
-  8.3 short name, or other capitals), `unpin clean` removed installed
-  versions as orphans.
+- ctrl-c during `unpin run` goes to the program alone. unpin used to exit
+  under it, leaving a program that handles ctrl-c (vim, a Python prompt)
+  running on its own.
+- Windows: `unpin run` cut an exit code above 255 — a crash, or ctrl-c — to
+  its low byte.
+- Windows: adding unpin's folder to your PATH turned the PATH's `%VARIABLE%`
+  references into fixed paths, and the folder could be added twice or left
+  behind by an uninstall.
+- Windows: `unpin clean` removed installed versions as orphans when
+  `%LOCALAPPDATA%` was spelled differently from the disk.
+- Installing a multicall package (e.g. `mtools`) warned that its own name "is
+  provided by more than one binary in this package".
+- Building unpin for Windows with a MinGW-w64 12 toolchain failed with
+  "redefinition of 'vasprintf'".
 
 ### Security
 - Built on nixpkgs 26.05 (was 25.11), with the catalog's musl CVE patches.
