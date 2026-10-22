@@ -24,6 +24,15 @@ impl Spec {
         format!("{}/{}", self.owner, self.name)
     }
 
+    /// The verb of a catalog helper (`unpins/unpin-<verb>`), reached only as
+    /// `unpin <verb>` (docs/helper-verbs.md). A foreign `owner/unpin-*` is an
+    /// ordinary program.
+    pub fn helper_verb(&self) -> Option<&str> {
+        (self.owner == CATALOG_OWNER)
+            .then(|| self.name.strip_prefix("unpin-"))
+            .flatten()
+    }
+
     /// How the package is shown to the user: a curated catalog entry is just its
     /// bare `name` (the `unpins/` owner is implied and pure noise), while a
     /// third-party package keeps its disambiguating `<owner>/<name>`. Display

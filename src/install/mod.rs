@@ -266,12 +266,16 @@ pub(crate) fn installed_binaries(
         resolve_installed(paths, name)?.ok_or_else(|| format!("`{name}` is not installed"))?;
     let version = active_version(paths, &owner, &repo)
         .ok_or_else(|| format!("`{name}` has no linked version (try `unpin install {name}`)"))?;
-    let vdir = paths.version_dir(&owner, &repo, &version);
+    binaries_primary_first(&paths.version_dir(&owner, &repo, &version), &repo)
+}
+
+/// The binary candidates in `vdir`, the primary (file stem == `repo`) first:
+/// the embedded metadata lives in it, so a reader taking the first hit finds
+/// it before any helper binaries.
+pub(crate) fn binaries_primary_first(vdir: &Path, repo: &str) -> Result<Vec<PathBuf>, String> {
     let mut cands = Vec::new();
-    linker::walk_binary_candidates(&vdir, &mut cands)
+    linker::walk_binary_candidates(vdir, &mut cands)
         .map_err(|e| format!("scan {}: {e}", vdir.display()))?;
-    // The man blob lives in the primary binary; sort name-match first so the
-    // reader hits it before any helper binaries.
     cands.sort_by_key(|p| {
         let stem = p
             .file_stem()
@@ -544,6 +548,7 @@ pub fn link_installed(
         &Ui::Plain,
         spec,
         vdir,
+        &Vec::new(),
         assume_yes,
         crate::aliases::AliasMode::No,
     )?;

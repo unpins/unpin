@@ -11,6 +11,11 @@ Versioning](https://semver.org).
   the ZIP the existing releases use, and reads only the metadata, not the rest
   of the image.
 
+### Changed
+- A catalog package whose binary carries no aliases or man pages is now
+  refused, by `install` and by `unpin <pkg>` alike, and the download is not
+  kept. Packages from other owners install and run as before.
+
 ### Removed
 - The `--no-data` option and the `data` config setting. No package in the
   catalog publishes the separate data file they controlled: a package that

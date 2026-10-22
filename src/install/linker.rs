@@ -300,11 +300,16 @@ pub struct LinkSummary {
     pub notes: Vec<String>,
 }
 
+/// Aliases already read from a version's binaries, keyed by path relative to
+/// the version dir. The linker reads only the binaries not listed here.
+pub type KnownAliases = Vec<(PathBuf, Vec<String>)>;
+
 pub fn link_all_executables(
     paths: &Paths,
     ui: &Ui,
     spec: &Spec,
     vdir: &Path,
+    known: &KnownAliases,
     assume_yes: bool,
     alias_mode: AliasMode,
 ) -> Result<LinkSummary, String> {
@@ -314,8 +319,7 @@ pub fn link_all_executables(
     // name. This is the *only* way a helper is treated differently from any
     // other package. See docs/helper-verbs.md. (Foreign `owner/unpin-*` is a
     // normal program and still links.)
-    if spec.owner == CATALOG_OWNER && spec.name.starts_with("unpin-") {
-        let verb = spec.name.strip_prefix("unpin-").unwrap_or(&spec.name);
+    if let Some(verb) = spec.helper_verb() {
         return Ok(LinkSummary {
             notes: vec![format!(
                 "`{}` is a helper verb — kept resident, not linked on PATH (run it with `unpin {verb}`)",
@@ -409,8 +413,13 @@ pub fn link_all_executables(
         // most packages have one, but a multi-binary release with two
         // alias-bearing primaries would just contribute both lists. The
         // catalog-only gate is enforced inside `link_aliases_for`.
+        let rel = target.strip_prefix(vdir).unwrap_or(target);
+        let declared = match known.iter().find(|(p, _)| p == rel) {
+            Some((_, a)) => a.clone(),
+            None => meta::read(target)?.map(|m| m.aliases()).unwrap_or_default(),
+        };
         let alias_outcome = link_aliases_for(
-            paths, ui, &rdir, &refreshed, target, short, spec, alias_mode, assume_yes,
+            paths, ui, &rdir, &refreshed, target, short, declared, spec, alias_mode, assume_yes,
         )?;
         for a in &alias_outcome.linked {
             refreshed.push(bin.join(platform::alias_link_filename(a)));
@@ -479,14 +488,11 @@ fn link_aliases_for(
     claimed: &[PathBuf],
     primary: &Path,
     primary_name: &str,
+    declared: Vec<String>,
     spec: &Spec,
     alias_mode: AliasMode,
     assume_yes: bool,
 ) -> Result<AliasOutcome, String> {
-    let declared = match meta::read(primary)? {
-        None => return Ok(AliasOutcome::default()),
-        Some(m) => m.aliases(),
-    };
     // A multicall binary announces every name it answers to, its own included —
     // the payload carries the dispatcher's whole table, so builder and installer
     // read one list instead of two that differ by a name. The slot for that name
@@ -799,7 +805,7 @@ mod tests {
         };
 
         let v1 = mk_vdir("v1", &["foo", "bar"]);
-        link_all_executables(&paths, &ui, &spec, &v1, true, AliasMode::No).unwrap();
+        link_all_executables(&paths, &ui, &spec, &v1, &vec![], true, AliasMode::No).unwrap();
         assert!(bin.join("foo").exists() && bin.join("bar").exists());
         assert!(
             platform::read_link(&bin.join("foo"))
@@ -808,7 +814,8 @@ mod tests {
         );
 
         let v2 = mk_vdir("v2", &["foo"]);
-        let summary = link_all_executables(&paths, &ui, &spec, &v2, true, AliasMode::No).unwrap();
+        let summary =
+            link_all_executables(&paths, &ui, &spec, &v2, &vec![], true, AliasMode::No).unwrap();
 
         // foo repointed to v2, no v1 link survives, bar (dropped) removed.
         let foo_target = platform::read_link(&bin.join("foo")).unwrap();
@@ -818,6 +825,45 @@ mod tests {
         );
         assert!(!bin.join("bar").exists(), "dropped bar should be gone");
         assert!(summary.primary.contains(&"foo".to_string()));
+    }
+
+    /// Aliases the catalog check already read are used as they are: the
+    /// binary here carries none, so a link proves it was not read again.
+    #[cfg(unix)]
+    #[test]
+    fn known_aliases_are_not_read_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let paths = Paths {
+            data: tmp.path().join("data"),
+            bin: bin.clone(),
+            config: tmp.path().join("config"),
+        };
+        let spec = Spec {
+            owner: CATALOG_OWNER.into(),
+            name: "tool".into(),
+            version: None,
+        };
+        let vdir = paths.version_dir(CATALOG_OWNER, "tool", "v1");
+        fs::create_dir_all(vdir.join("bin")).unwrap();
+        let p = vdir.join("bin").join("tool");
+        fs::write(&p, b"\x7fELF no container").unwrap();
+        ensure_executable(&p).unwrap();
+
+        let known = vec![(PathBuf::from("bin/tool"), vec!["tl".to_string()])];
+        let summary = link_all_executables(
+            &paths,
+            &Ui::Plain,
+            &spec,
+            &vdir,
+            &known,
+            true,
+            AliasMode::Yes,
+        )
+        .unwrap();
+        assert_eq!(summary.aliases, ["tl"]);
+        assert!(bin.join("tl").exists());
     }
 
     #[cfg(unix)]
@@ -855,7 +901,8 @@ mod tests {
             version: None,
         };
         let vdir = mk_vdir(CATALOG_OWNER, "unpin-search");
-        let summary = link_all_executables(&paths, &ui, &verb, &vdir, true, AliasMode::No).unwrap();
+        let summary =
+            link_all_executables(&paths, &ui, &verb, &vdir, &vec![], true, AliasMode::No).unwrap();
         assert!(
             !bin.join("search").exists(),
             "helper verb must not link on PATH"
@@ -875,7 +922,7 @@ mod tests {
             version: None,
         };
         let fvdir = mk_vdir("someone", "unpin-search");
-        link_all_executables(&paths, &ui, &foreign, &fvdir, true, AliasMode::No).unwrap();
+        link_all_executables(&paths, &ui, &foreign, &fvdir, &vec![], true, AliasMode::No).unwrap();
         assert!(
             bin.join("search").exists(),
             "foreign unpin-* should link normally"
@@ -885,8 +932,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn aliases_gate_credential_names_behind_confirmation() {
-        use std::io::Write as _;
-
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         let bin = tmp.path().join("bin");
@@ -908,21 +953,9 @@ mod tests {
         let vbin = paths.version_dir(CATALOG_OWNER, "tool", "v1").join("bin");
         fs::create_dir_all(&vbin).unwrap();
         let primary = vbin.join("tool");
-        let mut bytes = b"\x7fELF not-really-an-elf ".to_vec();
-        {
-            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            zw.start_file("unpin/aliases", opts).unwrap();
-            zw.write_all(b"sudo\nxzcat\n").unwrap();
-            bytes.extend_from_slice(&zw.finish().unwrap().into_inner());
-        }
-        fs::write(&primary, &bytes).unwrap();
+        fs::write(&primary, b"\x7fELF not-really-an-elf ").unwrap();
         ensure_executable(&primary).unwrap();
-        assert_eq!(
-            meta::read(&primary).unwrap().unwrap().aliases(),
-            vec!["sudo".to_string(), "xzcat".to_string()]
-        );
+        let declared = || vec!["sudo".to_string(), "xzcat".to_string()];
 
         // `--yes` auto-confirms the gate: both names link.
         let out = link_aliases_for(
@@ -932,6 +965,7 @@ mod tests {
             &[],
             &primary,
             "tool",
+            declared(),
             &spec,
             AliasMode::Yes,
             true,
@@ -953,6 +987,7 @@ mod tests {
             &[],
             &primary,
             "tool",
+            declared(),
             &spec,
             AliasMode::Yes,
             false,
@@ -975,8 +1010,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn alias_matching_the_binarys_own_name_is_dropped() {
-        use std::io::Write as _;
-
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -995,16 +1028,7 @@ mod tests {
         let vbin = paths.version_dir(CATALOG_OWNER, "mtools", "v1").join("bin");
         fs::create_dir_all(&vbin).unwrap();
         let primary = vbin.join("mtools");
-        let mut bytes = b"\x7fELF not-really-an-elf ".to_vec();
-        {
-            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            zw.start_file("unpin/aliases", opts).unwrap();
-            zw.write_all(b"mtools\nmkmanifest\nmdir\n").unwrap();
-            bytes.extend_from_slice(&zw.finish().unwrap().into_inner());
-        }
-        fs::write(&primary, &bytes).unwrap();
+        fs::write(&primary, b"\x7fELF not-really-an-elf ").unwrap();
         ensure_executable(&primary).unwrap();
 
         let out = link_aliases_for(
@@ -1014,6 +1038,7 @@ mod tests {
             &[bin.join("mtools")],
             &primary,
             "mtools",
+            ["mtools", "mkmanifest", "mdir"].map(String::from).to_vec(),
             &spec,
             AliasMode::Yes,
             true,

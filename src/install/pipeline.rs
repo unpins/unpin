@@ -18,6 +18,7 @@ use crate::aliases::AliasMode;
 use crate::archive;
 use crate::ctx::Ctx;
 use crate::github::{self, Asset, ByteSink, Release};
+use crate::meta;
 use crate::platform::{self, Paths};
 use crate::progress::{self, Reporter, Ui};
 
@@ -25,10 +26,10 @@ use super::asset::{
     ambiguous_assets_error, fetch_expected_sha256, find_checksum_url, narrow_assets, pick_asset,
 };
 use super::job::{PipelineMode, PipelineRequest, PrepareOutcome, PromptKind, ResolutionData};
-use super::linker::{LinkSummary, link_all_executables};
+use super::linker::{KnownAliases, LinkSummary, link_all_executables};
 use super::prompt::PromptResult;
-use super::spec::Spec;
-use super::{RepoLock, active_version, fetch_release, prompt_yes_no};
+use super::spec::{CATALOG_OWNER, Spec};
+use super::{RepoLock, active_version, binaries_primary_first, fetch_release, prompt_yes_no};
 
 /// Resolved per-invocation policy for one `install`/`update` call. Bundled
 /// so the pipeline functions don't carry a five-arg tail of policy flags.
@@ -280,9 +281,16 @@ pub struct DlSinks {
 /// A failed or interrupted extract removes `.part`; one killed outright leaves
 /// only `.part` on disk, so the next `vdir.is_dir()` cache check correctly
 /// classifies the package as not installed.
-pub fn do_extract(ctx: &Ctx, job: &ExtractJob, ui: &Ui, sinks: &DlSinks) -> Result<(), String> {
+///
+/// Returns the aliases the catalog check read, for the linker to reuse.
+pub fn do_extract(
+    ctx: &Ctx,
+    job: &ExtractJob,
+    ui: &Ui,
+    sinks: &DlSinks,
+) -> Result<KnownAliases, String> {
     let Some(primary_asset) = job.asset.as_ref() else {
-        return Ok(()); // cached
+        return Ok(Vec::new()); // cached
     };
     let rdir = ctx.paths.repo_dir(&job.spec.owner, &job.spec.name);
     fs::create_dir_all(&rdir).map_err(|e| format!("mkdir {}: {e}", rdir.display()))?;
@@ -305,7 +313,7 @@ fn extract_and_publish(
     ctx: &Ctx,
     ui: &Ui,
     sinks: &DlSinks,
-) -> Result<(), String> {
+) -> Result<KnownAliases, String> {
     let repo = job.spec.repo();
     let result = download_extract_verify(
         ctx,
@@ -317,19 +325,51 @@ fn extract_and_publish(
         &job.extract_dir,
     );
 
-    result.and_then(|()| {
-        // Atomic publish step. The two paths are siblings under the same
-        // parent dir (same filesystem on every supported OS), so rename is
-        // a metadata-only operation — no half-rename window. After this
-        // succeeds the package looks installed; before, it doesn't.
-        fs::rename(&job.extract_dir, &job.vdir).map_err(|e| {
-            format!(
-                "rename {} -> {}: {e}",
-                job.extract_dir.display(),
-                job.vdir.display()
-            )
+    result
+        .and_then(|()| require_catalog_meta(&job.spec, &job.extract_dir))
+        .and_then(|known| {
+            // Atomic publish step. The two paths are siblings under the same
+            // parent dir (same filesystem on every supported OS), so rename is
+            // a metadata-only operation — no half-rename window. After this
+            // succeeds the package looks installed; before, it doesn't.
+            fs::rename(&job.extract_dir, &job.vdir).map_err(|e| {
+                format!(
+                    "rename {} -> {}: {e}",
+                    job.extract_dir.display(),
+                    job.vdir.display()
+                )
+            })?;
+            Ok(known)
         })
-    })
+}
+
+/// Every catalog binary is built with embedded metadata, so a catalog download
+/// in which no binary carries it is damaged or was not built by the catalog.
+/// Checked in `.part`, before publishing: a refused download never becomes a
+/// version dir that `run` would start or a later install would reuse. The full
+/// read, not a presence probe, so a damaged container is refused here too.
+/// Helper verbs are exempt (they are never linked, so nothing reads it); other
+/// owners may carry none. Candidates are the ones `unpin man` reads. Returns
+/// the aliases of every binary read, so the linker doesn't read them again.
+fn require_catalog_meta(spec: &Spec, dir: &Path) -> Result<KnownAliases, String> {
+    let mut known = Vec::new();
+    if spec.owner != CATALOG_OWNER || spec.helper_verb().is_some() {
+        return Ok(known);
+    }
+    for p in binaries_primary_first(dir, &spec.name)? {
+        let meta = meta::read(&p)?;
+        let found = meta.is_some();
+        let rel = p.strip_prefix(dir).unwrap_or(&p).to_path_buf();
+        known.push((rel, meta.map(|m| m.aliases()).unwrap_or_default()));
+        if found {
+            return Ok(known);
+        }
+    }
+    Err(format!(
+        "{}: no embedded unpin metadata — every {CATALOG_OWNER}/ binary carries it; \
+         the download is damaged or was not built by {CATALOG_OWNER}",
+        spec.repo()
+    ))
 }
 
 /// One download → extract → verify step against one [`ByteSink`]. **Row
@@ -404,10 +444,10 @@ pub(super) fn finalize_primary_row(
     reporter: &Reporter,
     idx: usize,
     bytes: Arc<progress::RowBytes>,
-    result: &Result<(), String>,
+    result: &Result<KnownAliases, String>,
 ) {
     match result {
-        Ok(()) => reporter.clear(idx),
+        Ok(_) => reporter.clear(idx),
         Err(e) => reporter.download_failed(idx, bytes, e.clone()),
     }
 }
@@ -541,7 +581,7 @@ pub fn run_pipeline_v2(
     let (extract_tx, extract_rx) = mpsc::channel::<(usize, ExtractJob)>();
     let extract_rx = Arc::new(Mutex::new(extract_rx));
     let (extract_done_tx, extract_done_rx) =
-        mpsc::channel::<(usize, ExtractJob, Result<(), String>)>();
+        mpsc::channel::<(usize, ExtractJob, Result<KnownAliases, String>)>();
 
     thread::scope(|s| {
         // ---- Preflight worker pool ----
@@ -644,6 +684,7 @@ pub fn run_pipeline_v2(
                                 idx,
                                 &ui,
                                 job,
+                                &Vec::new(),
                                 &mut errors,
                             );
                         }
@@ -668,7 +709,7 @@ pub fn run_pipeline_v2(
         for (idx, job, result) in extract_done_rx {
             let request = &requests[idx];
             match result {
-                Ok(()) => link_on_main(
+                Ok(known) => link_on_main(
                     &ctx.paths,
                     opts,
                     request,
@@ -676,6 +717,7 @@ pub fn run_pipeline_v2(
                     idx,
                     &ui,
                     job,
+                    &known,
                     &mut errors,
                 ),
                 Err(e) => {
@@ -708,6 +750,7 @@ fn link_on_main(
     idx: usize,
     ui: &Ui,
     job: ExtractJob,
+    known: &KnownAliases,
     errors: &mut Vec<String>,
 ) {
     // Keep the row's identity and the resolved version together for the rest of
@@ -746,6 +789,7 @@ fn link_on_main(
         ui,
         &job.spec,
         &job.vdir,
+        known,
         opts.assume_yes,
         opts.alias_mode,
     ) {
@@ -1135,6 +1179,57 @@ fn finalize_errors(errors: Vec<String>, rows_shown: bool) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `.part` tree holding `bin/<name>` with `bytes`, made executable.
+    fn part_with(dir: &Path, name: &str, bytes: &[u8]) {
+        let p = dir.join("bin").join(name);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, bytes).unwrap();
+        super::super::linker::ensure_executable(&p).unwrap();
+    }
+
+    fn with_aliases_zip(prog: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("unpin/aliases", opts).unwrap();
+        zw.write_all(b"tool\n").unwrap();
+        let mut v = prog.to_vec();
+        v.extend_from_slice(&zw.finish().unwrap().into_inner());
+        v
+    }
+
+    fn spec(owner: &str, name: &str) -> Spec {
+        Spec {
+            owner: owner.into(),
+            name: name.into(),
+            version: None,
+        }
+    }
+
+    #[test]
+    fn catalog_download_without_metadata_is_refused_before_publishing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("bare");
+        part_with(&bare, "tool", b"\x7fELF no container");
+        let err = require_catalog_meta(&spec(CATALOG_OWNER, "tool"), &bare).unwrap_err();
+        assert!(err.contains("no embedded unpin metadata"), "got: {err}");
+        // Other owners and helper verbs are not held to it.
+        require_catalog_meta(&spec("someone", "tool"), &bare).unwrap();
+        require_catalog_meta(&spec(CATALOG_OWNER, "unpin-tool"), &bare).unwrap();
+
+        // Only the primary needs to carry it, not every executable shipped.
+        let ok = tmp.path().join("ok");
+        part_with(&ok, "tool", &with_aliases_zip(b"\x7fELF "));
+        part_with(&ok, "helper.sh", b"#!/bin/sh\n");
+        let known = require_catalog_meta(&spec(CATALOG_OWNER, "tool"), &ok).unwrap();
+        // What it read is handed to the linker, keyed relative to the dir.
+        assert_eq!(
+            known,
+            [(PathBuf::from("bin/tool"), vec!["tool".to_string()])]
+        );
+    }
 
     #[test]
     fn quiet_refuses_a_missing_checksum_instead_of_skipping() {
