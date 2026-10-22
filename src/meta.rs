@@ -18,8 +18,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
+
+use crate::sqfs;
 
 /// Don't even try to scan an absurdly large file into memory.
 const MAX_FILE: u64 = 512 * 1024 * 1024;
@@ -57,20 +59,109 @@ pub struct Meta {
 /// `Err(e)` = a fatal ambiguity (two ZIPs carrying `unpin/aliases`) or a cap
 /// breach. A binary with unrelated ZIPs but no `unpin/` entries reads as `None`.
 pub fn read(path: &Path) -> Result<Option<Meta>, String> {
-    let len = fs::metadata(path)
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .len();
-    if len > MAX_FILE {
-        return Err(format!(
-            "{}: {len} bytes is too large to scan for embedded metadata (max {MAX_FILE})",
-            path.display()
-        ));
-    }
-    let data = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    read_bytes(&data)
+    read_container(open(path)?).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Where a binary's `unpin/*` entries live.
+enum Container<R> {
+    /// A squashfs image behind the footer (Linux); authoritative when present.
+    Image(R, sqfs::Footer),
+    /// The whole file, to scan for embedded ZIPs.
+    Zips(Vec<u8>),
+    /// No footer, and too large to scan.
+    TooLarge(u64),
+}
+
+fn open(path: &Path) -> Result<Container<fs::File>, String> {
+    let f = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let len = f
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    container(f, len).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn container<R: Read + Seek>(mut r: R, len: u64) -> Result<Container<R>, String> {
+    if let Some(ft) = sqfs::footer(&mut r, len)? {
+        return Ok(Container::Image(r, ft));
+    }
+    if len > MAX_FILE {
+        return Ok(Container::TooLarge(len));
+    }
+    let mut data = Vec::new();
+    r.rewind()
+        .and_then(|_| r.read_to_end(&mut data))
+        .map_err(|e| format!("read: {e}"))?;
+    Ok(Container::Zips(data))
+}
+
+fn read_container<R: Read + Seek>(c: Container<R>) -> Result<Option<Meta>, String> {
+    match c {
+        Container::Image(r, ft) => read_image(r, &ft),
+        Container::Zips(data) => read_zips(&data),
+        Container::TooLarge(len) => Err(format!(
+            "{len} bytes is too large to scan for embedded metadata (max {MAX_FILE})"
+        )),
+    }
+}
+
+/// Count one `unpin/*` entry of `size` bytes against the per-entry and total caps.
+fn charge_entry(total: &mut u64, path: &str, size: u64) -> Result<(), String> {
+    if size > MAX_META_ENTRY {
+        return Err(format!(
+            "embedded `{path}` is {size} bytes (max {MAX_META_ENTRY})"
+        ));
+    }
+    *total = total.saturating_add(size);
+    if *total > MAX_META_TOTAL {
+        return Err(format!(
+            "embedded meta exceeds {MAX_META_TOTAL} bytes total"
+        ));
+    }
+    Ok(())
+}
+
+/// Collect the `unpin/*` entries of a footer-located squashfs image (Linux).
+/// The footer is authoritative: no ZIP scan follows, and a damaged image is
+/// an error rather than "no metadata".
+fn read_image<R: Read + Seek>(r: R, ft: &sqfs::Footer) -> Result<Option<Meta>, String> {
+    let mut img = sqfs::Image::open(r, ft.offset, ft.size)?;
+    let Some(dir) = img.lookup("unpin")? else {
+        return Ok(None);
+    };
+    let mut entries = Vec::new();
+    let mut total: u64 = 0;
+    for (rel, node) in sqfs::walk(&mut img, &dir, MAX_META_ENTRIES)? {
+        let path = format!("unpin/{rel}");
+        let (is_symlink, data) = match node {
+            sqfs::Node::File(f) => {
+                charge_entry(&mut total, &path, f.size)?;
+                let data = img
+                    .read_file(&f, f.size)
+                    .map_err(|e| format!("read embedded `{path}`: {e}"))?;
+                (false, data)
+            }
+            sqfs::Node::Symlink(t) => (true, t),
+            _ => continue,
+        };
+        entries.push(Entry {
+            path,
+            is_symlink,
+            data,
+        });
+    }
+    Ok((!entries.is_empty()).then_some(Meta { entries }))
+}
+
+/// [`read`] over an in-memory binary.
+#[cfg(test)]
 fn read_bytes(data: &[u8]) -> Result<Option<Meta>, String> {
+    read_container(container(std::io::Cursor::new(data), data.len() as u64)?)
+}
+
+/// The ZIP container (macOS, Windows, and Linux binaries built before the
+/// squashfs one): every embedded ZIP in `data` is scanned.
+fn read_zips(data: &[u8]) -> Result<Option<Meta>, String> {
     let mut entries: Vec<Entry> = Vec::new();
     let mut total: u64 = 0;
     let mut alias_bearing_zips = 0usize;
@@ -95,19 +186,7 @@ fn read_bytes(data: &[u8]) -> Result<Option<Meta>, String> {
             if !ent.name.starts_with("unpin/") || ent.name.ends_with('/') {
                 continue;
             }
-            let sz = ent.usize as u64;
-            if sz > MAX_META_ENTRY {
-                return Err(format!(
-                    "embedded `{}` is {sz} bytes (max {MAX_META_ENTRY})",
-                    ent.name
-                ));
-            }
-            total = total.saturating_add(sz);
-            if total > MAX_META_TOTAL {
-                return Err(format!(
-                    "embedded meta exceeds {MAX_META_TOTAL} bytes total"
-                ));
-            }
+            charge_entry(&mut total, &ent.name, ent.usize as u64)?;
             if entries.len() >= MAX_META_ENTRIES {
                 return Err(format!("embedded meta exceeds {MAX_META_ENTRIES} entries"));
             }
@@ -439,17 +518,27 @@ const WHATIS_SCAN: u64 = 8 * 1024;
 /// best-effort by design: a page we can't locate or parse yields `whatis: None`,
 /// not an error.
 pub fn read_program_docs(path: &Path) -> Result<Option<Vec<ProgramDoc>>, String> {
-    let len = fs::metadata(path)
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .len();
-    if len > MAX_FILE {
-        return Ok(None);
-    }
-    let data = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    Ok(program_docs_from_bytes(&data))
+    Ok(program_docs_in(open(path)?))
 }
 
-fn program_docs_from_bytes(data: &[u8]) -> Option<Vec<ProgramDoc>> {
+fn program_docs_in<R: Read + Seek>(c: Container<R>) -> Option<Vec<ProgramDoc>> {
+    match c {
+        Container::Image(r, ft) => program_docs_from_image(r, &ft),
+        Container::Zips(data) => program_docs_from_zips(&data),
+        Container::TooLarge(_) => None,
+    }
+}
+
+/// [`read_program_docs`] over an in-memory binary.
+#[cfg(test)]
+fn program_docs_from_bytes(data: &[u8]) -> Result<Option<Vec<ProgramDoc>>, String> {
+    Ok(program_docs_in(container(
+        std::io::Cursor::new(data),
+        data.len() as u64,
+    )?))
+}
+
+fn program_docs_from_zips(data: &[u8]) -> Option<Vec<ProgramDoc>> {
     // Accumulate across every embedded ZIP, not just the first: a binary built
     // before the unified container splits `unpin/aliases` (main embed) from its
     // `unpin/man/*` pages (a separate dict-trained man overlay), so the program
@@ -474,30 +563,6 @@ fn program_docs_from_bytes(data: &[u8]) -> Option<Vec<ProgramDoc>> {
         saw_bundle = true;
         let mut dict = overlay_dict(&cd).ok().flatten();
 
-        // Index this ZIP's man pages by program stem, preferring the lowest
-        // section so `foo.1` wins over a stray `foo.3`.
-        let mut man: BTreeMap<String, usize> = BTreeMap::new();
-        for (i, e) in cd.iter().enumerate() {
-            let Some(file) = e.name.strip_prefix("unpin/man/") else {
-                continue;
-            };
-            if file.is_empty() || file.ends_with('/') {
-                continue;
-            }
-            let (stem, sec) = split_section(file);
-            match man.get(&stem) {
-                Some(&j) => {
-                    let prev = cd[j].name.strip_prefix("unpin/man/").unwrap_or("");
-                    if sec < split_section(prev).1 {
-                        man.insert(stem, i);
-                    }
-                }
-                None => {
-                    man.insert(stem, i);
-                }
-            }
-        }
-
         // Declared multicall aliases (small entry — full-decode is cheap).
         if let Some(e) = cd.iter().find(|e| e.name == ALIASES_PATH)
             && let Some(Ok(b)) = decompress(e.method, e.payload, dict.as_mut())
@@ -506,8 +571,16 @@ fn program_docs_from_bytes(data: &[u8]) -> Option<Vec<ProgramDoc>> {
         }
 
         // Resolve each man page's whatis now, while this overlay's dict is live.
-        for stem in man.keys().cloned().collect::<Vec<_>>() {
-            let w = whatis_for(&stem, &man, &cd, &mut dict);
+        let man: Vec<(&str, bool, &CdEntry)> = cd
+            .iter()
+            .filter_map(|e| Some((e.name.strip_prefix("unpin/man/")?, e.is_symlink, e)))
+            .collect();
+        let files: Vec<(&str, bool)> = man.iter().map(|&(n, l, _)| (n, l)).collect();
+        let found = man_whatis(&files, |i, limit| {
+            let e = man[i].2;
+            decompress_capped(e.method, e.payload, dict.as_mut(), limit)?.ok()
+        });
+        for (stem, w) in found {
             let slot = whatis.entry(stem).or_insert(None);
             if w.is_some() {
                 *slot = w;
@@ -518,6 +591,50 @@ fn program_docs_from_bytes(data: &[u8]) -> Option<Vec<ProgramDoc>> {
     if !saw_bundle {
         return None;
     }
+    docs_from(whatis, aliases)
+}
+
+/// The squashfs-container counterpart of [`program_docs_from_zips`]: one image,
+/// read through its directory tree, so only `unpin/aliases` and the first
+/// block of each man page are ever decoded.
+fn program_docs_from_image<R: Read + Seek>(r: R, ft: &sqfs::Footer) -> Option<Vec<ProgramDoc>> {
+    let mut img = sqfs::Image::open(r, ft.offset, ft.size).ok()?;
+    img.lookup("unpin").ok()??;
+    let mut aliases = Vec::new();
+    if let Ok(Some(sqfs::Node::File(f))) = img.lookup(ALIASES_PATH)
+        && f.size <= MAX_META_ENTRY
+        && let Ok(b) = img.read_file(&f, f.size)
+    {
+        aliases = alias_names(&b);
+    }
+    let mut whatis = BTreeMap::new();
+    if let Ok(Some(dir @ sqfs::Node::Dir { .. })) = img.lookup("unpin/man")
+        && let Ok(list) = img.read_dir(&dir)
+    {
+        let nodes: Vec<(String, sqfs::Node)> = list
+            .into_iter()
+            .filter_map(|(name, iref)| Some((name, img.inode(iref).ok()?)))
+            .filter(|(_, n)| matches!(n, sqfs::Node::File(_) | sqfs::Node::Symlink(_)))
+            .collect();
+        let files: Vec<(&str, bool)> = nodes
+            .iter()
+            .map(|(n, node)| (n.as_str(), matches!(node, sqfs::Node::Symlink(_))))
+            .collect();
+        whatis = man_whatis(&files, |i, limit| match &nodes[i].1 {
+            sqfs::Node::File(f) => img.read_file(f, limit).ok(),
+            sqfs::Node::Symlink(t) => Some(t.clone()),
+            _ => unreachable!("filtered to files and symlinks above"),
+        });
+    }
+    docs_from(whatis, aliases)
+}
+
+/// The sorted union of the documented stems and the declared aliases, each
+/// with its whatis. `None` if there is nothing to list.
+fn docs_from(
+    whatis: BTreeMap<String, Option<String>>,
+    aliases: Vec<String>,
+) -> Option<Vec<ProgramDoc>> {
     let mut names: BTreeSet<String> = whatis.keys().cloned().collect();
     names.extend(aliases);
     if names.is_empty() {
@@ -534,33 +651,46 @@ fn program_docs_from_bytes(data: &[u8]) -> Option<Vec<ProgramDoc>> {
     )
 }
 
-/// The whatis for program `name`: locate its man page, follow one `.so`/symlink
-/// redirect (e.g. `unxz.1 -> xz.1`), inflate only the NAME-section prefix, and
-/// parse it. `None` if there's no page, the redirect dead-ends, or no NAME line.
-fn whatis_for(
-    name: &str,
-    man: &BTreeMap<String, usize>,
-    cd: &[CdEntry],
-    dict: &mut Option<ruzstd::FrameDecoder>,
-) -> Option<String> {
-    let &idx = man.get(name)?;
-    let ent = &cd[idx];
-    let target = if ent.is_symlink {
-        let tgt = decompress(ent.method, ent.payload, dict.as_mut())?.ok()?;
-        let tgt = String::from_utf8(tgt).ok()?;
-        let base = tgt.trim().rsplit(['/', '\\']).next()?;
-        let (tstem, _) = split_section(base);
-        let &j = man.get(&tstem)?;
-        if cd[j].is_symlink {
-            return None; // don't chase multi-hop redirects
+/// The whatis of every program in one man listing. `files[i]` is a page's name
+/// under `unpin/man/` and whether it is a symlink; `read(i, limit)` returns the
+/// first `limit` bytes of page `i` (a symlink's target path). Pages are indexed
+/// by stem, preferring the lowest section so `foo.1` wins over a stray `foo.3`;
+/// one `.so`/symlink redirect (e.g. `unxz.1 -> xz.1`) is followed, and only the
+/// NAME-section prefix is ever inflated.
+fn man_whatis(
+    files: &[(&str, bool)],
+    mut read: impl FnMut(usize, u64) -> Option<Vec<u8>>,
+) -> BTreeMap<String, Option<String>> {
+    let mut man: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, (file, _)) in files.iter().enumerate() {
+        if file.is_empty() || file.ends_with('/') {
+            continue;
         }
-        j
-    } else {
-        idx
+        let (stem, sec) = split_section(file);
+        match man.get(&stem) {
+            Some(&j) if sec >= split_section(files[j].0).1 => {}
+            _ => {
+                man.insert(stem, i);
+            }
+        }
+    }
+    let mut whatis_of = |idx: usize| -> Option<String> {
+        let target = if files[idx].1 {
+            let tgt = String::from_utf8(read(idx, MAX_META_ENTRY + 1)?).ok()?;
+            let base = tgt.trim().rsplit(['/', '\\']).next()?;
+            let &j = man.get(&split_section(base).0)?;
+            if files[j].1 {
+                return None; // don't chase multi-hop redirects
+            }
+            j
+        } else {
+            idx
+        };
+        whatis_from_roff(&String::from_utf8_lossy(&read(target, WHATIS_SCAN)?))
     };
-    let tent = &cd[target];
-    let prefix = decompress_capped(tent.method, tent.payload, dict.as_mut(), WHATIS_SCAN)?.ok()?;
-    whatis_from_roff(&String::from_utf8_lossy(&prefix))
+    man.iter()
+        .map(|(stem, &i)| (stem.clone(), whatis_of(i)))
+        .collect()
 }
 
 /// Split a man-page filename into `(stem, section)` on the final dot:
@@ -795,8 +925,7 @@ mod tests {
     /// Embed `zip` mid-binary: junk prefix + zip + junk suffix, mimicking a
     /// real binary where the ZIP isn't at EOF.
     fn embed(zip: &[u8]) -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend_from_slice(b"\x7fELF fake program bytes \x00\x01\x02\x03");
+        let mut v = PROG.to_vec();
         v.extend_from_slice(zip);
         v.extend_from_slice(b"trailing non-zip bytes \xca\xfe");
         v
@@ -938,7 +1067,9 @@ mod tests {
             ("unpin/man/ifne.1", ifne.as_bytes(), M::Deflate),
             // `lckdo` ships no man page → listed, but with no description.
         ]);
-        let docs = program_docs_from_bytes(&embed(&zip)).expect("docs");
+        let docs = program_docs_from_bytes(&embed(&zip))
+            .unwrap()
+            .expect("docs");
         assert_eq!(
             docs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
             vec!["ifne", "lckdo", "sponge"],
@@ -964,7 +1095,9 @@ mod tests {
             ("unpin/man/xz.1", xz.as_bytes(), M::Zstd),
             ("unpin/man/unxz.1", b"xz.1\n", M::Symlink),
         ]);
-        let docs = program_docs_from_bytes(&embed(&zip)).expect("docs");
+        let docs = program_docs_from_bytes(&embed(&zip))
+            .unwrap()
+            .expect("docs");
         let unxz = docs.iter().find(|d| d.name == "unxz").expect("unxz listed");
         assert_eq!(
             unxz.whatis.as_deref(),
@@ -975,7 +1108,7 @@ mod tests {
     #[test]
     fn program_docs_none_without_bundle() {
         let zip = build_zip(&[("usr/share/zoneinfo/UTC", b"TZif...", M::Stored)]);
-        assert!(program_docs_from_bytes(&embed(&zip)).is_none());
+        assert!(program_docs_from_bytes(&embed(&zip)).unwrap().is_none());
     }
 
     #[test]
@@ -1040,5 +1173,211 @@ mod tests {
         // by the nix build), so the self-scan must come back empty, not error.
         let exe = std::env::current_exe().expect("current_exe");
         assert!(read(&exe).expect("read own binary").is_none());
+    }
+
+    use crate::sqfs::build_sqfs;
+
+    /// `prog` + `img` + the 64-byte container footer.
+    fn with_footer(prog: &[u8], img: &[u8], version: u32) -> Vec<u8> {
+        let mut v = prog.to_vec();
+        v.extend_from_slice(img);
+        v.extend_from_slice(&(prog.len() as u64).to_le_bytes());
+        v.extend_from_slice(&(img.len() as u64).to_le_bytes());
+        let mut id = [0u8; 32];
+        id[..20].copy_from_slice(&[0xab; 20]);
+        v.extend_from_slice(&id);
+        v.push(20);
+        v.extend_from_slice(&[0, 0, 0]);
+        v.extend_from_slice(&version.to_le_bytes());
+        v.extend_from_slice(b"UNPINSQF");
+        v
+    }
+
+    const PROG: &[u8] = b"\x7fELF fake program bytes \x00\x01\x02\x03";
+
+    /// Bytes that compress poorly, so a multi-block file stays multi-block.
+    fn noise(n: usize) -> Vec<u8> {
+        let mut x: u32 = 0x1234_5678;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sqfs_reads_aliases_man_and_symlinks() {
+        let img = build_sqfs(
+            &[
+                ("unpin/aliases", b"xzcat\nunxz\n# note\n\nlzma\n"),
+                ("unpin/man/xz.1", b".TH XZ 1\n.SH NAME\nxz \\- compress\n"),
+                ("__unpins_xz__/share/data", &noise(300_000)),
+            ],
+            &[("unpin/man/unxz.1", "xz.1")],
+            131072,
+        );
+        let meta = read_bytes(&with_footer(PROG, &img, 1)).unwrap().unwrap();
+        assert_eq!(meta.aliases(), vec!["xzcat", "unxz", "lzma"]);
+        let mut man: Vec<_> = meta
+            .entries_under("unpin/man/")
+            .map(|e| (e.path.as_str(), e.is_symlink, e.data.clone()))
+            .collect();
+        man.sort();
+        assert_eq!(
+            man,
+            vec![
+                ("unpin/man/unxz.1", true, b"xz.1".to_vec()),
+                (
+                    "unpin/man/xz.1",
+                    false,
+                    b".TH XZ 1\n.SH NAME\nxz \\- compress\n".to_vec()
+                ),
+            ]
+        );
+        // The runtime tree beside `unpin/` is not metadata.
+        assert!(meta.entry("__unpins_xz__/share/data").is_none());
+        assert_eq!(meta.entries.len(), 3);
+    }
+
+    #[test]
+    fn sqfs_reads_multiblock_files_with_fragment_tails() {
+        // 2.5 blocks of noise (two full blocks + a fragment tail), a file of
+        // exactly one block, and small files packed together in fragments.
+        let big = noise(2 * 65536 + 12345);
+        let exact = noise(65536);
+        let img = build_sqfs(
+            &[
+                ("unpin/man/big.1", &big),
+                ("unpin/man/exact.1", &exact),
+                ("unpin/man/a.1", b"aaa"),
+                ("unpin/man/b.1", b"bbbb"),
+                ("unpin/man/sub/deep.5", b"nested"),
+            ],
+            &[],
+            65536,
+        );
+        let meta = read_bytes(&with_footer(PROG, &img, 1)).unwrap().unwrap();
+        assert_eq!(meta.entry("unpin/man/big.1").unwrap().data, big);
+        assert_eq!(meta.entry("unpin/man/exact.1").unwrap().data, exact);
+        assert_eq!(meta.entry("unpin/man/a.1").unwrap().data, b"aaa");
+        assert_eq!(meta.entry("unpin/man/b.1").unwrap().data, b"bbbb");
+        assert_eq!(meta.entry("unpin/man/sub/deep.5").unwrap().data, b"nested");
+    }
+
+    #[test]
+    fn sqfs_program_docs_follow_symlink_and_list_aliases() {
+        let img = build_sqfs(
+            &[
+                ("unpin/aliases", b"xz\nunxz\nlzcat\n"),
+                (
+                    "unpin/man/xz.1",
+                    b".TH XZ 1\n.SH NAME\nxz, unxz \\- Compress or decompress .xz files\n",
+                ),
+            ],
+            &[("unpin/man/unxz.1", "xz.1")],
+            131072,
+        );
+        let docs = program_docs_from_bytes(&with_footer(PROG, &img, 1))
+            .unwrap()
+            .unwrap();
+        let want = Some("Compress or decompress .xz files".to_string());
+        assert_eq!(
+            docs,
+            vec![
+                ProgramDoc {
+                    name: "lzcat".into(),
+                    whatis: None
+                },
+                ProgramDoc {
+                    name: "unxz".into(),
+                    whatis: want.clone()
+                },
+                ProgramDoc {
+                    name: "xz".into(),
+                    whatis: want
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sqfs_through_a_file_reads_only_what_it_needs() {
+        let img = build_sqfs(
+            &[
+                ("unpin/aliases", b"foo\n"),
+                (
+                    "unpin/man/foo.1",
+                    b".TH FOO 1\n.SH NAME\nfoo \\- does foo\n",
+                ),
+            ],
+            &[],
+            131072,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("foo");
+        fs::write(&p, with_footer(PROG, &img, 1)).unwrap();
+        assert_eq!(read(&p).unwrap().unwrap().aliases(), vec!["foo"]);
+        let docs = read_program_docs(&p).unwrap().unwrap();
+        assert_eq!(docs[0].whatis.as_deref(), Some("does foo"));
+    }
+
+    #[test]
+    fn sqfs_without_unpin_dir_is_none() {
+        let img = build_sqfs(&[("__unpins_x__/f", b"x")], &[], 131072);
+        let bin = with_footer(PROG, &img, 1);
+        assert!(read_bytes(&bin).unwrap().is_none());
+        assert!(program_docs_from_bytes(&bin).unwrap().is_none());
+    }
+
+    #[test]
+    fn sqfs_footer_is_authoritative_over_embedded_zips() {
+        // A stray ZIP with `unpin/aliases` inside the program bytes is not read
+        // once a footer says where the container is.
+        let zip = build_zip(&[("unpin/aliases", b"evil\n", M::Stored)]);
+        let img = build_sqfs(&[("unpin/aliases", b"good\n")], &[], 131072);
+        let meta = read_bytes(&with_footer(&embed(&zip), &img, 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.aliases(), vec!["good"]);
+    }
+
+    #[test]
+    fn sqfs_bad_footer_is_an_error_not_absence() {
+        let img = build_sqfs(&[("unpin/aliases", b"a\n")], &[], 131072);
+        let err = read_bytes(&with_footer(PROG, &img, 2)).unwrap_err();
+        assert!(err.contains("version 2"), "got: {err}");
+        // Bytes appended after the footer move it off EOF: no magic, no container.
+        let mut tail = with_footer(PROG, &img, 1);
+        tail.push(0);
+        assert!(read_bytes(&tail).unwrap().is_none());
+        // An offset that doesn't put the image right before the footer.
+        let mut off = with_footer(PROG, &img, 1);
+        let at = off.len() - 64;
+        off[at] ^= 1;
+        assert!(read_bytes(&off).unwrap_err().contains("does not end"));
+    }
+
+    #[test]
+    fn sqfs_corruption_never_panics() {
+        // Flip every byte of a small image in turn: each read must come back
+        // Ok or Err, never panic or hang.
+        let img = build_sqfs(
+            &[
+                ("unpin/aliases", b"a\nb\n"),
+                ("unpin/man/a.1", b".TH A 1\n.SH NAME\na \\- x\n"),
+            ],
+            &[("unpin/man/b.1", "a.1")],
+            4096,
+        );
+        let base = with_footer(PROG, &img, 1);
+        for i in PROG.len()..PROG.len() + img.len() {
+            let mut bin = base.clone();
+            bin[i] ^= 0xff;
+            let _ = read_bytes(&bin);
+            let _ = program_docs_from_bytes(&bin);
+        }
     }
 }

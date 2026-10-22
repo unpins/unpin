@@ -5,6 +5,12 @@ Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+- Linux binaries from the catalog can carry their aliases and man pages in a
+  squashfs image at the end of the file. `unpin` reads that format as well as
+  the ZIP the existing releases use, and reads only the metadata, not the rest
+  of the image.
+
 ### Removed
 - The `--no-data` option and the `data` config setting. No package in the
   catalog publishes the separate data file they controlled: a package that

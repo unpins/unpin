@@ -23,6 +23,7 @@ mod render;
 mod readurl;
 mod setup;
 mod sigint;
+mod sqfs;
 
 // The palette help.rs mirrors for the hand-written parts: section headers
 // yellow, typeable literals green (the scheme gleam uses).

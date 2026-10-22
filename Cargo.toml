@@ -43,6 +43,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 tempfile = "3"
 zstd = { version = "0.13", default-features = false }
+# Writes the squashfs fixtures the container reader is tested against.
+backhand = { version = "0.25", default-features = false, features = ["zstd"] }
 
 [profile.release]
 opt-level = 2
