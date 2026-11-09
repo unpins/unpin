@@ -1520,6 +1520,7 @@ dependencies = [
  "ctrlc",
  "dialoguer",
  "flate2",
+ "libc",
  "mandoc-sys",
  "minreq",
  "nanoserde",

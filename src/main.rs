@@ -495,6 +495,7 @@ fn resolve_alias_override(yes: bool, no: bool, ask: bool) -> Option<aliases::Ali
 fn main() -> ExitCode {
     panic::install();
     panic::restore_sigpipe_default();
+    platform::trap_seccomp_as_enosys();
     sigint::install();
     // Build the pre-`--` view used to classify unpin's own help banner. After a
     // package spec (`unpin owner/repo …` or `unpin run owner/repo …`) every arg

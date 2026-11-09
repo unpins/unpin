@@ -1240,6 +1240,74 @@ pub fn run_foreground(cmd: &mut std::process::Command) -> io::Result<i32> {
     })
 }
 
+/// Turn a syscall that a seccomp filter traps into an `ENOSYS` return instead
+/// of a kill. Android runs every app, Termux included, under a filter that
+/// answers syscalls outside its allow-list with `SECCOMP_RET_TRAP`: a SIGSYS
+/// whose default action kills the process ("Bad system call"). A static musl
+/// binary is `target_os = "linux"`, so its dependencies call syscalls that
+/// filter refuses — cap-std's `openat2(RESOLVE_BENEATH)` in `archive.rs` first
+/// of all — and expect the `ENOSYS` an older kernel gives, which they handle
+/// by falling back. The handler makes the trapped call return exactly that.
+///
+/// Only a seccomp trap (`si_code == SYS_SECCOMP`) is rewritten; any other
+/// SIGSYS gets the default action back and is raised again. `exec` resets the
+/// handler, so the program `unpin` runs is not affected.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+pub fn trap_seccomp_as_enosys() {
+    // SAFETY: a zeroed `sigaction` is a valid "no flags, empty mask" value;
+    // the handler only touches the `siginfo_t`/`ucontext_t` the kernel passes.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = seccomp_trap_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+)))]
+pub fn trap_seccomp_as_enosys() {}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+extern "C" fn seccomp_trap_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ctx: *mut libc::c_void,
+) {
+    // <linux/signal.h>; the libc crate does not export it.
+    const SYS_SECCOMP: libc::c_int = 1;
+    // SAFETY: SA_SIGINFO handler — the kernel passes a valid `siginfo_t` and
+    // the interrupted thread's `ucontext_t`; writing the return register there
+    // is what the trapped syscall returns once the handler does. Everything
+    // called here is async-signal-safe.
+    unsafe {
+        if (*info).si_code != SYS_SECCOMP {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+            return;
+        }
+        let uc = &mut *(ctx as *mut libc::ucontext_t);
+        let enosys = -i64::from(libc::ENOSYS);
+        #[cfg(target_arch = "aarch64")]
+        {
+            uc.uc_mcontext.regs[0] = enosys as u64;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            uc.uc_mcontext.gregs[libc::REG_RAX as usize] = enosys;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1591,5 +1659,55 @@ mod tests {
         assert_eq!(f, "xzcat");
         #[cfg(windows)]
         assert_eq!(f, "xzcat.exe");
+    }
+
+    /// A filter that traps `getppid` on this thread only (no TSYNC), then the
+    /// handler must turn the trap into `ENOSYS` instead of killing the test.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn seccomp_trap_returns_enosys() {
+        trap_seccomp_as_enosys();
+        let r = std::thread::spawn(|| {
+            const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
+            const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+            let stmt = |code: u16, k: u32| libc::sock_filter {
+                code,
+                jt: 0,
+                jf: 0,
+                k,
+            };
+            let mut prog = [
+                // A = seccomp_data.nr
+                stmt((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0),
+                libc::sock_filter {
+                    code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    jt: 0,
+                    jf: 1,
+                    k: libc::SYS_getppid as u32,
+                },
+                stmt((libc::BPF_RET | libc::BPF_K) as u16, SECCOMP_RET_TRAP),
+                stmt((libc::BPF_RET | libc::BPF_K) as u16, SECCOMP_RET_ALLOW),
+            ];
+            let fprog = libc::sock_fprog {
+                len: prog.len() as u16,
+                filter: prog.as_mut_ptr(),
+            };
+            // SAFETY: plain prctl calls; `fprog` outlives them.
+            unsafe {
+                assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+                assert_eq!(
+                    libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &fprog),
+                    0
+                );
+                let rc = libc::syscall(libc::SYS_getppid);
+                (rc, io::Error::last_os_error().raw_os_error())
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(r, (-1, Some(libc::ENOSYS)));
     }
 }

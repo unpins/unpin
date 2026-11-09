@@ -16,6 +16,11 @@ Versioning](https://semver.org).
   refused, by `install` and by `unpin <pkg>` alike, and the download is not
   kept. Packages from other owners install and run as before.
 
+### Fixed
+- On Android (Termux), installing or running a package that had to be
+  downloaded killed `unpin` with "Bad system call" while unpacking it. It now
+  unpacks and runs the package.
+
 ### Removed
 - The `--no-data` option and the `data` config setting. No package in the
   catalog publishes the separate data file they controlled: a package that

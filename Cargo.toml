@@ -34,6 +34,11 @@ console = { version = "0.16", default-features = false }
 dialoguer = { version = "0.12", default-features = false }
 cap-std = { version = "4.0.2", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# siginfo_t/ucontext_t layouts for the seccomp SIGSYS handler
+# (platform::trap_seccomp_as_enosys).
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # Hardlink-name enumeration (FindFirstFileNameW) and file identity
 # (GetFileInformationByHandle) for the bin-dir hardlink bookkeeping; the
