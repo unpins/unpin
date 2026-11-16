@@ -2,7 +2,7 @@
 # bundle, update, uninstall — see ../smoke-scenario.sh) on all three OSes,
 # using only the standard GitHub runners. The .exe is cross-built on ubuntu
 # and executed on windows-latest, the same pattern as action-build's
-# smoke_windows job; macos-14 is Apple Silicon, so the darwin job also
+# smoke_windows job; macos-15 is Apple Silicon, so the darwin job also
 # proves the appended metadata ZIP coexists with the ad-hoc code signature
 # at exec time. The quick `--version` smoke after every build lives in
 # action-build via the flake's `manifest.smoke`; this workflow is the deep
@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
