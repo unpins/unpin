@@ -419,7 +419,7 @@ fn resolve_argv_version_collisions(
             Some(chosen)
         } else {
             let header = format!(
-                "{owner}/{name} specified with {} different versions:",
+                "{owner}/{name} specified with {} different versions",
                 group.len()
             );
             let items: Vec<String> = group.iter().map(|&i| parsed[i].0.clone()).collect();
@@ -955,7 +955,13 @@ fn info(ctx: &Ctx, input: &str) -> Result<(), String> {
         );
     }
     println!("Status:  not installed");
-    match pick_asset(&release.assets, &spec.name, false, ctx.verbose) {
+    match pick_asset(
+        &release.assets,
+        &spec.name,
+        &spec.display(),
+        false,
+        ctx.verbose,
+    ) {
         Ok(a) => println!("Asset:   {}", a.name),
         Err(e) => println!("Asset:   (unresolved: {e})"),
     }
@@ -1328,7 +1334,7 @@ fn run_binary(spec: &Spec, vdir: &Path, args: &[String], assume_yes: bool) -> Re
                 }
                 None => {
                     let header = format!(
-                        "{} ships {} executables, none named '{}':",
+                        "{} ships {} executables, none named '{}'",
                         spec.repo(),
                         executables.len(),
                         spec.name

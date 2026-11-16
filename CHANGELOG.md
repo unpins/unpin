@@ -20,6 +20,11 @@ Versioning](https://semver.org).
 - On Android (Termux), installing or running a package that had to be
   downloaded killed `unpin` with "Bad system call" while unpacking it. It now
   unpacks and runs the package.
+- The questions asked during an install now name the package they are about:
+  continuing without a SHA-256 checksum, picking among several release assets,
+  replacing a command another package or an unmanaged file already provides,
+  and installing an alias that would shadow a system command.
+- Pickers no longer print a doubled colon after their header (`::`).
 
 ### Removed
 - The `--no-data` option and the `data` config setting. No package in the

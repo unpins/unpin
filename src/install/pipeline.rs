@@ -23,7 +23,8 @@ use crate::platform::{self, Paths};
 use crate::progress::{self, Reporter, Ui};
 
 use super::asset::{
-    ambiguous_assets_error, fetch_expected_sha256, find_checksum_url, narrow_assets, pick_asset,
+    ambiguous_assets_error, asset_picker_header, fetch_expected_sha256, find_checksum_url,
+    narrow_assets, pick_asset,
 };
 use super::job::{PipelineMode, PipelineRequest, PrepareOutcome, PromptKind, ResolutionData};
 use super::linker::{KnownAliases, LinkSummary, link_all_executables};
@@ -179,6 +180,7 @@ fn remove_tree(dir: &Path) -> io::Result<()> {
 /// accepts running without verification.
 fn resolve_checksum_for(
     ctx: &Ctx,
+    pkg: &str,
     assets: &[Asset],
     asset_name: &str,
     assume_yes: bool,
@@ -193,9 +195,9 @@ fn resolve_checksum_for(
     // the trust gap from the user.
     if assume_yes {
         eprintln!(
-            "warning: no SHA-256 checksum published for {asset_name}; downloading without verification"
+            "warning: no SHA-256 checksum published for {pkg} ({asset_name}); downloading without verification"
         );
-    } else if !prompt_yes_no("No SHA-256 checksum found. Continue without verification?") {
+    } else if !prompt_yes_no(&missing_checksum_question(pkg)) {
         return Err("aborted: missing checksum".into());
     }
     Ok(None)
@@ -242,14 +244,27 @@ pub fn preflight_extract(
             _lock: None,
         });
     }
-    let asset = pick_asset(&release.assets, &spec.name, pick, ctx.verbose)?.clone();
+    let asset = pick_asset(
+        &release.assets,
+        &spec.name,
+        &spec.display(),
+        pick,
+        ctx.verbose,
+    )?
+    .clone();
     // Resolve checksums (network fetch + the missing-checksum y/n prompt)
     // BEFORE acquiring the repo lock. resolve_checksum_for may block on a
     // prompt; holding the cross-process lock across it would make a parallel
     // install/run on the same package error out while the user is deciding.
     // The asset picker above is likewise pre-lock. Mirrors run_pipeline_v2,
     // which resolves on a worker thread and only locks in finalize_resolution.
-    let expected_sha256 = resolve_checksum_for(ctx, &release.assets, &asset.name, assume_yes)?;
+    let expected_sha256 = resolve_checksum_for(
+        ctx,
+        &spec.display(),
+        &release.assets,
+        &asset.name,
+        assume_yes,
+    )?;
     // All prompts are done — now take the lock and clear stale staging, the
     // smallest window that still fully covers the destructive extract.
     let extract_dir = part_dir_for(&vdir);
@@ -948,11 +963,7 @@ fn finalize_resolution(
                             }
                         })
                         .collect();
-                    let header = if data.candidates.len() == 1 {
-                        "Available asset:"
-                    } else {
-                        "Available assets:"
-                    };
+                    let header = asset_picker_header(&spec.display(), data.candidates.len());
                     // Genuine ambiguity (>1 candidate) that we can't prompt for:
                     // fail loudly rather than letting `prompt_pick_with_skip`
                     // return Skip below, which would mark this an exit-0
@@ -964,7 +975,7 @@ fn finalize_resolution(
                             data.candidates.iter().map(|a| a.name.clone()).collect();
                         return Err(ambiguous_assets_error(&names));
                     }
-                    let chosen_idx = match ui.prompt_pick(header, &items) {
+                    let chosen_idx = match ui.prompt_pick(&header, &items) {
                         PromptResult::Got(i) => i,
                         PromptResult::Skip => {
                             return Ok(Resolved::Skipped("asset picker skipped".into()));
@@ -988,7 +999,12 @@ fn finalize_resolution(
             // Cascade: handle missing-checksum prompts now (possibly fresh
             // from the picker resolution).
             if data.primary_checksum_missing {
-                match resolve_missing_checksum_prompt(ui, opts.assume_yes, opts.quiet) {
+                match resolve_missing_checksum_prompt(
+                    ui,
+                    &spec.display(),
+                    opts.assume_yes,
+                    opts.quiet,
+                ) {
                     PromptResult::Got(true) => {}
                     PromptResult::Got(false) => {
                         return Err("aborted: missing checksum".into());
@@ -1081,7 +1097,12 @@ fn into_extract_job(paths: &Paths, spec: Spec, data: ResolutionData) -> Result<E
 /// asset. Returns `Got(true)` to continue without verification, `Got(false)`
 /// to abort the install with a hard error, or `Skip` (user typed `s` or
 /// stdin is non-TTY) to mark the package as skipped — non-fatal.
-fn resolve_missing_checksum_prompt(ui: &Ui, assume_yes: bool, quiet: bool) -> PromptResult<bool> {
+fn resolve_missing_checksum_prompt(
+    ui: &Ui,
+    pkg: &str,
+    assume_yes: bool,
+    quiet: bool,
+) -> PromptResult<bool> {
     if assume_yes {
         // No separate warning line under -y: the missing-checksum fact is
         // folded into the package's final row instead (yellow ⚠
@@ -1094,7 +1115,13 @@ fn resolve_missing_checksum_prompt(ui: &Ui, assume_yes: bool, quiet: bool) -> Pr
         // fail this package (the run still exits non-zero and prints the error).
         return PromptResult::Got(false);
     }
-    ui.prompt_yes_no("No SHA-256 checksum found. Continue without verification?")
+    ui.prompt_yes_no(&missing_checksum_question(pkg))
+}
+
+/// The missing-checksum confirm, naming the package: several downloads can be
+/// in flight, so a bare "Continue?" leaves the user guessing which one.
+fn missing_checksum_question(pkg: &str) -> String {
+    format!("No SHA-256 checksum found for {pkg}. Continue without verification?")
 }
 
 /// Compose the trailing summary that sits to the right of the green check-mark,
@@ -1236,10 +1263,10 @@ mod tests {
         // Security gate: a quiet run can't show the y/N, and a silent skip would
         // read as success. It must refuse — `Got(false)` makes the caller fail
         // the package (non-zero exit), never a non-fatal `Skip`.
-        let r = resolve_missing_checksum_prompt(&Ui::Plain, false, true);
+        let r = resolve_missing_checksum_prompt(&Ui::Plain, "jq", false, true);
         assert!(matches!(r, PromptResult::Got(false)));
         // `-y` still wins (explicit opt-in to run unverified), quiet or not.
-        let y = resolve_missing_checksum_prompt(&Ui::Plain, true, true);
+        let y = resolve_missing_checksum_prompt(&Ui::Plain, "jq", true, true);
         assert!(matches!(y, PromptResult::Got(true)));
     }
 

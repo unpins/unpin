@@ -988,7 +988,9 @@ impl Reporter {
         if !self.tty {
             return plain_pick(header, items);
         }
-        let mut lines = vec![header.to_string()];
+        // Headers carry no trailing colon; `dialoguer` (the plain path) adds
+        // one, so the live path does too.
+        let mut lines = vec![format!("{header}:")];
         for (i, it) in items.iter().enumerate() {
             lines.push(format!("  {}) {it}", i + 1));
         }

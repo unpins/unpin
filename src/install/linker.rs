@@ -178,8 +178,7 @@ fn link_owner_repo(data: &Path, target: &Path) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-/// Classify the existing bin_dir entry at `link` for the package rooted at
-/// `rdir`, prompting where the policy calls for it. `claimed` holds links this
+/// Classify the existing bin_dir entry at `link` for `spec`, prompting where the policy calls for it. `claimed` holds links this
 /// run already created (so a second binary in the same package can't silently
 /// clobber the first). All four cases:
 ///   - free slot / our own older version → silent (over)write;
@@ -190,11 +189,13 @@ fn link_owner_repo(data: &Path, target: &Path) -> Option<String> {
 fn classify_slot(
     paths: &Paths,
     ui: &Ui,
-    rdir: &Path,
+    spec: &Spec,
     claimed: &[PathBuf],
     link: &Path,
     assume_yes: bool,
 ) -> SlotDecision {
+    let rdir = paths.repo_dir(&spec.owner, &spec.name);
+    let pkg = spec.display();
     let name = link
         .file_name()
         .unwrap_or_default()
@@ -215,7 +216,7 @@ fn classify_slot(
 
     match platform::read_link(link) {
         // Our own previous version → normal update overwrite, silent.
-        Some(t) if t.starts_with(rdir) => SlotDecision::Write(None),
+        Some(t) if t.starts_with(&rdir) => SlotDecision::Write(None),
         // Owned by a different unpin package → cross-package collision.
         Some(t) if t.starts_with(&paths.data) => {
             let owner =
@@ -226,7 +227,7 @@ fn classify_slot(
                 SlotDecision::Write(Some(format!("replaced {owner}'s `{name}`")))
             } else {
                 let q = format!(
-                    "{} is provided by {owner}. Replace it with this package?",
+                    "{} is provided by {owner}. Replace it with the one from {pkg}?",
                     link.display()
                 );
                 match ui.prompt_yes_no(&q) {
@@ -245,7 +246,7 @@ fn classify_slot(
                 return SlotDecision::Write(None);
             }
             let q = format!(
-                "{} already exists and was not installed by unpin. Overwrite?",
+                "{} already exists and was not installed by unpin. Overwrite it with the one from {pkg}?",
                 link.display()
             );
             match ui.prompt_yes_no(&q) {
@@ -262,7 +263,7 @@ fn classify_slot(
 fn link_binary(
     paths: &Paths,
     ui: &Ui,
-    rdir: &Path,
+    spec: &Spec,
     claimed: &[PathBuf],
     target: &Path,
     link: &Path,
@@ -271,7 +272,7 @@ fn link_binary(
     let parent = link.parent().ok_or("link has no parent")?;
     fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
 
-    match classify_slot(paths, ui, rdir, claimed, link, assume_yes) {
+    match classify_slot(paths, ui, spec, claimed, link, assume_yes) {
         SlotDecision::Keep(note) => Ok(LinkResult {
             linked: false,
             note,
@@ -400,7 +401,7 @@ pub fn link_all_executables(
         let link = bin.join(platform::link_filename(short));
         // `refreshed` doubles as the "claimed this run" set — passing it in
         // lets a second binary detect a name an earlier one already took.
-        let r = link_binary(paths, ui, &rdir, &refreshed, target, &link, assume_yes)?;
+        let r = link_binary(paths, ui, spec, &refreshed, target, &link, assume_yes)?;
         if r.linked {
             refreshed.push(link.clone());
             summary.primary.push(short.to_owned());
@@ -419,7 +420,7 @@ pub fn link_all_executables(
             None => meta::read(target)?.map(|m| m.aliases()).unwrap_or_default(),
         };
         let alias_outcome = link_aliases_for(
-            paths, ui, &rdir, &refreshed, target, short, declared, spec, alias_mode, assume_yes,
+            paths, ui, &refreshed, target, short, declared, spec, alias_mode, assume_yes,
         )?;
         for a in &alias_outcome.linked {
             refreshed.push(bin.join(platform::alias_link_filename(a)));
@@ -484,7 +485,6 @@ struct AliasOutcome {
 fn link_aliases_for(
     paths: &Paths,
     ui: &Ui,
-    rdir: &Path,
     claimed: &[PathBuf],
     primary: &Path,
     primary_name: &str,
@@ -575,8 +575,10 @@ fn link_aliases_for(
         // (the user opted into non-interactive); a non-tty prompt returns Skip,
         // which we treat as "don't link" — the safe default.
         if aliases::alias_needs_confirmation(name) && !assume_yes {
-            let q =
-                format!("Alias `{name}` would shadow the system `{name}` command — install it?");
+            let q = format!(
+                "Alias `{name}` from {} would shadow the system `{name}` command — install it?",
+                spec.display()
+            );
             match ui.prompt_yes_no(&q) {
                 PromptResult::Got(true) => {}
                 PromptResult::Got(false) | PromptResult::Skip => {
@@ -585,7 +587,7 @@ fn link_aliases_for(
                 }
             }
         }
-        let r = link_alias(paths, ui, rdir, claimed, primary, name, assume_yes)?;
+        let r = link_alias(paths, ui, spec, claimed, primary, name, assume_yes)?;
         if r.linked {
             linked.push(name.clone());
         } else if r.note.is_none() {
@@ -627,7 +629,7 @@ fn link_aliases_for(
 fn link_alias(
     paths: &Paths,
     ui: &Ui,
-    rdir: &Path,
+    spec: &Spec,
     claimed: &[PathBuf],
     target: &Path,
     name: &str,
@@ -637,7 +639,7 @@ fn link_alias(
     let link = bin.join(platform::alias_link_filename(name));
     fs::create_dir_all(bin).map_err(|e| format!("mkdir {}: {e}", bin.display()))?;
 
-    match classify_slot(paths, ui, rdir, claimed, &link, assume_yes) {
+    match classify_slot(paths, ui, spec, claimed, &link, assume_yes) {
         SlotDecision::Keep(note) => Ok(LinkResult {
             linked: false,
             note,
@@ -715,7 +717,11 @@ mod tests {
             config: tmp.path().join("config"),
         };
         let ui = Ui::Plain;
-        let rdir = paths.repo_dir("me", "tool");
+        let spec = Spec {
+            owner: "me".into(),
+            name: "tool".into(),
+            version: None,
+        };
         let link = bin.join("x");
 
         // Create a real binary under <owner>/<repo>/v1/bin and return its path.
@@ -729,27 +735,27 @@ mod tests {
 
         // 1. Free slot → write.
         assert!(matches!(
-            classify_slot(&paths, &ui, &rdir, &[], &link, true),
+            classify_slot(&paths, &ui, &spec, &[], &link, true),
             SlotDecision::Write(None)
         ));
 
         // 2. Already claimed this run → keep first, with a note.
         assert!(matches!(
-            classify_slot(&paths, &ui, &rdir, std::slice::from_ref(&link), &link, true),
+            classify_slot(&paths, &ui, &spec, std::slice::from_ref(&link), &link, true),
             SlotDecision::Keep(Some(_))
         ));
 
         // 3. Our own previous version → silent overwrite.
         symlink(mk_target("me", "tool"), &link).unwrap();
         assert!(matches!(
-            classify_slot(&paths, &ui, &rdir, &[], &link, true),
+            classify_slot(&paths, &ui, &spec, &[], &link, true),
             SlotDecision::Write(None)
         ));
         fs::remove_file(&link).unwrap();
 
         // 4. Another package owns it; -y lets the explicit install win + note.
         symlink(mk_target("them", "other"), &link).unwrap();
-        match classify_slot(&paths, &ui, &rdir, &[], &link, true) {
+        match classify_slot(&paths, &ui, &spec, &[], &link, true) {
             SlotDecision::Write(Some(n)) => assert!(n.contains("them/other"), "note: {n}"),
             d => panic!(
                 "expected cross-package Write(Some), got {:?}",
@@ -761,7 +767,7 @@ mod tests {
         // 5. Foreign file; -y overwrites without a shadow note.
         fs::write(&link, b"foreign").unwrap();
         assert!(matches!(
-            classify_slot(&paths, &ui, &rdir, &[], &link, true),
+            classify_slot(&paths, &ui, &spec, &[], &link, true),
             SlotDecision::Write(None)
         ));
     }
@@ -946,7 +952,6 @@ mod tests {
             name: "tool".into(),
             version: None,
         };
-        let rdir = paths.repo_dir(CATALOG_OWNER, "tool");
 
         // A primary binary carrying an embedded `unpin/aliases` listing one
         // credential name (gated) and one ordinary applet (ungated).
@@ -961,7 +966,6 @@ mod tests {
         let out = link_aliases_for(
             &paths,
             &Ui::Plain,
-            &rdir,
             &[],
             &primary,
             "tool",
@@ -983,7 +987,6 @@ mod tests {
         let out = link_aliases_for(
             &paths,
             &Ui::Plain,
-            &rdir,
             &[],
             &primary,
             "tool",
@@ -1023,7 +1026,6 @@ mod tests {
             name: "mtools".into(),
             version: None,
         };
-        let rdir = paths.repo_dir(CATALOG_OWNER, "mtools");
 
         let vbin = paths.version_dir(CATALOG_OWNER, "mtools", "v1").join("bin");
         fs::create_dir_all(&vbin).unwrap();
@@ -1034,7 +1036,6 @@ mod tests {
         let out = link_aliases_for(
             &paths,
             &Ui::Plain,
-            &rdir,
             &[bin.join("mtools")],
             &primary,
             "mtools",

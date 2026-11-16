@@ -218,6 +218,7 @@ fn apply_toolchain_preference<'a>(candidates: Vec<&'a Asset>, prefer: &[&str]) -
 pub fn pick_asset<'a>(
     assets: &'a [Asset],
     repo_name: &str,
+    pkg: &str,
     force_pick: bool,
     verbose: bool,
 ) -> Result<&'a Asset, String> {
@@ -225,7 +226,7 @@ pub fn pick_asset<'a>(
     if !force_pick && candidates.len() == 1 {
         return Ok(candidates[0]);
     }
-    prompt_pick(&candidates)
+    prompt_pick(pkg, &candidates)
 }
 
 /// One menu line for an asset: name, plus the GitHub-reported size when known.
@@ -239,10 +240,17 @@ fn asset_label(a: &Asset) -> String {
     }
 }
 
+/// Header of the asset picker, naming the package it picks for. No trailing
+/// colon: both pickers append it (`dialoguer`'s theme and the live renderer).
+pub(super) fn asset_picker_header(pkg: &str, n: usize) -> String {
+    let noun = if n == 1 { "asset" } else { "assets" };
+    format!("Available {noun} for {pkg}")
+}
+
 /// Single-package adapter over the shared `prompt_pick_with_skip`. `run` and
 /// `info` resolve exactly one asset, so a skip (Esc/q, or non-interactive
 /// stdin) becomes a clean error rather than dropping silently.
-pub(super) fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, String> {
+pub(super) fn prompt_pick<'a>(pkg: &str, candidates: &[&'a Asset]) -> Result<&'a Asset, String> {
     // Keep an explicit non-TTY message here: the shared picker just returns
     // Skip, but for a single-package caller "stdin is not a terminal" is far
     // more actionable than a generic "no asset selected".
@@ -251,13 +259,9 @@ pub(super) fn prompt_pick<'a>(candidates: &[&'a Asset]) -> Result<&'a Asset, Str
              re-run on a terminal to pick one"
             .into());
     }
-    let header = if candidates.len() == 1 {
-        "Available asset"
-    } else {
-        "Available assets"
-    };
+    let header = asset_picker_header(pkg, candidates.len());
     let items: Vec<String> = candidates.iter().map(|a| asset_label(a)).collect();
-    match plain_pick(header, &items) {
+    match plain_pick(&header, &items) {
         PromptResult::Got(i) => Ok(candidates[i]),
         PromptResult::Skip => Err("no asset selected".into()),
     }
@@ -674,7 +678,7 @@ mod tests {
             size: 0,
         };
         let candidates = vec![&a, &b];
-        let err = prompt_pick(&candidates).unwrap_err();
+        let err = prompt_pick("tool", &candidates).unwrap_err();
         assert!(err.contains("not a terminal"), "got: {err}");
     }
 
